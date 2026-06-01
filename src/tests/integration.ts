@@ -146,6 +146,7 @@ function runManageCommand(
             HOME: sandbox.homeDir,
             PATH: `${sandbox.binDir}:/usr/bin:/bin:/usr/sbin:/sbin`,
             SCRIPTD_ROOT_DIR: sandbox.repoRoot,
+            SCRIPTD_ENTRY_SHELL_PATH: path.join(sandbox.repoRoot, "scriptd.sh"),
         },
     });
 
@@ -232,10 +233,10 @@ export function createIntegrationTests(): TestCase[] {
                     const install = runManageCommand(sandbox, ["install", "root"]);
                     assert.equal(install.status, 0);
                     const plistPath = path.join(sandbox.homeDir, "Library", "LaunchAgents", "com.omar.scriptd.plist");
-                    const runtimeManage = path.join(sandbox.homeDir, "Library", "Application Support", "scriptd", "runtime", "scriptd.sh");
+                    const sandboxManage = path.join(sandbox.repoRoot, "scriptd.sh");
                     assert.equal(existsSync(plistPath), true);
-                    assert.equal(existsSync(runtimeManage), true);
-                    assert.match(readFileSync(plistPath, "utf8"), new RegExp(runtimeManage.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+                    assert.match(readFileSync(plistPath, "utf8"), new RegExp(sandboxManage.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+                    assert.match(readFileSync(plistPath, "utf8"), new RegExp(sandbox.repoRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 
                     const uninstall = runManageCommand(sandbox, ["uninstall", "root"]);
                     assert.equal(uninstall.status, 0);
