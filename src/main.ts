@@ -3,7 +3,7 @@ import { promises as fs } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { discoverModules, ensureDirectory, loadServiceConfig } from "./config.ts";
 import { runModuleDirect, runModuleSetup } from "./module-runner.ts";
-import { resolveManageScriptPath, resolveRepoRoot, resolveRuntimeDir, resolveStateFile } from "./paths.ts";
+import { resolveManageScriptPath, resolveRepoRoot, resolveStateFile } from "./paths.ts";
 import { renderStatus } from "./status.ts";
 import { runSupervisor } from "./supervisor.ts";
 import { runAllTests } from "./test.ts";
@@ -61,23 +61,6 @@ async function cleanupLegacyServices(): Promise<void> {
     }
 }
 
-async function deployRuntime(repoRoot: string): Promise<string> {
-    const runtimeDir = resolveRuntimeDir();
-    await fs.rm(runtimeDir, { recursive: true, force: true });
-    await fs.mkdir(runtimeDir, { recursive: true });
-
-    const copyTargets = ["scriptd.sh", "service.yaml", "package.json", "tsconfig.json", "src", "modules"];
-
-    for (const target of copyTargets) {
-        await fs.cp(path.join(repoRoot, target), path.join(runtimeDir, target), {
-            recursive: true,
-            preserveTimestamps: true,
-        });
-    }
-
-    return runtimeDir;
-}
-
 function plistContents(options: {
     label: string;
     manageScriptPath: string;
@@ -124,8 +107,7 @@ async function installRoot(): Promise<number> {
 
     const config = await loadServiceConfig(repoRoot);
     const plistPath = rootPlistPath(config.label);
-    const runtimeDir = await deployRuntime(repoRoot);
-    const manageScriptPath = path.join(runtimeDir, "scriptd.sh");
+    const manageScriptPath = resolveManageScriptPath(repoRoot);
 
     await ensureDirectory(path.dirname(plistPath));
     await ensureDirectory(config.logDir);
@@ -137,7 +119,7 @@ async function installRoot(): Promise<number> {
         plistContents({
             label: config.label,
             manageScriptPath,
-            workingDirectory: runtimeDir,
+            workingDirectory: repoRoot,
             logDir: config.logDir,
         }),
         "utf8",
@@ -162,7 +144,6 @@ async function uninstallRoot(): Promise<number> {
 async function reloadRoot(): Promise<number> {
     const repoRoot = resolveRepoRoot();
     const config = await loadServiceConfig(repoRoot);
-    await deployRuntime(repoRoot);
     const stateFile = resolveStateFile();
 
     try {

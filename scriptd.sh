@@ -6,7 +6,7 @@ ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ENTRYPOINT="${ROOT_DIR}/src/main.ts"
 USER_ARGS=("$@")
 
-export SCRIPTD_ROOT_DIR="${SCRIPTD_ROOT_DIR:-${ROOT_DIR}}"
+export SCRIPTD_ROOT_DIR="${ROOT_DIR}"
 export SCRIPTD_ENTRY_SHELL_PATH="${ROOT_DIR}/scriptd.sh"
 
 try_runtime() {
