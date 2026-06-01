@@ -1,0 +1,16 @@
+id: wifi-monitor
+display_name: Wi-Fi Monitor
+mode: daemon
+scan_interval: 30
+min_dwell: 180
+ping_target: 1.1.1.1
+ping_timeout: 1
+ping_weight: 8
+band_bonus_2g: 0
+band_bonus_5g: 100
+band_bonus_6g: 150
+rssi_offset: 100
+max_ping_penalty: 30
+ssids:
+  # - HomeWiFi
+  # - OfficeNet

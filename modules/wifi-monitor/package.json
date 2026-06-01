@@ -1,0 +1,5 @@
+{
+  "name": "@scriptd/wifi-monitor",
+  "private": true,
+  "type": "module"
+}

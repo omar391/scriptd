@@ -1,0 +1,13 @@
+id: cpu-monitor
+display_name: CPU Monitor
+mode: daemon
+cpu_threshold: 50
+check_interval_seconds: 30
+time_limit_seconds: 600
+exclude_apps:
+  - Finder
+  - Dock
+  - Terminal
+  - Activity Monitor
+  - kernel_task
+  - loginwindow

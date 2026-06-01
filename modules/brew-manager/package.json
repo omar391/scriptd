@@ -1,0 +1,5 @@
+{
+  "name": "@scriptd/brew-manager",
+  "private": true,
+  "type": "module"
+}

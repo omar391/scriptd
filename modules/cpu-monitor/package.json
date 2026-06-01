@@ -1,0 +1,5 @@
+{
+  "name": "@scriptd/cpu-monitor",
+  "private": true,
+  "type": "module"
+}

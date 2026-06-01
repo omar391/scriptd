@@ -1,0 +1,12 @@
+{
+  "name": "scriptd",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "modules/*"
+  ],
+  "scripts": {
+    "test": "./scriptd.sh test",
+    "status": "./scriptd.sh status"
+  }
+}

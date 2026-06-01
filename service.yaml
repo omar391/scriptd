@@ -1,0 +1,10 @@
+label: com.omar.scriptd
+log_dir: ~/Library/Logs/scriptd
+watch: true
+modules:
+  wifi-monitor:
+    enabled: true
+  cpu-monitor:
+    enabled: false
+  brew-manager:
+    enabled: true

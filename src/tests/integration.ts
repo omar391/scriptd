@@ -1,0 +1,272 @@
+import assert from "node:assert/strict";
+import os from "node:os";
+import path from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { chmod, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import { resolveManageScriptPath, resolveRepoRoot } from "../paths.ts";
+import type { TestCase } from "./harness.ts";
+
+type Sandbox = {
+    repoRoot: string;
+    homeDir: string;
+    binDir: string;
+    runtimeLogPath: string;
+    launchctlLogPath: string;
+    tempRoot: string;
+};
+
+const actualRepoRoot = resolveRepoRoot();
+const actualManageScriptPath = resolveManageScriptPath(actualRepoRoot);
+const actualBun = "/opt/homebrew/bin/bun";
+const actualNode = "/opt/homebrew/bin/node";
+const actualNpx = "/opt/homebrew/bin/npx";
+
+async function createSandbox(): Promise<Sandbox> {
+    const tempRoot = await mkdtemp(path.join(os.tmpdir(), "scriptd-integration-"));
+    const repoRoot = path.join(tempRoot, "repo");
+    const homeDir = path.join(tempRoot, "home");
+    const binDir = path.join(tempRoot, "bin");
+    const runtimeLogPath = path.join(tempRoot, "runtime.log");
+    const launchctlLogPath = path.join(tempRoot, "launchctl.log");
+
+    await mkdir(repoRoot, { recursive: true });
+    await mkdir(path.join(repoRoot, "src"), { recursive: true });
+    await mkdir(path.join(repoRoot, "modules", "wifi-monitor"), { recursive: true });
+    await mkdir(path.join(homeDir, "Library", "LaunchAgents"), { recursive: true });
+    await mkdir(binDir, { recursive: true });
+
+    await writeFile(
+        path.join(repoRoot, "service.yaml"),
+        `label: com.omar.scriptd
+log_dir: ~/Library/Logs/scriptd
+watch: true
+modules:
+  wifi-monitor:
+    enabled: true
+`,
+    );
+                    await writeFile(
+                        path.join(repoRoot, "scriptd.sh"),
+                        `#!/bin/bash
+exit 0
+`,
+                    );
+                    await chmod(path.join(repoRoot, "scriptd.sh"), 0o755);
+    await writeFile(path.join(repoRoot, "package.json"), `{"name":"scriptd","private":true,"type":"module","workspaces":["modules/*"]}\n`);
+    await writeFile(
+        path.join(repoRoot, "tsconfig.json"),
+        `{"compilerOptions":{"target":"ES2022","module":"NodeNext","moduleResolution":"NodeNext","noEmit":true}}\n`,
+    );
+    await writeFile(path.join(repoRoot, "src", "main.ts"), "export {}\n");
+
+    await writeFile(
+        path.join(repoRoot, "modules", "wifi-monitor", "module.ts"),
+        `export default {
+  id: "wifi-monitor",
+  mode: "daemon",
+  async start(ctx) {
+    ctx.log.info("sandbox module started");
+    await new Promise((resolve) => ctx.signal.addEventListener("abort", resolve, { once: true }));
+  },
+  status() {
+    return { state: "running", message: "sandbox-ok", metrics: { loops: 1 } };
+  },
+  health() {
+    return { ok: true, message: "healthy" };
+  }
+};`,
+    );
+    await writeFile(
+        path.join(repoRoot, "modules", "wifi-monitor", "module.yaml"),
+        `id: wifi-monitor
+mode: daemon
+`,
+    );
+
+    await writeFile(
+        path.join(binDir, "launchctl"),
+        `#!/bin/bash
+echo "$*" >> "${launchctlLogPath}"
+exit 0
+`,
+        "utf8",
+    );
+    await chmod(path.join(binDir, "launchctl"), 0o755);
+    return { repoRoot, homeDir, binDir, runtimeLogPath, launchctlLogPath, tempRoot };
+}
+
+async function cleanupSandbox(sandbox: Sandbox): Promise<void> {
+    await rm(sandbox.tempRoot, { recursive: true, force: true });
+}
+
+async function writeRuntimeWrapper(
+    sandbox: Sandbox,
+    name: string,
+    mode: "delegate" | "fail",
+    targetPath: string,
+): Promise<void> {
+    const wrapperPath = path.join(sandbox.binDir, name);
+    const body =
+        mode === "delegate"
+            ? `#!/bin/bash
+echo "${name}" >> "${sandbox.runtimeLogPath}"
+PATH="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+exec "${targetPath}" "$@"
+`
+            : `#!/bin/bash
+echo "${name}" >> "${sandbox.runtimeLogPath}"
+exit 1
+`;
+
+    await writeFile(wrapperPath, body, "utf8");
+    await chmod(wrapperPath, 0o755);
+}
+
+async function prepareRuntimeWrappers(
+    sandbox: Sandbox,
+    modes: { bun: "delegate" | "fail"; node: "delegate" | "fail"; npx: "delegate" | "fail" },
+): Promise<void> {
+    await writeRuntimeWrapper(sandbox, "bun", modes.bun, actualBun);
+    await writeRuntimeWrapper(sandbox, "node", modes.node, actualNode);
+    await writeRuntimeWrapper(sandbox, "npx", modes.npx, actualNpx);
+}
+
+function runManageCommand(
+    sandbox: Sandbox,
+    args: string[],
+    extraEnv: NodeJS.ProcessEnv = {},
+): { status: number | null; stdout: string; stderr: string } {
+    const result = spawnSync(actualManageScriptPath, args, {
+        cwd: actualRepoRoot,
+        encoding: "utf8",
+        env: {
+            ...process.env,
+            ...extraEnv,
+            HOME: sandbox.homeDir,
+            PATH: `${sandbox.binDir}:/usr/bin:/bin:/usr/sbin:/sbin`,
+            SCRIPTD_ROOT_DIR: sandbox.repoRoot,
+        },
+    });
+
+    return {
+        status: result.status,
+        stdout: result.stdout ?? "",
+        stderr: result.stderr ?? "",
+    };
+}
+
+export function createIntegrationTests(): TestCase[] {
+    return [
+        {
+            name: "scriptd.sh status uses bun when available",
+            run: async () => {
+                const sandbox = await createSandbox();
+                try {
+                    await prepareRuntimeWrappers(sandbox, {
+                        bun: "delegate",
+                        node: "delegate",
+                        npx: "delegate",
+                    });
+
+                    const result = runManageCommand(sandbox, ["status"]);
+                    assert.equal(result.status, 0);
+                    assert.match(result.stdout, /Config path: .*\/service\.yaml/);
+                    assert.equal(readFileSync(sandbox.runtimeLogPath, "utf8").trim().split("\n")[0], "bun");
+                } finally {
+                    await cleanupSandbox(sandbox);
+                }
+            },
+        },
+        {
+            name: "scriptd.sh status falls back to node strip-types when bun fails",
+            run: async () => {
+                const sandbox = await createSandbox();
+                try {
+                    await prepareRuntimeWrappers(sandbox, {
+                        bun: "fail",
+                        node: "delegate",
+                        npx: "delegate",
+                    });
+
+                    const result = runManageCommand(sandbox, ["status"]);
+                    assert.equal(result.status, 0);
+                    const runtimes = readFileSync(sandbox.runtimeLogPath, "utf8").trim().split("\n");
+                    assert.deepEqual(runtimes.slice(0, 3), ["bun", "node", "node"]);
+                } finally {
+                    await cleanupSandbox(sandbox);
+                }
+            },
+        },
+        {
+            name: "scriptd.sh status falls back to npx tsx when bun and node fail",
+            run: async () => {
+                const sandbox = await createSandbox();
+                try {
+                    await prepareRuntimeWrappers(sandbox, {
+                        bun: "fail",
+                        node: "fail",
+                        npx: "delegate",
+                    });
+
+                    const result = runManageCommand(sandbox, ["status"]);
+                    assert.equal(result.status, 0);
+                    const runtimes = readFileSync(sandbox.runtimeLogPath, "utf8").trim().split("\n");
+                    assert.deepEqual(runtimes.slice(0, 4), ["bun", "node", "npx", "npx"]);
+                } finally {
+                    await cleanupSandbox(sandbox);
+                }
+            },
+        },
+        {
+            name: "install root and uninstall root operate on the sandbox launch agents path",
+            run: async () => {
+                const sandbox = await createSandbox();
+                try {
+                    await prepareRuntimeWrappers(sandbox, {
+                        bun: "delegate",
+                        node: "delegate",
+                        npx: "delegate",
+                    });
+
+                    const install = runManageCommand(sandbox, ["install", "root"]);
+                    assert.equal(install.status, 0);
+                    const plistPath = path.join(sandbox.homeDir, "Library", "LaunchAgents", "com.omar.scriptd.plist");
+                    const runtimeManage = path.join(sandbox.homeDir, "Library", "Application Support", "scriptd", "runtime", "scriptd.sh");
+                    assert.equal(existsSync(plistPath), true);
+                    assert.equal(existsSync(runtimeManage), true);
+                    assert.match(readFileSync(plistPath, "utf8"), new RegExp(runtimeManage.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+
+                    const uninstall = runManageCommand(sandbox, ["uninstall", "root"]);
+                    assert.equal(uninstall.status, 0);
+                    assert.equal(existsSync(plistPath), false);
+                } finally {
+                    await cleanupSandbox(sandbox);
+                }
+            },
+        },
+        {
+            name: "run module fails for an invalid module export in the sandbox repo",
+            run: async () => {
+                const sandbox = await createSandbox();
+                try {
+                    await prepareRuntimeWrappers(sandbox, {
+                        bun: "delegate",
+                        node: "delegate",
+                        npx: "delegate",
+                    });
+
+                    await mkdir(path.join(sandbox.repoRoot, "modules", "broken-module"), { recursive: true });
+                    await writeFile(path.join(sandbox.repoRoot, "modules", "broken-module", "module.ts"), `export default { id: "broken-module", mode: "interval" };`);
+                    await writeFile(path.join(sandbox.repoRoot, "modules", "broken-module", "module.yaml"), `id: broken-module\nmode: interval\ninterval_seconds: 30\n`);
+
+                    const result = runManageCommand(sandbox, ["run", "broken-module"]);
+                    assert.notEqual(result.status, 0);
+                    assert.match(result.stderr, /runOnce|RootServiceModule/);
+                } finally {
+                    await cleanupSandbox(sandbox);
+                }
+            },
+        },
+    ];
+}
