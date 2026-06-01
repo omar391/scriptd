@@ -230,6 +230,7 @@ export function createIntegrationTests(): TestCase[] {
                         npx: "delegate",
                     });
 
+                    await mkdir(path.join(sandbox.repoRoot, "node_modules"), { recursive: true });
                     const install = runManageCommand(sandbox, ["install", "root"]);
                     assert.equal(install.status, 0);
                     const plistPath = path.join(sandbox.homeDir, "Library", "LaunchAgents", "com.omar.scriptd.plist");

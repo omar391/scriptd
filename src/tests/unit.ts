@@ -11,7 +11,6 @@ import {
     loadServiceConfig,
     parseSimpleYaml,
 } from "../config.ts";
-import { findForbiddenDependencyDirectories } from "../validate.ts";
 import { resolveRepoRoot, resolveServiceConfigPath } from "../paths.ts";
 import { scoreNetwork, resolveWifiMonitorConfig } from "../../modules/wifi-monitor/module.ts";
 import { buildBrewCommands } from "../../modules/brew-manager/module.ts";
@@ -208,19 +207,6 @@ mode: daemon
                     });
                     assert.equal(scheduled.shouldSchedule, true);
                     assert.equal(scheduled.delayMs, 30000);
-                } finally {
-                    await cleanupTempDirs();
-                }
-            },
-        },
-        {
-            name: "findForbiddenDependencyDirectories reports blocked root folders",
-            run: async () => {
-                try {
-                    const rootDir = await makeTempRoot();
-                    await mkdir(path.join(rootDir, "node_modules"), { recursive: true });
-                    const found = await findForbiddenDependencyDirectories(rootDir);
-                    assert.deepEqual(found, ["node_modules"]);
                 } finally {
                     await cleanupTempDirs();
                 }

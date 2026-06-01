@@ -68,10 +68,6 @@ Module-specific tools:
 - `cpu-monitor`: `ps` and the ability to signal processes
 - `brew-manager`: Homebrew, `security`, and `sudo`
 
-Important repo constraint:
-
-- `install root` and `test` fail if the repo root contains top-level dependency directories such as `node_modules`, `venv`, `.venv`, `env`, `__pycache__`, or `.pytest_cache`
-
 ## Quick Start
 
 1. Clone the repo and keep the checkout somewhere stable.

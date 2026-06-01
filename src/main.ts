@@ -7,7 +7,6 @@ import { resolveManageScriptPath, resolveRepoRoot, resolveStateFile } from "./pa
 import { renderStatus } from "./status.ts";
 import { runSupervisor } from "./supervisor.ts";
 import { runAllTests } from "./test.ts";
-import { assertNoDependencyDirs } from "./validate.ts";
 
 type PersistedState = {
     supervisor?: {
@@ -103,8 +102,6 @@ function plistContents(options: {
 
 async function installRoot(): Promise<number> {
     const repoRoot = resolveRepoRoot();
-    await assertNoDependencyDirs(repoRoot);
-
     const config = await loadServiceConfig(repoRoot);
     const plistPath = rootPlistPath(config.label);
     const manageScriptPath = resolveManageScriptPath(repoRoot);
