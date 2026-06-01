@@ -21,6 +21,10 @@ type PersistedModuleState = {
 };
 
 type PersistedState = {
+    label?: string;
+    rootDir?: string;
+    configPath?: string;
+    logDir?: string;
     updatedAt: string;
     supervisor: {
         pid: number;
@@ -30,7 +34,13 @@ type PersistedState = {
     modules: Record<string, PersistedModuleState>;
 };
 
-function launchctlStatus(label: string): { loaded: boolean; pid: string; lastExitStatus: string } {
+type LaunchdStatus = {
+    loaded: boolean;
+    pid: string;
+    lastExitStatus: string;
+};
+
+function launchctlStatus(label: string): LaunchdStatus {
     const result = spawnSync("launchctl", ["list"], { encoding: "utf8" });
     const output = result.stdout ?? "";
 
@@ -52,8 +62,54 @@ function launchctlStatus(label: string): { loaded: boolean; pid: string; lastExi
     };
 }
 
+function processExists(pid: number): boolean {
+    try {
+        process.kill(pid, 0);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+function resolveStateFreshness(
+    state: PersistedState,
+    options: {
+        launchd: LaunchdStatus;
+        repoRoot: string;
+        configPath: string;
+    },
+): { current: boolean; reason?: string } {
+    if (state.rootDir && state.rootDir !== options.repoRoot) {
+        return { current: false, reason: "State file belongs to a different repo root" };
+    }
+
+    if (state.configPath && state.configPath !== options.configPath) {
+        return { current: false, reason: "State file was written from a different config path" };
+    }
+
+    if (!options.launchd.loaded) {
+        return { current: false, reason: "LaunchAgent not loaded" };
+    }
+
+    if (options.launchd.pid === "-") {
+        return { current: false, reason: "LaunchAgent loaded but not currently running" };
+    }
+
+    if (!processExists(state.supervisor.pid)) {
+        return { current: false, reason: `Supervisor PID ${state.supervisor.pid} is not running` };
+    }
+
+    const launchdPid = Number(options.launchd.pid);
+    if (Number.isFinite(launchdPid) && launchdPid !== state.supervisor.pid) {
+        return { current: false, reason: `State PID ${state.supervisor.pid} does not match launchd PID ${launchdPid}` };
+    }
+
+    return { current: true };
+}
+
 export async function renderStatus(): Promise<void> {
-    const config = await loadServiceConfig(resolveRepoRoot());
+    const repoRoot = resolveRepoRoot();
+    const config = await loadServiceConfig(repoRoot);
     const launchd = launchctlStatus(config.label);
 
     console.log(`scriptd label: ${config.label}`);
@@ -64,31 +120,52 @@ export async function renderStatus(): Promise<void> {
     console.log(`Shared log dir: ${config.logDir}`);
     console.log(`State file: ${config.stateFile}`);
 
-    if (!existsSync(config.stateFile)) {
+    const state = existsSync(config.stateFile) ? (JSON.parse(readFileSync(config.stateFile, "utf8")) as PersistedState) : undefined;
+    const stateFreshness = state
+        ? resolveStateFreshness(state, {
+              launchd,
+              repoRoot,
+              configPath: config.path,
+          })
+        : undefined;
+
+    if (!state) {
         console.log("scriptd state: unavailable");
-        return;
+    } else {
+        console.log(stateFreshness?.current ? "scriptd state: current" : `scriptd state: stale snapshot (${stateFreshness?.reason})`);
+        console.log(`${stateFreshness?.current ? "scriptd PID" : "Last known scriptd PID"}: ${state.supervisor.pid}`);
+        console.log(`${stateFreshness?.current ? "scriptd started" : "Last known scriptd start"}: ${state.supervisor.startedAt}`);
+        console.log(`scriptd watch enabled: ${state.supervisor.watch ? "yes" : "no"}`);
+        console.log(`State updated: ${state.updatedAt}`);
     }
 
-    const state = JSON.parse(readFileSync(config.stateFile, "utf8")) as PersistedState;
-    console.log(`scriptd PID: ${state.supervisor.pid}`);
-    console.log(`scriptd started: ${state.supervisor.startedAt}`);
-    console.log(`scriptd watch enabled: ${state.supervisor.watch ? "yes" : "no"}`);
-    console.log(`State updated: ${state.updatedAt}`);
-
-    const moduleNames = Object.keys(state.modules).sort();
-    if (moduleNames.length === 0) {
+    const moduleNames = new Set<string>([...Object.keys(config.modules), ...Object.keys(state?.modules ?? {})]);
+    if (moduleNames.size === 0) {
         console.log("Modules: none discovered");
         return;
     }
 
     console.log("Modules:");
-    for (const moduleName of moduleNames) {
-        const moduleState = state.modules[moduleName];
-        const details: string[] = [
-            moduleState.desiredEnabled ? "enabled" : "disabled",
-            moduleState.mode,
-            moduleState.status,
-        ];
+    for (const moduleName of [...moduleNames].sort()) {
+        const moduleState = state?.modules[moduleName];
+        const desiredEnabled = config.modules[moduleName]?.enabled ?? false;
+        const details: string[] = [`desired=${desiredEnabled ? "enabled" : "disabled"}`];
+
+        if (moduleState?.mode) {
+            details.push(moduleState.mode);
+        }
+
+        if (!moduleState) {
+            details.push("runtime=unknown");
+            console.log(`- ${moduleName}: ${details.join(", ")}`);
+            continue;
+        }
+
+        details.push(`${stateFreshness?.current ? "runtime" : "last"}=${moduleState.status}`);
+
+        if (moduleState.desiredEnabled !== desiredEnabled) {
+            details.push(`lastDesired=${moduleState.desiredEnabled ? "enabled" : "disabled"}`);
+        }
 
         if (moduleState.nextRunAt) {
             details.push(`next=${moduleState.nextRunAt}`);

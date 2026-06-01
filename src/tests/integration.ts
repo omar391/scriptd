@@ -44,6 +44,10 @@ watch: true
 modules:
   wifi-monitor:
     enabled: true
+  cpu-monitor:
+    enabled: false
+  brew-manager:
+    enabled: true
 `,
     );
                     await writeFile(
@@ -214,6 +218,75 @@ export function createIntegrationTests(): TestCase[] {
                     assert.equal(result.status, 0);
                     const runtimes = readFileSync(sandbox.runtimeLogPath, "utf8").trim().split("\n");
                     assert.deepEqual(runtimes.slice(0, 4), ["bun", "node", "npx", "npx"]);
+                } finally {
+                    await cleanupSandbox(sandbox);
+                }
+            },
+        },
+        {
+            name: "status shows desired config separately from a stale runtime snapshot",
+            run: async () => {
+                const sandbox = await createSandbox();
+                try {
+                    await prepareRuntimeWrappers(sandbox, {
+                        bun: "delegate",
+                        node: "delegate",
+                        npx: "delegate",
+                    });
+
+                    const stateDir = path.join(sandbox.homeDir, "Library", "Application Support", "scriptd");
+                    await mkdir(stateDir, { recursive: true });
+                    await writeFile(
+                        path.join(stateDir, "state.json"),
+                        `${JSON.stringify(
+                            {
+                                label: "com.omar.scriptd",
+                                rootDir: sandbox.repoRoot,
+                                configPath: path.join(sandbox.repoRoot, "service.yaml"),
+                                logDir: path.join(sandbox.homeDir, "Library", "Logs", "scriptd"),
+                                updatedAt: "2026-06-01T18:40:25.545Z",
+                                supervisor: {
+                                    pid: 47473,
+                                    startedAt: "2026-06-01T18:35:21.250Z",
+                                    watch: true,
+                                },
+                                modules: {
+                                    "brew-manager": {
+                                        desiredEnabled: false,
+                                        status: "disabled",
+                                        mode: "interval",
+                                        runs: 0,
+                                        restarts: 0,
+                                        message: "module disabled",
+                                    },
+                                    "cpu-monitor": {
+                                        desiredEnabled: false,
+                                        status: "disabled",
+                                        mode: "daemon",
+                                        runs: 0,
+                                        restarts: 0,
+                                        message: "module disabled",
+                                    },
+                                    "wifi-monitor": {
+                                        desiredEnabled: false,
+                                        status: "disabled",
+                                        mode: "daemon",
+                                        runs: 0,
+                                        restarts: 0,
+                                        message: "module disabled",
+                                    },
+                                },
+                            },
+                            null,
+                            2,
+                        )}\n`,
+                    );
+
+                    const result = runManageCommand(sandbox, ["status"]);
+                    assert.equal(result.status, 0);
+                    assert.match(result.stdout, /scriptd state: stale snapshot \(LaunchAgent not loaded\)/);
+                    assert.match(result.stdout, /brew-manager: desired=enabled, interval, last=disabled, lastDesired=disabled/);
+                    assert.match(result.stdout, /wifi-monitor: desired=enabled, daemon, last=disabled, lastDesired=disabled/);
                 } finally {
                     await cleanupSandbox(sandbox);
                 }
