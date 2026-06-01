@@ -63,6 +63,12 @@ type PersistedState = {
     modules: Record<string, PersistedModuleState>;
 };
 
+type StopModuleOptions = {
+    finalMessage?: string;
+    finalStatus?: RuntimeStatus;
+    preserveDesiredEnabled?: boolean;
+};
+
 const REPO_ROOT = resolveRepoRoot();
 const supervisorStartedAt = new Date().toISOString();
 
@@ -142,12 +148,17 @@ export async function runSupervisor(): Promise<void> {
         state.nextRunAt = undefined;
     }
 
-    async function stopModule(state: ModuleRuntimeState): Promise<void> {
-        state.desiredEnabled = false;
+    async function stopModule(state: ModuleRuntimeState, options: StopModuleOptions = {}): Promise<void> {
+        const finalStatus = options.finalStatus ?? "disabled";
+        const finalMessage = options.finalMessage ?? "module disabled";
+
+        if (!options.preserveDesiredEnabled) {
+            state.desiredEnabled = false;
+        }
         clearModuleTimer(state);
 
         if (!state.controller) {
-            setState(state, "disabled", "module disabled");
+            setState(state, finalStatus, finalMessage);
             await writeStateFile();
             return;
         }
@@ -172,7 +183,7 @@ export async function runSupervisor(): Promise<void> {
         state.health = undefined;
         state.moduleStatus = undefined;
         state.lastExitAt = timestamp();
-        setState(state, "disabled", "module disabled");
+        setState(state, finalStatus, finalMessage);
         await writeStateFile();
     }
 
@@ -436,7 +447,11 @@ export async function runSupervisor(): Promise<void> {
         }
 
         for (const state of moduleStates.values()) {
-            await stopModule(state);
+            await stopModule(state, {
+                finalMessage: "supervisor stopped",
+                finalStatus: "stopped",
+                preserveDesiredEnabled: true,
+            });
         }
 
         await writeStateFile();

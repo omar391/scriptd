@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { existsSync, readFileSync } from "node:fs";
 import { chmod, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { resolveManageScriptPath, resolveRepoRoot } from "../paths.ts";
 import type { TestCase } from "./harness.ts";
 
@@ -33,6 +33,8 @@ async function createSandbox(): Promise<Sandbox> {
     await mkdir(repoRoot, { recursive: true });
     await mkdir(path.join(repoRoot, "src"), { recursive: true });
     await mkdir(path.join(repoRoot, "modules", "wifi-monitor"), { recursive: true });
+    await mkdir(path.join(repoRoot, "modules", "cpu-monitor"), { recursive: true });
+    await mkdir(path.join(repoRoot, "modules", "brew-manager"), { recursive: true });
     await mkdir(path.join(homeDir, "Library", "LaunchAgents"), { recursive: true });
     await mkdir(binDir, { recursive: true });
 
@@ -85,6 +87,41 @@ exit 0
         path.join(repoRoot, "modules", "wifi-monitor", "module.yaml"),
         `id: wifi-monitor
 mode: daemon
+`,
+    );
+    await writeFile(
+        path.join(repoRoot, "modules", "cpu-monitor", "module.ts"),
+        `export default {
+  id: "cpu-monitor",
+  mode: "daemon",
+  async start(ctx) {
+    ctx.log.info("sandbox cpu module started");
+    await new Promise((resolve) => ctx.signal.addEventListener("abort", resolve, { once: true }));
+  }
+};`,
+    );
+    await writeFile(
+        path.join(repoRoot, "modules", "cpu-monitor", "module.yaml"),
+        `id: cpu-monitor
+mode: daemon
+`,
+    );
+    await writeFile(
+        path.join(repoRoot, "modules", "brew-manager", "module.ts"),
+        `export default {
+  id: "brew-manager",
+  mode: "interval",
+  intervalMs: 30000,
+  async runOnce(ctx) {
+    ctx.log.info("sandbox brew module ran");
+  }
+};`,
+    );
+    await writeFile(
+        path.join(repoRoot, "modules", "brew-manager", "module.yaml"),
+        `id: brew-manager
+mode: interval
+interval_seconds: 30
 `,
     );
 
@@ -159,6 +196,35 @@ function runManageCommand(
         stdout: result.stdout ?? "",
         stderr: result.stderr ?? "",
     };
+}
+
+function startManageCommand(sandbox: Sandbox, args: string[], extraEnv: NodeJS.ProcessEnv = {}) {
+    return spawn(actualManageScriptPath, args, {
+        cwd: actualRepoRoot,
+        env: {
+            ...process.env,
+            ...extraEnv,
+            HOME: sandbox.homeDir,
+            PATH: `${sandbox.binDir}:/usr/bin:/bin:/usr/sbin:/sbin`,
+            SCRIPTD_ROOT_DIR: sandbox.repoRoot,
+            SCRIPTD_ENTRY_SHELL_PATH: path.join(sandbox.repoRoot, "scriptd.sh"),
+        },
+        stdio: "pipe",
+    });
+}
+
+async function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+
+    while (Date.now() < deadline) {
+        if (predicate()) {
+            return;
+        }
+
+        await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+
+    throw new Error(`Timed out after ${timeoutMs}ms`);
 }
 
 export function createIntegrationTests(): TestCase[] {
@@ -285,8 +351,49 @@ export function createIntegrationTests(): TestCase[] {
                     const result = runManageCommand(sandbox, ["status"]);
                     assert.equal(result.status, 0);
                     assert.match(result.stdout, /scriptd state: stale snapshot \(LaunchAgent not loaded\)/);
-                    assert.match(result.stdout, /brew-manager: desired=enabled, interval, last=disabled, lastDesired=disabled/);
-                    assert.match(result.stdout, /wifi-monitor: desired=enabled, daemon, last=disabled, lastDesired=disabled/);
+                    assert.match(
+                        result.stdout,
+                        /brew-manager: desired=enabled, interval, last=disabled, next=unknown \(service not running\)/,
+                    );
+                    assert.match(result.stdout, /wifi-monitor: desired=enabled, daemon, last=disabled/);
+                    assert.doesNotMatch(result.stdout, /module disabled/);
+                } finally {
+                    await cleanupSandbox(sandbox);
+                }
+            },
+        },
+        {
+            name: "run root preserves desired enabled state across shutdown",
+            run: async () => {
+                const sandbox = await createSandbox();
+                try {
+                    await prepareRuntimeWrappers(sandbox, {
+                        bun: "delegate",
+                        node: "delegate",
+                        npx: "delegate",
+                    });
+
+                    const child = startManageCommand(sandbox, ["run", "root"]);
+                    const stateFile = path.join(sandbox.homeDir, "Library", "Application Support", "scriptd", "state.json");
+                    await waitFor(() => existsSync(stateFile));
+
+                    child.kill("SIGTERM");
+                    await new Promise<void>((resolve, reject) => {
+                        child.once("exit", () => resolve());
+                        child.once("error", reject);
+                    });
+
+                    const state = JSON.parse(readFileSync(stateFile, "utf8")) as {
+                        modules: Record<string, { desiredEnabled: boolean; status: string; message: string }>;
+                    };
+
+                    assert.equal(state.modules["wifi-monitor"]?.desiredEnabled, true);
+                    assert.equal(state.modules["wifi-monitor"]?.status, "stopped");
+                    assert.equal(state.modules["wifi-monitor"]?.message, "supervisor stopped");
+                    assert.equal(state.modules["brew-manager"]?.desiredEnabled, true);
+                    assert.equal(state.modules["brew-manager"]?.status, "stopped");
+                    assert.equal(state.modules["brew-manager"]?.message, "supervisor stopped");
+                    assert.equal(state.modules["cpu-monitor"]?.desiredEnabled, false);
                 } finally {
                     await cleanupSandbox(sandbox);
                 }

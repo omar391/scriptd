@@ -40,6 +40,8 @@ type LaunchdStatus = {
     lastExitStatus: string;
 };
 
+const HIDDEN_STALE_MESSAGES = new Set(["module disabled", "supervisor stopped"]);
+
 function launchctlStatus(label: string): LaunchdStatus {
     const result = spawnSync("launchctl", ["list"], { encoding: "utf8" });
     const output = result.stdout ?? "";
@@ -107,6 +109,27 @@ function resolveStateFreshness(
     return { current: true };
 }
 
+function shouldShowModuleMessage(
+    moduleState: PersistedModuleState,
+    options: {
+        stateIsCurrent: boolean;
+    },
+): boolean {
+    if (!moduleState.message) {
+        return false;
+    }
+
+    if (!options.stateIsCurrent && HIDDEN_STALE_MESSAGES.has(moduleState.message)) {
+        return false;
+    }
+
+    if (moduleState.nextRunAt && moduleState.message === `next run at ${moduleState.nextRunAt}`) {
+        return false;
+    }
+
+    return true;
+}
+
 export async function renderStatus(): Promise<void> {
     const repoRoot = resolveRepoRoot();
     const config = await loadServiceConfig(repoRoot);
@@ -128,13 +151,14 @@ export async function renderStatus(): Promise<void> {
               configPath: config.path,
           })
         : undefined;
+    const stateIsCurrent = Boolean(stateFreshness?.current);
 
     if (!state) {
         console.log("scriptd state: unavailable");
     } else {
-        console.log(stateFreshness?.current ? "scriptd state: current" : `scriptd state: stale snapshot (${stateFreshness?.reason})`);
-        console.log(`${stateFreshness?.current ? "scriptd PID" : "Last known scriptd PID"}: ${state.supervisor.pid}`);
-        console.log(`${stateFreshness?.current ? "scriptd started" : "Last known scriptd start"}: ${state.supervisor.startedAt}`);
+        console.log(stateIsCurrent ? "scriptd state: current" : `scriptd state: stale snapshot (${stateFreshness?.reason})`);
+        console.log(`${stateIsCurrent ? "scriptd PID" : "Last known scriptd PID"}: ${state.supervisor.pid}`);
+        console.log(`${stateIsCurrent ? "scriptd started" : "Last known scriptd start"}: ${state.supervisor.startedAt}`);
         console.log(`scriptd watch enabled: ${state.supervisor.watch ? "yes" : "no"}`);
         console.log(`State updated: ${state.updatedAt}`);
     }
@@ -161,14 +185,16 @@ export async function renderStatus(): Promise<void> {
             continue;
         }
 
-        details.push(`${stateFreshness?.current ? "runtime" : "last"}=${moduleState.status}`);
+        details.push(`${stateIsCurrent ? "runtime" : "last"}=${moduleState.status}`);
 
-        if (moduleState.desiredEnabled !== desiredEnabled) {
+        if (stateIsCurrent && moduleState.desiredEnabled !== desiredEnabled) {
             details.push(`lastDesired=${moduleState.desiredEnabled ? "enabled" : "disabled"}`);
         }
 
         if (moduleState.nextRunAt) {
             details.push(`next=${moduleState.nextRunAt}`);
+        } else if (!stateIsCurrent && desiredEnabled && moduleState.mode === "interval") {
+            details.push("next=unknown (service not running)");
         }
 
         details.push(`runs=${moduleState.runs}`);
@@ -187,7 +213,9 @@ export async function renderStatus(): Promise<void> {
             }
         }
 
-        details.push(moduleState.message);
+        if (shouldShowModuleMessage(moduleState, { stateIsCurrent })) {
+            details.push(moduleState.message);
+        }
         console.log(`- ${moduleName}: ${details.join(", ")}`);
 
         if (moduleState.health?.message) {
