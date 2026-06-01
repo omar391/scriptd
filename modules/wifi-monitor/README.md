@@ -3,6 +3,8 @@ wifi-monitor
 
 This is a small macOS Wi‑Fi monitor that filters to known SSIDs, scores each candidate, and switches to the highest-scoring one.
 
+It prefers the legacy `airport -s` scan output when available, and falls back to a CoreWLAN scan through `swift` on newer macOS setups where the private `airport` binary is missing.
+
 How ranking works
 - If `WIFI_MONITOR_SSIDS` is set, only those SSIDs are considered.
 - If `WIFI_MONITOR_SSIDS` is empty, the monitor falls back to the system preferred Wi-Fi network list from `networksetup`.
@@ -31,6 +33,7 @@ Configuration
   - `WIFI_MONITOR_PING_TARGET` — host used to measure latency for ranking.
   - `WIFI_MONITOR_PING_TIMEOUT` — ping timeout in seconds (default 1).
   - `WIFI_MONITOR_PING_WEIGHT` — divisor used to convert ping latency into a penalty (default 8).
+  - `WIFI_MONITOR_AIRPORT_PATH` — override the `airport` scanner path; if the command is missing or fails, the module falls back to CoreWLAN via `swift`.
 
 Config file
 - `module.yaml` is the single module manifest/config file. Example keys:

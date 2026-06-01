@@ -64,7 +64,7 @@ Repo layout:
 
 Module-specific tools:
 
-- `wifi-monitor`: `networksetup`, `ping`, and the private `airport` CLI
+- `wifi-monitor`: `networksetup`, `ping`, and either the private `airport` CLI or the built-in `swift` CoreWLAN fallback
 - `cpu-monitor`: `ps` and the ability to signal processes
 - `brew-manager`: Homebrew, `security`, and `sudo`
 

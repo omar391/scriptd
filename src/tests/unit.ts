@@ -12,7 +12,7 @@ import {
     parseSimpleYaml,
 } from "../config.ts";
 import { resolveRepoRoot, resolveServiceConfigPath } from "../paths.ts";
-import { scoreNetwork, resolveWifiMonitorConfig } from "../../modules/wifi-monitor/module.ts";
+import { parseSwiftWifiScanOutput, scoreNetwork, resolveWifiMonitorConfig } from "../../modules/wifi-monitor/module.ts";
 import { buildBrewCommands } from "../../modules/brew-manager/module.ts";
 import { parseCpuSnapshot, reconcileTrackedProcesses } from "../../modules/cpu-monitor/module.ts";
 import type { TestCase } from "./harness.ts";
@@ -270,6 +270,46 @@ mode: daemon
                     ) > 0,
                     true,
                 );
+            },
+        },
+        {
+            name: "wifi-monitor parses CoreWLAN fallback scan output",
+            run: () => {
+                const networks = parseSwiftWifiScanOutput(
+                    JSON.stringify([
+                        {
+                            ssid: "knight_riders_5G",
+                            rssi: -68,
+                            channel: "161",
+                            summary:
+                                "<CWNetwork: 0x10afafb60> [ssid=knight_riders_5G, bssid=(null), security=WPA2 Personal, rssi=-68, channel=<CWChannel: 0x10afb3dd0> [channelNumber=161(5GHz), channelWidth={80MHz}], ibss=0]",
+                        },
+                        {
+                            ssid: "Lab6E",
+                            rssi: -55,
+                            channel: "233",
+                            summary:
+                                "<CWNetwork: 0x10afb3a60> [ssid=Lab6E, bssid=(null), security=WPA3 Personal, rssi=-55, channel=<CWChannel: 0x10afb3db0> [channelNumber=233(6GHz), channelWidth={160MHz}], ibss=0]",
+                        },
+                    ]),
+                );
+
+                assert.deepEqual(networks, [
+                    {
+                        ssid: "knight_riders_5G",
+                        band: "5g",
+                        rssi: -68,
+                        channel: "161",
+                        security: "WPA2 Personal",
+                    },
+                    {
+                        ssid: "Lab6E",
+                        band: "6g",
+                        rssi: -55,
+                        channel: "233",
+                        security: "WPA3 Personal",
+                    },
+                ]);
             },
         },
         {

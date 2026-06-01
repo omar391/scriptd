@@ -4,6 +4,8 @@ import { spawnSync } from "node:child_process";
 import type { ModuleContext, ModuleHealth, ModuleStatus, RootServiceModule } from "../../src/interfaces.ts";
 import { assertPositiveInteger, parseSimpleYaml } from "../../src/config.ts";
 
+const DEFAULT_AIRPORT_PATH = "/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport";
+
 export type Network = {
     ssid: string;
     band: "2g" | "5g" | "6g";
@@ -48,6 +50,11 @@ function envNumber(raw: string | undefined, fallback: number): number {
     return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+function airportPath(): string {
+    const override = process.env.WIFI_MONITOR_AIRPORT_PATH?.trim();
+    return override && override.length > 0 ? override : DEFAULT_AIRPORT_PATH;
+}
+
 function command(command: string, args: string[], check = true): string {
     const result = spawnSync(command, args, { encoding: "utf8" });
     if (check && result.status !== 0) {
@@ -80,6 +87,22 @@ function ensureStringValue(value: unknown, label: string): string {
     }
 
     return value;
+}
+
+function commandExists(commandName: string): boolean {
+    const result = spawnSync("sh", ["-lc", `command -v ${JSON.stringify(commandName)} >/dev/null 2>&1`], {
+        encoding: "utf8",
+    });
+    return result.status === 0;
+}
+
+function runSwift(code: string): string {
+    const result = spawnSync("swift", ["-e", code], { encoding: "utf8" });
+    if (result.status !== 0) {
+        throw new Error(result.stderr || "swift command failed");
+    }
+
+    return (result.stdout ?? "").trim();
 }
 
 export function resolveWifiMonitorConfig(raw: Record<string, unknown>, env: NodeJS.ProcessEnv): WifiMonitorConfig {
@@ -125,13 +148,42 @@ function wifiDevice(): string {
         }
     }
 
+    if (commandExists("swift")) {
+        const output = runSwift(`
+import Foundation
+import CoreWLAN
+
+if let iface = CWWiFiClient.shared().interface(), let name = iface.interfaceName {
+    print(name)
+}
+`);
+        if (output) {
+            return output;
+        }
+    }
+
     throw new Error("could not find Wi-Fi device");
 }
 
 function currentSsid(device: string): string {
     const output = command("networksetup", ["-getairportnetwork", device], false);
     const match = output.match(/Current Wi-Fi Network: (.+)$/m);
-    return match ? match[1].trim() : "";
+    if (match?.[1]) {
+        return match[1].trim();
+    }
+
+    if (commandExists("swift")) {
+        return runSwift(`
+import Foundation
+import CoreWLAN
+
+if let iface = CWWiFiClient.shared().interface(), let ssid = iface.ssid() {
+    print(ssid)
+}
+`);
+    }
+
+    return "";
 }
 
 function pingMs(target: string, timeoutSeconds: number): number | undefined {
@@ -148,11 +200,88 @@ function pingMs(target: string, timeoutSeconds: number): number | undefined {
     return match ? Math.round(Number(match[1])) : undefined;
 }
 
+type SwiftScanRecord = {
+    ssid: string;
+    rssi: number;
+    channel: string;
+    summary?: string;
+};
+
+function parseSecurity(summary: string | undefined): string {
+    if (!summary) {
+        return "unknown";
+    }
+
+    const match = summary.match(/security=([^,\]]+)/i);
+    return match?.[1]?.trim() ?? "unknown";
+}
+
+export function parseSwiftWifiScanOutput(output: string): Network[] {
+    const parsed = JSON.parse(output) as SwiftScanRecord[];
+    return parsed
+        .filter((item) => item && typeof item.ssid === "string" && item.ssid.trim().length > 0)
+        .map((item) => {
+            const channelNumber = Number(item.channel.match(/(\d+)/)?.[1] ?? 0);
+            let band: "2g" | "5g" | "6g" = "2g";
+            if (channelNumber > 165) {
+                band = "6g";
+            } else if (channelNumber >= 36) {
+                band = "5g";
+            }
+
+            return {
+                ssid: item.ssid.trim(),
+                band,
+                rssi: Number(item.rssi),
+                channel: item.channel,
+                security: parseSecurity(item.summary),
+            };
+        });
+}
+
+function scanWifiViaSwift(allowedSsids: string[]): Network[] {
+    if (!commandExists("swift")) {
+        throw new Error("swift is not available for Wi-Fi scanning");
+    }
+
+    const output = runSwift(`
+import Foundation
+import CoreWLAN
+
+let client = CWWiFiClient.shared()
+guard let iface = client.interface() else {
+    throw NSError(domain: "scriptd", code: 1, userInfo: [NSLocalizedDescriptionKey: "No Wi-Fi interface available"])
+}
+
+let networks = try iface.scanForNetworks(withSSID: nil)
+let rows: [[String: Any]] = networks.compactMap { network in
+    guard let ssid = network.ssid, !ssid.isEmpty else {
+        return nil
+    }
+
+    return [
+        "ssid": ssid,
+        "rssi": network.rssiValue,
+        "channel": String(network.wlanChannel?.channelNumber ?? 0),
+        "summary": String(describing: network),
+    ]
+}
+
+let data = try JSONSerialization.data(withJSONObject: rows, options: [])
+print(String(data: data, encoding: .utf8) ?? "[]")
+`);
+
+    return parseSwiftWifiScanOutput(output).filter((network) => allowedSsids.length === 0 || allowedSsids.includes(network.ssid));
+}
+
 function scanWifi(allowedSsids: string[]): Network[] {
-    const output = command(
-        "/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport",
-        ["-s"],
-    );
+    const scannerPath = airportPath();
+    const result = spawnSync(scannerPath, ["-s"], { encoding: "utf8" });
+    if (result.status !== 0) {
+        return scanWifiViaSwift(allowedSsids);
+    }
+
+    const output = (result.stdout ?? "").trim();
 
     const pattern =
         /^(?<ssid>.+?)\s+(?<bssid>(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2})\s+(?<rssi>-?\d+)\s+(?<channel>\S+)\s+(?<ht>\S+)\s+(?<cc>\S+)\s+(?<security>.+)$/;
