@@ -224,14 +224,15 @@ export async function renderStatus(): Promise<void> {
         const moduleState = state?.modules[moduleName];
         const desiredEnabled = config.modules[moduleName]?.enabled ?? false;
         const discoveredModule = modules.get(moduleName);
+        const effectiveMode = !stateIsCurrent && discoveredModule?.plugin.mode ? discoveredModule.plugin.mode : moduleState?.mode;
         const details: string[] = [`desired=${desiredEnabled ? "enabled" : "disabled"}`];
         const nextFromConfig =
             discoveredModule?.plugin.mode === "interval"
                 ? nextScheduledRun(config.modules[moduleName]?.schedule, new Date(), discoveredModule.plugin.intervalMs ?? 0)
                 : undefined;
 
-        if (moduleState?.mode) {
-            details.push(moduleState.mode);
+        if (effectiveMode) {
+            details.push(effectiveMode);
         } else if (discoveredModule?.plugin.mode) {
             details.push(discoveredModule.plugin.mode);
         }
@@ -259,20 +260,20 @@ export async function renderStatus(): Promise<void> {
 
         if (moduleState.nextRunAt) {
             details.push(`next=${moduleState.nextRunAt}`);
-        } else if (!stateIsCurrent && desiredEnabled && moduleState.mode === "interval") {
+        } else if (!stateIsCurrent && desiredEnabled && effectiveMode === "interval") {
             const nextHint = staleNextHint({
                 desiredEnabled,
-                mode: moduleState.mode,
+                mode: effectiveMode,
                 intervalMs: discoveredModule?.plugin.intervalMs,
                 nextRunAt: nextFromConfig,
             });
             if (nextHint) {
                 details.push(`next=${nextHint}`);
             }
-        } else if (!stateIsCurrent && desiredEnabled && moduleState.mode === "daemon") {
+        } else if (!stateIsCurrent && desiredEnabled && effectiveMode === "daemon") {
             const nextHint = staleNextHint({
                 desiredEnabled,
-                mode: moduleState.mode,
+                mode: effectiveMode,
                 intervalMs: discoveredModule?.plugin.intervalMs,
             });
             if (nextHint) {

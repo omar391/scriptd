@@ -344,7 +344,7 @@ export function createIntegrationTests(): TestCase[] {
                                     "cpu-monitor": {
                                         desiredEnabled: false,
                                         status: "disabled",
-                                        mode: "interval",
+                                        mode: "daemon",
                                         runs: 0,
                                         restarts: 0,
                                         message: "module disabled",
@@ -352,7 +352,7 @@ export function createIntegrationTests(): TestCase[] {
                                     "wifi-monitor": {
                                         desiredEnabled: false,
                                         status: "disabled",
-                                        mode: "interval",
+                                        mode: "daemon",
                                         runs: 0,
                                         restarts: 0,
                                         message: "module disabled",
