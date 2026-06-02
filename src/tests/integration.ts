@@ -29,6 +29,7 @@ async function createSandbox(): Promise<Sandbox> {
     const binDir = path.join(tempRoot, "bin");
     const runtimeLogPath = path.join(tempRoot, "runtime.log");
     const launchctlLogPath = path.join(tempRoot, "launchctl.log");
+    const launchctlStatePath = path.join(tempRoot, "launchctl-state");
 
     await mkdir(repoRoot, { recursive: true });
     await mkdir(path.join(repoRoot, "src"), { recursive: true });
@@ -139,6 +140,28 @@ interval_seconds: 30
         path.join(binDir, "launchctl"),
         `#!/bin/bash
 echo "$*" >> "${launchctlLogPath}"
+case "$1" in
+  list)
+    if [ -f "${launchctlStatePath}" ]; then
+      echo "12345 0 com.omar.scriptd"
+    fi
+    ;;
+  load)
+    if [[ "$*" == *"com.omar.scriptd.plist"* ]]; then
+      touch "${launchctlStatePath}"
+    fi
+    ;;
+  unload)
+    if [[ "$*" == *"com.omar.scriptd.plist"* ]]; then
+      rm -f "${launchctlStatePath}"
+    fi
+    ;;
+  remove)
+    if [ "$2" = "com.omar.scriptd" ]; then
+      rm -f "${launchctlStatePath}"
+    fi
+    ;;
+esac
 exit 0
 `,
         "utf8",
@@ -271,6 +294,35 @@ export function createIntegrationTests(): TestCase[] {
                     assert.equal(result.status, 0);
                     assert.match(result.stdout, /Config path: .*\/service\.yaml/);
                     assert.equal(readFileSync(sandbox.runtimeLogPath, "utf8").trim().split("\n")[0], "bun");
+                } finally {
+                    await cleanupSandbox(sandbox);
+                }
+            },
+        },
+        {
+            name: "help exposes only the public root lifecycle commands",
+            run: async () => {
+                const sandbox = await createSandbox();
+                try {
+                    await prepareRuntimeWrappers(sandbox, {
+                        bun: "delegate",
+                        node: "delegate",
+                        npx: "delegate",
+                    });
+
+                    const help = runManageCommand(sandbox, ["help"]);
+                    assert.equal(help.status, 0);
+                    assert.match(help.stdout, /scriptd\.sh start root/);
+                    assert.doesNotMatch(help.stdout, /^\s*scriptd\.sh restart root/m);
+                    assert.doesNotMatch(help.stdout, /^\s*scriptd\.sh install root/m);
+                    assert.doesNotMatch(help.stdout, /^\s*scriptd\.sh reload/m);
+
+                    const restart = runManageCommand(sandbox, ["restart", "root"]);
+                    assert.equal(restart.status, 2);
+                    const install = runManageCommand(sandbox, ["install", "root"]);
+                    assert.equal(install.status, 2);
+                    const reload = runManageCommand(sandbox, ["reload"]);
+                    assert.equal(reload.status, 2);
                 } finally {
                     await cleanupSandbox(sandbox);
                 }
@@ -515,7 +567,7 @@ modules:
             },
         },
         {
-            name: "start restart stop and uninstall root operate on the sandbox launch agents path",
+            name: "start stop and uninstall root operate on the sandbox launch agents path",
             run: async () => {
                 const sandbox = await createSandbox();
                 try {
@@ -539,8 +591,8 @@ modules:
                     assert.equal(existsSync(path.join(appPath, "Contents", "Resources", "Scriptd.icns")), true);
                     assert.match(readFileSync(appExecutable, "utf8"), new RegExp(sandboxManage.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 
-                    const restart = runManageCommand(sandbox, ["restart", "root"]);
-                    assert.equal(restart.status, 0);
+                    const secondStart = runManageCommand(sandbox, ["start", "root"]);
+                    assert.equal(secondStart.status, 0);
                     const launchctlLog = readFileSync(sandbox.launchctlLogPath, "utf8");
                     assert.match(launchctlLog, /enable gui\/\d+\/com\.omar\.scriptd/);
                     assert.match(launchctlLog, /load -w .*com\.omar\.scriptd\.plist/);
@@ -553,6 +605,65 @@ modules:
                     const uninstall = runManageCommand(sandbox, ["uninstall", "root"]);
                     assert.equal(uninstall.status, 0);
                     assert.equal(existsSync(plistPath), false);
+                } finally {
+                    await cleanupSandbox(sandbox);
+                }
+            },
+        },
+        {
+            name: "setup module updates enablement and schedule in service yaml",
+            run: async () => {
+                const sandbox = await createSandbox();
+                try {
+                    await prepareRuntimeWrappers(sandbox, {
+                        bun: "delegate",
+                        node: "delegate",
+                        npx: "delegate",
+                    });
+
+                    const disable = runManageCommand(sandbox, ["setup", "wifi-monitor", "--disable"]);
+                    assert.equal(disable.status, 0);
+                    assert.match(disable.stdout, /Updated wifi-monitor in service\.yaml/);
+                    let serviceYaml = readFileSync(path.join(sandbox.repoRoot, "service.yaml"), "utf8");
+                    assert.match(serviceYaml, /wifi-monitor:\n    enabled: false/);
+
+                    const schedule = runManageCommand(sandbox, [
+                        "setup",
+                        "wifi-monitor",
+                        "--enable",
+                        "--every-minutes",
+                        "5",
+                        "--weekday",
+                        "mon",
+                        "--window-start",
+                        "09:00",
+                        "--window-end",
+                        "17:00",
+                    ]);
+                    assert.equal(schedule.status, 0);
+                    serviceYaml = readFileSync(path.join(sandbox.repoRoot, "service.yaml"), "utf8");
+                    assert.match(serviceYaml, /wifi-monitor:\n    enabled: true\n    schedule:\n      every_seconds: 300/);
+                    assert.match(serviceYaml, /weekdays:\n        - mon/);
+                    assert.match(serviceYaml, /window:\n        start: 09:00\n        end: 17:00/);
+                } finally {
+                    await cleanupSandbox(sandbox);
+                }
+            },
+        },
+        {
+            name: "setup module rejects conflicting enablement flags",
+            run: async () => {
+                const sandbox = await createSandbox();
+                try {
+                    await prepareRuntimeWrappers(sandbox, {
+                        bun: "delegate",
+                        node: "delegate",
+                        npx: "delegate",
+                    });
+
+                    const result = runManageCommand(sandbox, ["setup", "wifi-monitor", "--disable", "--enable"]);
+                    assert.notEqual(result.status, 0);
+                    assert.match(result.stderr, /Use only one of --enable or --disable/);
                 } finally {
                     await cleanupSandbox(sandbox);
                 }

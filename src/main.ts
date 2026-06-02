@@ -1,29 +1,21 @@
 import path from "node:path";
 import { promises as fs } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { discoverModules, ensureDirectory, loadServiceConfig } from "./config.ts";
+import { discoverModules, ensureDirectory, loadServiceConfig, type ModuleSchedule, type ServiceConfig, type Weekday } from "./config.ts";
 import { runModuleDirect, runModuleSetup } from "./module-runner.ts";
 import { resolveManageScriptPath, resolveRepoRoot, resolveStateDir, resolveStateFile } from "./paths.ts";
 import { renderStatus } from "./status.ts";
 import { runSupervisor } from "./supervisor.ts";
 import { runAllTests } from "./test.ts";
 
-type PersistedState = {
-    supervisor?: {
-        pid?: number;
-    };
-};
-
 function usage(): string {
     return `Usage:
   scriptd.sh start root
-  scriptd.sh restart root
   scriptd.sh stop root
   scriptd.sh uninstall root
   scriptd.sh run <module>
-  scriptd.sh reload
   scriptd.sh status
-  scriptd.sh setup <module>
+  scriptd.sh setup <module> [--enable|--disable] [--every-seconds n|--every-minutes n|--every-hours n|--daily-at HH:MM|--cron expr]
   scriptd.sh test`;
 }
 
@@ -45,6 +37,10 @@ function runLaunchctl(args: string[], check: boolean): void {
     if (check && result.status !== 0) {
         throw new Error(result.stderr || `launchctl ${args.join(" ")} failed`);
     }
+}
+
+function launchctlResult(args: string[]): ReturnType<typeof spawnSync> {
+    return spawnSync("launchctl", args, { encoding: "utf8" });
 }
 
 function launchdDomainLabel(label: string): string {
@@ -183,15 +179,16 @@ async function writeRootPlist(): Promise<{ label: string; plistPath: string }> {
     return { label: config.label, plistPath };
 }
 
-async function startRoot(options: { restart?: boolean; alias?: "install" } = {}): Promise<number> {
+async function startRoot(): Promise<number> {
     const { label, plistPath } = await writeRootPlist();
+    const wasLoaded = launchctlResult(["list"]).stdout?.split("\n").some((line) => line.trim().split(/\s+/)[2] === label) ?? false;
 
-    if (options.restart) {
+    if (wasLoaded) {
         runLaunchctl(["unload", plistPath], false);
     }
     runLaunchctl(["enable", launchdDomainLabel(label)], false);
     runLaunchctl(["load", "-w", plistPath], true);
-    console.log(`${options.alias === "install" ? "Installed" : options.restart ? "Restarted" : "Started"} root LaunchAgent ${label}`);
+    console.log(`${wasLoaded ? "Restarted" : "Started"} root LaunchAgent ${label}`);
     return 0;
 }
 
@@ -210,32 +207,6 @@ async function stopRoot(): Promise<number> {
     const plistPath = rootPlistPath(config.label);
     runLaunchctl(["unload", plistPath], false);
     console.log(`Stopped root LaunchAgent ${config.label}`);
-    return 0;
-}
-
-async function reloadRoot(): Promise<number> {
-    const repoRoot = resolveRepoRoot();
-    const config = await loadServiceConfig(repoRoot);
-    const stateFile = resolveStateFile();
-
-    try {
-        const parsed = JSON.parse(await fs.readFile(stateFile, "utf8")) as PersistedState;
-        const pid = parsed.supervisor?.pid;
-        if (typeof pid === "number") {
-            process.kill(pid, "SIGHUP");
-            console.log(`Sent SIGHUP to supervisor PID ${pid}`);
-            return 0;
-        }
-    } catch {
-        // fall back to launchctl
-    }
-
-    const result = spawnSync("launchctl", ["kill", "HUP", launchdDomainLabel(config.label)], { encoding: "utf8" });
-    if (result.status !== 0) {
-        throw new Error("Could not find a running scriptd service to reload.");
-    }
-
-    console.log(`Requested launchd reload for ${config.label}`);
     return 0;
 }
 
@@ -261,6 +232,196 @@ async function setupModule(moduleName: string): Promise<number> {
     return 0;
 }
 
+type SetupOptions = {
+    enabled?: boolean;
+    schedule?: ModuleSchedule;
+};
+
+function parsePositiveInteger(raw: string | undefined, label: string): number {
+    const parsed = Number(raw);
+    if (!Number.isInteger(parsed) || parsed <= 0) {
+        throw new Error(`${label} must be a positive integer`);
+    }
+
+    return parsed;
+}
+
+function assertTimeOfDay(value: string, label: string): void {
+    if (!/^([01]\d|2[0-3]):([0-5]\d)$/.test(value)) {
+        throw new Error(`${label} must use HH:MM 24-hour time`);
+    }
+}
+
+function parseWeekdayOption(value: string, label: string): Weekday {
+    const normalized = value.toLowerCase();
+    if (!["sun", "mon", "tue", "wed", "thu", "fri", "sat"].includes(normalized)) {
+        throw new Error(`${label} must be one of sun, mon, tue, wed, thu, fri, sat`);
+    }
+
+    return normalized as Weekday;
+}
+
+function assertCronExpression(value: string, label: string): void {
+    if (value.trim().split(/\s+/).length !== 6) {
+        throw new Error(`${label} must use six fields: second minute hour day month weekday`);
+    }
+}
+
+function parseSetupOptions(args: string[]): SetupOptions {
+    const options: SetupOptions = {};
+    const schedule: ModuleSchedule = {};
+    let enableFlagSeen = false;
+    let disableFlagSeen = false;
+
+    for (let index = 0; index < args.length; index += 1) {
+        const flag = args[index];
+        const next = () => {
+            index += 1;
+            if (index >= args.length) {
+                throw new Error(`${flag} requires a value`);
+            }
+
+            return args[index];
+        };
+
+        if (flag === "--enable") {
+            enableFlagSeen = true;
+            options.enabled = true;
+        } else if (flag === "--disable") {
+            disableFlagSeen = true;
+            options.enabled = false;
+        } else if (flag === "--every-seconds") {
+            schedule.everySeconds = parsePositiveInteger(next(), flag);
+        } else if (flag === "--every-minutes") {
+            schedule.everySeconds = parsePositiveInteger(next(), flag) * 60;
+        } else if (flag === "--every-hours") {
+            schedule.everySeconds = parsePositiveInteger(next(), flag) * 3600;
+        } else if (flag === "--daily-at") {
+            const value = next();
+            assertTimeOfDay(value, flag);
+            schedule.dailyAt = [...(schedule.dailyAt ?? []), value];
+        } else if (flag === "--cron") {
+            const value = next();
+            assertCronExpression(value, flag);
+            schedule.cron = [...(schedule.cron ?? []), value];
+        } else if (flag === "--weekday") {
+            schedule.weekdays = [...(schedule.weekdays ?? []), parseWeekdayOption(next(), flag)];
+        } else if (flag === "--window-start") {
+            const value = next();
+            assertTimeOfDay(value, flag);
+            schedule.window = { start: value, end: schedule.window?.end ?? "23:59" };
+        } else if (flag === "--window-end") {
+            const value = next();
+            assertTimeOfDay(value, flag);
+            schedule.window = { start: schedule.window?.start ?? "00:00", end: value };
+        } else {
+            throw new Error(`Unknown setup option: ${flag}`);
+        }
+    }
+
+    if (enableFlagSeen && disableFlagSeen) {
+        throw new Error("Use only one of --enable or --disable");
+    }
+
+    const triggerCount = [schedule.cron, schedule.dailyAt, schedule.everySeconds].filter((value) => value !== undefined).length;
+    if (triggerCount > 1) {
+        throw new Error("Use only one schedule trigger per setup command");
+    }
+
+    if (triggerCount > 0 || schedule.weekdays || schedule.window) {
+        options.schedule = schedule;
+    }
+
+    return options;
+}
+
+function yamlString(value: string): string {
+    return /^[A-Za-z0-9_.:/-]+$/.test(value) ? value : JSON.stringify(value);
+}
+
+function scheduleYaml(schedule: ModuleSchedule, indent: string): string[] {
+    const lines: string[] = [];
+    if (schedule.cron) {
+        lines.push(`${indent}cron:`);
+        for (const expression of schedule.cron) {
+            lines.push(`${indent}  - ${yamlString(expression)}`);
+        }
+    } else if (schedule.dailyAt) {
+        if (schedule.dailyAt.length === 1) {
+            lines.push(`${indent}daily_at: ${yamlString(schedule.dailyAt[0])}`);
+        } else {
+            lines.push(`${indent}daily_at:`);
+            for (const time of schedule.dailyAt) {
+                lines.push(`${indent}  - ${yamlString(time)}`);
+            }
+        }
+    } else if (schedule.everySeconds) {
+        lines.push(`${indent}every_seconds: ${schedule.everySeconds}`);
+    }
+
+    if (schedule.weekdays && schedule.weekdays.length > 0) {
+        lines.push(`${indent}weekdays:`);
+        for (const weekday of schedule.weekdays) {
+            lines.push(`${indent}  - ${weekday}`);
+        }
+    }
+
+    if (schedule.window) {
+        lines.push(`${indent}window:`);
+        lines.push(`${indent}  start: ${yamlString(schedule.window.start)}`);
+        lines.push(`${indent}  end: ${yamlString(schedule.window.end)}`);
+    }
+
+    return lines;
+}
+
+function serializeServiceConfig(config: ServiceConfig): string {
+    const homeDir = process.env.HOME;
+    const logDir = homeDir && config.logDir.startsWith(homeDir) ? config.logDir.replace(homeDir, "~") : config.logDir;
+    const lines = [
+        `label: ${config.label}`,
+        `log_dir: ${logDir}`,
+        `watch: ${config.watch ? "true" : "false"}`,
+        "modules:",
+    ];
+
+    for (const moduleName of Object.keys(config.modules).sort()) {
+        const moduleConfig = config.modules[moduleName];
+        lines.push(`  ${moduleName}:`);
+        lines.push(`    enabled: ${moduleConfig.enabled ? "true" : "false"}`);
+        if (moduleConfig.schedule) {
+            lines.push("    schedule:");
+            lines.push(...scheduleYaml(moduleConfig.schedule, "      "));
+        }
+    }
+
+    return `${lines.join("\n")}\n`;
+}
+
+async function updateModuleSetup(moduleName: string, options: SetupOptions): Promise<number> {
+    if (options.enabled === undefined && !options.schedule) {
+        return await setupModule(moduleName);
+    }
+
+    const repoRoot = resolveRepoRoot();
+    const modules = await discoverModules(repoRoot);
+    if (!modules.has(moduleName)) {
+        throw new Error(`Unknown module: ${moduleName}`);
+    }
+
+    const config = await loadServiceConfig(repoRoot);
+    const current = config.modules[moduleName] ?? { enabled: false };
+    config.modules[moduleName] = {
+        ...current,
+        enabled: options.enabled ?? current.enabled,
+        schedule: options.schedule ?? current.schedule,
+    };
+
+    await fs.writeFile(config.path, serializeServiceConfig(config), "utf8");
+    console.log(`Updated ${moduleName} in service.yaml`);
+    return 0;
+}
+
 export async function runCli(argv: string[] = process.argv.slice(2)): Promise<number> {
     const [command, target] = argv;
 
@@ -273,16 +434,13 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<nu
         return command ? 0 : 2;
     }
 
-    if (command === "install" || command === "start" || command === "restart") {
+    if (command === "start") {
         if (target !== "root") {
             console.error(usage());
             return 2;
         }
 
-        return await startRoot({
-            restart: command === "restart",
-            alias: command === "install" ? "install" : undefined,
-        });
+        return await startRoot();
     }
 
     if (command === "uninstall") {
@@ -317,10 +475,6 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<nu
         return await runModule(target);
     }
 
-    if (command === "reload") {
-        return await reloadRoot();
-    }
-
     if (command === "status") {
         await renderStatus();
         return 0;
@@ -332,7 +486,7 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<nu
             return 2;
         }
 
-        return await setupModule(target);
+        return await updateModuleSetup(target, parseSetupOptions(argv.slice(2)));
     }
 
     if (command === "test") {

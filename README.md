@@ -1,6 +1,6 @@
 # scriptd
 
-`scriptd` is a lightweight macOS automation supervisor for small TypeScript modules. It installs a single user-level `launchd` agent, loads modules from `modules/*`, manages long-running daemons and scheduled jobs, and exposes status, health, logs, and reload controls through a simple shell entrypoint.
+`scriptd` is a lightweight macOS automation supervisor for small TypeScript modules. It installs a single user-level `launchd` agent, loads modules from `modules/*`, manages long-running daemons and scheduled jobs, and exposes status, health, logs, and configuration controls through a simple shell entrypoint.
 
 The project is intentionally minimal:
 
@@ -24,7 +24,7 @@ The project is intentionally minimal:
 ```text
 scriptd.sh
   -> src/main.ts
-      -> install/uninstall/reload/status/test commands
+      -> start/stop/uninstall/status/test commands
       -> run root -> src/supervisor.ts
           -> discover modules from modules/<name>/
           -> load module.ts + module.yaml
@@ -95,18 +95,16 @@ Module-specific tools:
 Notes:
 
 - `root` means the top-level `scriptd` service, not the root user.
-- The LaunchAgent runs through a generated `Scriptd.app` wrapper in `~/Library/Application Support/scriptd` so macOS Login Items can show a real `scriptd` icon. If you move the repo after starting the service, run `./scriptd.sh restart root`.
+- The LaunchAgent runs through a generated `Scriptd.app` wrapper in `~/Library/Application Support/scriptd` so macOS Login Items can show a real `scriptd` icon. If you move the repo after starting the service, run `./scriptd.sh start root`.
 
 ## Commands
 
 ```bash
 ./scriptd.sh start root        # install or update the LaunchAgent, then start it
-./scriptd.sh restart root      # install or update the LaunchAgent, then restart it
 ./scriptd.sh stop root         # stop the LaunchAgent but keep it installed
 ./scriptd.sh uninstall root    # remove the LaunchAgent
 ./scriptd.sh run <module>      # run one module directly
-./scriptd.sh setup <module>    # run one-time module setup
-./scriptd.sh reload            # reload service.yaml in the running supervisor
+./scriptd.sh setup <module>    # run setup, or update enablement/schedule with flags
 ./scriptd.sh status            # print launchd + module status
 ./scriptd.sh test              # run unit and integration tests
 ```
@@ -175,6 +173,17 @@ schedule:
 
 Module-specific algorithm settings still live in each module's `module.yaml`.
 
+Update module enablement and schedules with `setup <module>`:
+
+```bash
+./scriptd.sh setup wifi-monitor --enable --every-minutes 5
+./scriptd.sh setup cpu-monitor --disable
+./scriptd.sh setup brew-manager --enable --daily-at 09:30 --weekday mon --weekday wed --weekday fri
+./scriptd.sh setup brew-manager --cron "0 0 */12 * * *"
+```
+
+Run `./scriptd.sh start root` after changing setup flags to install/update the LaunchAgent and restart it if it is already running. When `watch: true`, a running supervisor also picks up `service.yaml` edits automatically.
+
 ## Bundled Modules
 
 ### `wifi-monitor`
@@ -233,14 +242,14 @@ The `status` command combines:
 
 ## Runtime Behavior
 
-- `start root` and `restart root` write the LaunchAgent plist and call `launchctl load -w`, so a disabled login item is re-enabled.
+- `start root` writes the LaunchAgent plist, re-enables the launchd item, and starts or restarts it as needed.
 - The LaunchAgent points at `~/Library/Application Support/scriptd/Scriptd.app/Contents/MacOS/scriptd`; that launcher executes this checkout's `scriptd.sh run root`.
 - Daemon modules are started immediately when enabled.
 - Interval modules are scheduled from `service.yaml`; `intervalMs` and `interval_seconds` remain the module's fallback cadence.
 - Interval runs do not overlap.
 - Daemon modules are restarted after crashes with a short delay.
 - Disabling a module aborts its signal and calls the module's optional `stop()` hook.
-- `reload` sends `SIGHUP` to the running supervisor or asks `launchctl` to do so.
+- With `watch: true`, `service.yaml` changes are applied by the running supervisor automatically.
 
 ## Writing A Module
 
