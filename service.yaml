@@ -2,15 +2,18 @@ label: com.omar.scriptd
 log_dir: ~/Library/Logs/scriptd
 watch: true
 modules:
-  wifi-monitor:
-    enabled: false
-    schedule:
-      every_minutes: 5
-  cpu-monitor:
-    enabled: false
-    schedule:
-      every_minutes: 1
   brew-manager:
     enabled: true
     schedule:
       every_hours: 12
+  cpu-monitor:
+    enabled: false
+    schedule:
+      every_minutes: 1
+  wifi-monitor:
+    enabled: true
+    schedule:
+      every_minutes: 5
+      window:
+        start: 00:00
+        end: 06:00

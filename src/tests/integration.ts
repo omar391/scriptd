@@ -642,7 +642,7 @@ modules:
                     ]);
                     assert.equal(schedule.status, 0);
                     serviceYaml = readFileSync(path.join(sandbox.repoRoot, "service.yaml"), "utf8");
-                    assert.match(serviceYaml, /wifi-monitor:\n    enabled: true\n    schedule:\n      every_seconds: 300/);
+                    assert.match(serviceYaml, /wifi-monitor:\n    enabled: true\n    schedule:\n      every_minutes: 5/);
                     assert.match(serviceYaml, /weekdays:\n        - mon/);
                     assert.match(serviceYaml, /window:\n        start: 09:00\n        end: 17:00/);
                 } finally {

@@ -356,7 +356,13 @@ function scheduleYaml(schedule: ModuleSchedule, indent: string): string[] {
             }
         }
     } else if (schedule.everySeconds) {
-        lines.push(`${indent}every_seconds: ${schedule.everySeconds}`);
+        if (schedule.everySeconds >= 3600 && schedule.everySeconds % 3600 === 0) {
+            lines.push(`${indent}every_hours: ${schedule.everySeconds / 3600}`);
+        } else if (schedule.everySeconds >= 60 && schedule.everySeconds % 60 === 0) {
+            lines.push(`${indent}every_minutes: ${schedule.everySeconds / 60}`);
+        } else {
+            lines.push(`${indent}every_seconds: ${schedule.everySeconds}`);
+        }
     }
 
     if (schedule.weekdays && schedule.weekdays.length > 0) {
