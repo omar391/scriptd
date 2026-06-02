@@ -25,30 +25,45 @@ function writeLogLine(filePath: string, level: string, message: string): void {
     appendFileSync(filePath, line, "utf8");
 }
 
-function createLogger(logDir: string, moduleId: string): ModuleLogger {
+function createLogger(logDir: string, moduleId: string, options: { mirrorToConsole?: boolean } = {}): ModuleLogger {
     const outPath = path.join(logDir, `${moduleId}.log`);
     const errPath = path.join(logDir, `${moduleId}.err`);
+    const mirror = (level: string, message: string) => {
+        if (!options.mirrorToConsole) {
+            return;
+        }
+
+        const line = `[${moduleId}] ${level}: ${message}`;
+        if (level === "ERROR") {
+            console.error(line);
+        } else {
+            console.log(line);
+        }
+    };
 
     return {
         info(message: string) {
             writeLogLine(outPath, "INFO", message);
+            mirror("INFO", message);
         },
         warn(message: string) {
             writeLogLine(outPath, "WARN", message);
+            mirror("WARN", message);
         },
         error(message: string) {
             writeLogLine(errPath, "ERROR", message);
+            mirror("ERROR", message);
         },
     };
 }
 
 export async function createModuleExecutionHandle(
     moduleDef: DiscoveredModule,
-    options: { logDir: string; signal: AbortSignal; env?: NodeJS.ProcessEnv; repoRoot?: string },
+    options: { logDir: string; signal: AbortSignal; env?: NodeJS.ProcessEnv; repoRoot?: string; mirrorLogsToConsole?: boolean },
 ): Promise<ModuleExecutionHandle> {
     await ensureDirectory(options.logDir);
 
-    const logger = createLogger(options.logDir, moduleDef.id);
+    const logger = createLogger(options.logDir, moduleDef.id, { mirrorToConsole: options.mirrorLogsToConsole });
     const context: ModuleContext = {
         id: moduleDef.id,
         repoRoot: options.repoRoot ?? resolveRepoRoot(),
@@ -111,6 +126,7 @@ export async function runModuleDirect(moduleDef: DiscoveredModule, logDir: strin
     const { context } = await createModuleExecutionHandle(moduleDef, {
         logDir,
         signal: controller.signal,
+        mirrorLogsToConsole: true,
     });
     const config = await loadModuleConfig(moduleDef, context);
 
@@ -133,7 +149,9 @@ export async function runModuleDirect(moduleDef: DiscoveredModule, logDir: strin
             throw new Error(`Interval module ${moduleDef.id} is missing runOnce()`);
         }
 
+        console.log(`Running ${moduleDef.id}...`);
         await moduleDef.plugin.runOnce(context, config);
+        console.log(`Completed ${moduleDef.id}.`);
         return;
     }
 
@@ -141,5 +159,6 @@ export async function runModuleDirect(moduleDef: DiscoveredModule, logDir: strin
         throw new Error(`Daemon module ${moduleDef.id} is missing start()`);
     }
 
+    console.log(`Starting ${moduleDef.id}...`);
     await moduleDef.plugin.start(context, config);
 }

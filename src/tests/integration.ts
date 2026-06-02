@@ -670,6 +670,69 @@ modules:
             },
         },
         {
+            name: "run brew-manager recreates missing askpass helper before maintenance",
+            run: async () => {
+                const sandbox = await createSandbox();
+                try {
+                    await prepareRuntimeWrappers(sandbox, {
+                        bun: "delegate",
+                        node: "delegate",
+                        npx: "delegate",
+                    });
+
+                    const askpassPath = path.join(sandbox.homeDir, "Library", "Application Support", "scriptd", "brew-manager", "brew_askpass.sh");
+                    const brewLogPath = path.join(sandbox.tempRoot, "brew.log");
+                    await writeFile(
+                        path.join(sandbox.repoRoot, "modules", "brew-manager", "module.ts"),
+                        `export { default } from ${JSON.stringify(path.join(actualRepoRoot, "modules", "brew-manager", "module.ts"))};\n`,
+                    );
+                    await writeFile(
+                        path.join(sandbox.repoRoot, "modules", "brew-manager", "module.yaml"),
+                        `id: brew-manager
+mode: interval
+interval_seconds: 43200
+keychain_service: BrewAutoUpdate
+askpass_path: ${askpassPath}
+legacy_log_dir: ${path.join(sandbox.homeDir, "Library", "Logs", "Homebrew")}
+homebrew_bin: ${path.join(sandbox.binDir, "brew")}
+sudoers_path: ${path.join(sandbox.tempRoot, "sudoers-homebrew")}
+sudoers_timeout_path: ${path.join(sandbox.tempRoot, "sudoers-homebrew-timeout")}
+`,
+                    );
+                    await writeFile(
+                        path.join(sandbox.binDir, "security"),
+                        `#!/bin/bash
+if [ "$1" = "find-generic-password" ]; then
+  echo "stored-password"
+  exit 0
+fi
+exit 1
+`,
+                    );
+                    await chmod(path.join(sandbox.binDir, "security"), 0o755);
+                    await writeFile(
+                        path.join(sandbox.binDir, "brew"),
+                        `#!/bin/bash
+echo "$*" >> ${JSON.stringify(brewLogPath)}
+exit 0
+`,
+                    );
+                    await chmod(path.join(sandbox.binDir, "brew"), 0o755);
+
+                    const result = runManageCommand(sandbox, ["run", "brew-manager"]);
+                    assert.equal(result.status, 0, result.stderr);
+                    assert.match(result.stdout, /Running brew-manager\.\.\./);
+                    assert.match(result.stdout, /\[brew-manager\] INFO: brew update completed/);
+                    assert.match(result.stdout, /Completed brew-manager\./);
+                    assert.equal(existsSync(askpassPath), true);
+                    assert.match(readFileSync(askpassPath, "utf8"), /security find-generic-password -s "BrewAutoUpdate"/);
+                    assert.match(readFileSync(brewLogPath, "utf8"), /^update$/m);
+                } finally {
+                    await cleanupSandbox(sandbox);
+                }
+            },
+        },
+        {
             name: "run module fails for an invalid module export in the sandbox repo",
             run: async () => {
                 const sandbox = await createSandbox();

@@ -5,7 +5,7 @@ import { spawnSync } from "node:child_process";
 import type { ModuleContext, ModuleHealth, ModuleStatus, RootServiceModule } from "../../src/interfaces.ts";
 import { assertPositiveInteger, parseSimpleYaml } from "../../src/config.ts";
 
-type BrewManagerConfig = {
+export type BrewManagerConfig = {
     keychainService: string;
     askpassPath: string;
     legacyLogDir: string;
@@ -137,6 +137,24 @@ async function writeAskpassHelper(config: BrewManagerConfig): Promise<void> {
         "utf8",
     );
     await fs.chmod(config.askpassPath, 0o755);
+}
+
+export async function ensureAskpassHelper(
+    config: BrewManagerConfig,
+    passwordLookup: (service: string) => string = keychainPassword,
+): Promise<void> {
+    try {
+        await fs.access(config.askpassPath);
+        return;
+    } catch {
+        // The helper is generated state. If the credential still exists, rebuild it.
+    }
+
+    if (!passwordLookup(config.keychainService)) {
+        throw new Error(`brew-manager setup required: missing askpass helper at ${config.askpassPath}. Run ./scriptd.sh setup brew-manager.`);
+    }
+
+    await writeAskpassHelper(config);
 }
 
 async function promptHidden(prompt: string): Promise<string> {
@@ -281,7 +299,7 @@ export function buildBrewCommands(homebrewBin: string, outdatedCasks: string[]):
 
 async function runBrewMaintenance(ctx: ModuleContext, config: BrewManagerConfig): Promise<void> {
     await cleanupLegacyLogs(config, ctx);
-    await fs.access(config.askpassPath);
+    await ensureAskpassHelper(config);
 
     const update = brewCommand(config, ["update"]);
     if (update.status !== 0) {

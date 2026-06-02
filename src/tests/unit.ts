@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import os from "node:os";
 import path from "node:path";
 import { existsSync } from "node:fs";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import {
     buildIntervalPlan,
     buildModuleStateDiff,
@@ -14,7 +14,7 @@ import {
 } from "../config.ts";
 import { resolveRepoRoot, resolveServiceConfigPath } from "../paths.ts";
 import { decideWifiSwitch, parseSwiftWifiScanOutput, scoreNetwork, resolveWifiMonitorConfig } from "../../modules/wifi-monitor/module.ts";
-import { buildBrewCommands } from "../../modules/brew-manager/module.ts";
+import { buildBrewCommands, ensureAskpassHelper, type BrewManagerConfig } from "../../modules/brew-manager/module.ts";
 import { parseCpuSnapshot, reconcileTrackedProcesses } from "../../modules/cpu-monitor/module.ts";
 import type { TestCase } from "./harness.ts";
 
@@ -392,6 +392,59 @@ mode: daemon
                     args: ["upgrade", "--cask", "--force", "alpha"],
                     tolerateFailure: true,
                 });
+            },
+        },
+        {
+            name: "brew-manager recreates missing askpass helper from keychain credential",
+            run: async () => {
+                try {
+                    const rootDir = await makeTempRoot();
+                    const config: BrewManagerConfig = {
+                        keychainService: "BrewAutoUpdate",
+                        askpassPath: path.join(rootDir, "brew_askpass.sh"),
+                        legacyLogDir: path.join(rootDir, "logs"),
+                        maxLogSizeMb: 50,
+                        maxLogAgeDays: 30,
+                        maxRotatedLogs: 5,
+                        homebrewBin: "/opt/homebrew/bin/brew",
+                        sudoersPath: "/etc/sudoers.d/homebrew",
+                        sudoersTimeoutPath: "/etc/sudoers.d/homebrew_timeout",
+                        sudoTimeoutHours: 2,
+                    };
+
+                    await ensureAskpassHelper(config, () => "stored-password");
+
+                    const helper = await readFile(config.askpassPath, "utf8");
+                    const mode = (await stat(config.askpassPath)).mode & 0o777;
+                    assert.match(helper, /security find-generic-password -s "BrewAutoUpdate"/);
+                    assert.equal(mode, 0o755);
+                } finally {
+                    await cleanupTempDirs();
+                }
+            },
+        },
+        {
+            name: "brew-manager reports setup requirement when askpass credential is missing",
+            run: async () => {
+                try {
+                    const rootDir = await makeTempRoot();
+                    const config: BrewManagerConfig = {
+                        keychainService: "BrewAutoUpdate",
+                        askpassPath: path.join(rootDir, "brew_askpass.sh"),
+                        legacyLogDir: path.join(rootDir, "logs"),
+                        maxLogSizeMb: 50,
+                        maxLogAgeDays: 30,
+                        maxRotatedLogs: 5,
+                        homebrewBin: "/opt/homebrew/bin/brew",
+                        sudoersPath: "/etc/sudoers.d/homebrew",
+                        sudoersTimeoutPath: "/etc/sudoers.d/homebrew_timeout",
+                        sudoTimeoutHours: 2,
+                    };
+
+                    await assert.rejects(() => ensureAskpassHelper(config, () => ""), /setup required/);
+                } finally {
+                    await cleanupTempDirs();
+                }
             },
         },
         {
