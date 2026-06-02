@@ -123,6 +123,8 @@ function appInfoPlistContents(label: string): string {
   <string>scriptd</string>
   <key>CFBundleIconFile</key>
   <string>Scriptd</string>
+  <key>CFBundleIconName</key>
+  <string>Scriptd</string>
   <key>CFBundleIdentifier</key>
   <string>${escapeXml(label)}</string>
   <key>CFBundleName</key>
@@ -134,6 +136,41 @@ function appInfoPlistContents(label: string): string {
 </dict>
 </plist>
 `;
+}
+
+async function writeShellRootLauncher(executablePath: string, manageScriptPath: string): Promise<void> {
+    await fs.writeFile(executablePath, `#!/bin/bash\nexec ${shellQuote(manageScriptPath)} run root\n`, "utf8");
+    await fs.chmod(executablePath, 0o755);
+}
+
+async function writeCompiledRootLauncher(executablePath: string, manageScriptPath: string): Promise<boolean> {
+    const swiftc = spawnSync("sh", ["-lc", "command -v swiftc >/dev/null 2>&1"], { encoding: "utf8" });
+    if (swiftc.status !== 0) {
+        return false;
+    }
+
+    const sourcePath = path.join(path.dirname(executablePath), "scriptd.swift");
+    const source = `import Foundation
+
+let process = Process()
+process.executableURL = URL(fileURLWithPath: ${JSON.stringify(manageScriptPath)})
+process.arguments = ["run", "root"]
+
+try process.run()
+process.waitUntilExit()
+exit(process.terminationStatus)
+`;
+
+    await fs.writeFile(sourcePath, source, "utf8");
+    const result = spawnSync("swiftc", [sourcePath, "-o", executablePath], { encoding: "utf8" });
+    await fs.rm(sourcePath, { force: true });
+    if (result.status !== 0) {
+        await fs.rm(executablePath, { force: true });
+        return false;
+    }
+
+    await fs.chmod(executablePath, 0o755);
+    return true;
 }
 
 async function writeRootApp(repoRoot: string, label: string, manageScriptPath: string): Promise<string> {
@@ -148,8 +185,9 @@ async function writeRootApp(repoRoot: string, label: string, manageScriptPath: s
     await ensureDirectory(resourcesDir);
     await fs.writeFile(path.join(contentsDir, "Info.plist"), appInfoPlistContents(label), "utf8");
     await fs.copyFile(iconSourcePath, path.join(resourcesDir, "Scriptd.icns"));
-    await fs.writeFile(executablePath, `#!/bin/bash\nexec ${shellQuote(manageScriptPath)} run root\n`, "utf8");
-    await fs.chmod(executablePath, 0o755);
+    if (!(await writeCompiledRootLauncher(executablePath, manageScriptPath))) {
+        await writeShellRootLauncher(executablePath, manageScriptPath);
+    }
     return executablePath;
 }
 

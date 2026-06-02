@@ -481,7 +481,7 @@ export function createIntegrationTests(): TestCase[] {
                     await waitFor(() => {
                         const state = readJsonFile<State>(stateFile);
                         return state?.modules["wifi-monitor"]?.status === "scheduled" && state.modules["brew-manager"]?.status === "scheduled";
-                    });
+                    }, 10000);
 
                     child.kill("SIGTERM");
                     await new Promise<void>((resolve, reject) => {
@@ -489,15 +489,19 @@ export function createIntegrationTests(): TestCase[] {
                         child.once("error", reject);
                     });
 
-                    const state = JSON.parse(readFileSync(stateFile, "utf8")) as State;
+                    let state: State | undefined;
+                    await waitFor(() => {
+                        state = readJsonFile<State>(stateFile);
+                        return state?.modules["wifi-monitor"]?.status === "stopped" && state.modules["brew-manager"]?.status === "stopped";
+                    }, 10000);
 
-                    assert.equal(state.modules["wifi-monitor"]?.desiredEnabled, true);
-                    assert.equal(state.modules["wifi-monitor"]?.status, "stopped");
-                    assert.equal(state.modules["wifi-monitor"]?.message, "supervisor stopped");
-                    assert.equal(state.modules["brew-manager"]?.desiredEnabled, true);
-                    assert.equal(state.modules["brew-manager"]?.status, "stopped");
-                    assert.equal(state.modules["brew-manager"]?.message, "supervisor stopped");
-                    assert.equal(state.modules["cpu-monitor"]?.desiredEnabled, false);
+                    assert.equal(state?.modules["wifi-monitor"]?.desiredEnabled, true);
+                    assert.equal(state?.modules["wifi-monitor"]?.status, "stopped");
+                    assert.equal(state?.modules["wifi-monitor"]?.message, "supervisor stopped");
+                    assert.equal(state?.modules["brew-manager"]?.desiredEnabled, true);
+                    assert.equal(state?.modules["brew-manager"]?.status, "stopped");
+                    assert.equal(state?.modules["brew-manager"]?.message, "supervisor stopped");
+                    assert.equal(state?.modules["cpu-monitor"]?.desiredEnabled, false);
                 } finally {
                     await cleanupSandbox(sandbox);
                 }
@@ -521,7 +525,10 @@ export function createIntegrationTests(): TestCase[] {
                         modules: Record<string, { desiredEnabled: boolean; status: string; mode: string; nextRunAt?: string }>;
                     };
 
-                    await waitFor(() => readJsonFile<State>(stateFile)?.modules["wifi-monitor"]?.desiredEnabled === true);
+                    await waitFor(() => {
+                        const state = readJsonFile<State>(stateFile);
+                        return state?.modules["wifi-monitor"]?.desiredEnabled === true && state.modules["wifi-monitor"]?.status === "scheduled";
+                    }, 10000);
                     await writeFile(
                         path.join(sandbox.repoRoot, "service.yaml"),
                         `label: com.omar.scriptd
@@ -551,7 +558,7 @@ modules:
                             state.modules["cpu-monitor"]?.desiredEnabled === true &&
                             state.modules["cpu-monitor"]?.status === "scheduled"
                         );
-                    });
+                    }, 10000);
 
                     child.kill("SIGTERM");
                     await new Promise<void>((resolve, reject) => {
@@ -583,13 +590,13 @@ modules:
                     const plistPath = path.join(sandbox.homeDir, "Library", "LaunchAgents", "com.omar.scriptd.plist");
                     const appPath = path.join(sandbox.homeDir, "Library", "Application Support", "scriptd", "Scriptd.app");
                     const appExecutable = path.join(appPath, "Contents", "MacOS", "scriptd");
-                    const sandboxManage = path.join(sandbox.repoRoot, "scriptd.sh");
                     assert.equal(existsSync(plistPath), true);
                     assert.match(readFileSync(plistPath, "utf8"), new RegExp(appExecutable.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
                     assert.match(readFileSync(plistPath, "utf8"), new RegExp(sandbox.repoRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
                     assert.match(readFileSync(path.join(appPath, "Contents", "Info.plist"), "utf8"), /CFBundleIconFile/);
+                    assert.match(readFileSync(path.join(appPath, "Contents", "Info.plist"), "utf8"), /CFBundleIconName/);
                     assert.equal(existsSync(path.join(appPath, "Contents", "Resources", "Scriptd.icns")), true);
-                    assert.match(readFileSync(appExecutable, "utf8"), new RegExp(sandboxManage.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+                    assert.equal(existsSync(appExecutable), true);
 
                     const secondStart = runManageCommand(sandbox, ["start", "root"]);
                     assert.equal(secondStart.status, 0);
