@@ -4,7 +4,7 @@ brew-manager
 This module runs Homebrew maintenance under `scriptd`.
 
 Files
-- `module.ts` — TypeScript plugin implementation.
+- `module.rs` — Rust plugin implementation.
 - `module.yaml` — the single module manifest/config file.
 
 Usage

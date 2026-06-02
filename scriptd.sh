@@ -1,23 +1,36 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
-ENTRYPOINT="${ROOT_DIR}/src/main.ts"
-USER_ARGS=("$@")
-
 export SCRIPTD_ROOT_DIR="${SCRIPTD_ROOT_DIR:-${ROOT_DIR}}"
 export SCRIPTD_ENTRY_SHELL_PATH="${SCRIPTD_ENTRY_SHELL_PATH:-${ROOT_DIR}/scriptd.sh}"
+REPO_BIN="${ROOT_DIR}/target/release/scriptd"
 
-try_runtime() {
-  if "$@" "${ENTRYPOINT}" __runtime_probe >/dev/null 2>&1; then
-    exec "$@" "${ENTRYPOINT}" "${USER_ARGS[@]}"
+if [[ -x "${REPO_BIN}" ]]; then
+  exec "${REPO_BIN}" "$@"
+fi
+
+if [[ "${1-}" == "test" ]]; then
+  if command -v rustup >/dev/null 2>&1; then
+    exec rustup run stable cargo test -- --nocapture
   fi
-}
 
-try_runtime bun
-try_runtime node --experimental-strip-types
-try_runtime npx tsx
+  if command -v cargo >/dev/null 2>&1; then
+    exec cargo test -- --nocapture
+  fi
 
-echo "Could not run src/main.ts with bun, node --experimental-strip-types, or npx tsx." >&2
+  echo "Could not locate a Rust runtime (cargo or rustup)." >&2
+  exit 1
+fi
+
+if command -v rustup >/dev/null 2>&1; then
+  exec rustup run stable cargo run --release -- "$@"
+fi
+
+if command -v cargo >/dev/null 2>&1; then
+  exec cargo run --release -- "$@"
+fi
+
+echo "Could not locate a Rust runtime (cargo)." >&2
 exit 1

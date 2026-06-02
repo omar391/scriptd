@@ -10,7 +10,7 @@ How it works
 - Excludes common system and interactive apps such as Finder, Dock, Terminal, Activity Monitor, `kernel_task`, and `loginwindow`.
 
 Files
-- `module.ts` — TypeScript plugin implementation.
+- `module.rs` — Rust plugin implementation.
 - `module.yaml` — the single module manifest/config file.
 
 Configuration

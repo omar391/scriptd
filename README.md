@@ -1,10 +1,9 @@
 # scriptd
 
-`scriptd` is a lightweight macOS automation supervisor for small TypeScript modules. It installs a single user-level `launchd` agent, loads modules from `modules/*`, manages long-running daemons and scheduled jobs, and exposes status, health, logs, and configuration controls through a simple shell entrypoint.
+`scriptd` is a lightweight macOS automation supervisor for native Rust modules. It installs a single user-level `launchd` agent, loads modules from `modules/*`, manages long-running daemons and scheduled jobs, and exposes status, health, logs, and configuration controls through a simple shell entrypoint.
 
 The project is intentionally minimal:
 
-- no build step
 - no root-level runtime dependencies in the repo
 - no external framework for module loading
 - plain YAML for service and module configuration
@@ -23,11 +22,11 @@ The project is intentionally minimal:
 
 ```text
 scriptd.sh
-  -> src/main.ts
+  -> target/release/scriptd (or `cargo run --release`)
       -> start/stop/uninstall/status/test commands
-      -> run root -> src/supervisor.ts
+      -> run root -> src/main.rs -> src/supervisor.rs
           -> discover modules from modules/<name>/
-          -> load module.ts + module.yaml
+          -> load module.rs + module.yaml
           -> start daemons or schedule interval jobs
           -> write state.json and logs
 ```
@@ -36,16 +35,16 @@ Repo layout:
 
 ```text
 .
-    ├── scriptd.sh
-    ├── assets/
-├── service.yaml
-├── src/
-│   ├── main.ts
-│   ├── supervisor.ts
-│   ├── module-runner.ts
-│   ├── config.ts
-│   ├── status.ts
-│   └── tests/
+	├── scriptd.sh
+	├── assets/
+    ├── service.yaml
+    ├── src/
+    │   ├── main.rs
+    │   ├── supervisor.rs
+    │   ├── launchd.rs
+    │   ├── config.rs
+    │   ├── status.rs
+    │   └── modules.rs
 └── modules/
     ├── wifi-monitor/
     ├── cpu-monitor/
@@ -57,16 +56,13 @@ Repo layout:
 `scriptd` is macOS-specific. The current source relies on:
 
 - `launchctl` / `launchd`
-- one runtime that can execute `src/main.ts`
-  - `bun`
-  - `node --experimental-strip-types`
-  - `npx tsx`
+- one Rust binary: `target/release/scriptd` (or `cargo run --release -- ...`)
 - standard macOS command-line tools used by the bundled modules
 
 Module-specific tools:
 
-- `wifi-monitor`: `networksetup`, `ping`, and either the private `airport` CLI or the built-in `swift` CoreWLAN fallback
-- `cpu-monitor`: `ps` and the ability to signal processes
+- `wifi-monitor`: `networksetup`, `ping`, and `airport` CLI fallback path
+- `cpu-monitor`: sysinfo process inspection plus command-level signal support when needed
 - `brew-manager`: Homebrew, `security`, and `sudo`
 
 ## Quick Start
@@ -109,11 +105,7 @@ Notes:
 ./scriptd.sh test              # run unit and integration tests
 ```
 
-`scriptd.sh` tries the available runtimes in this order:
-
-1. `bun`
-2. `node --experimental-strip-types`
-3. `npx tsx`
+`scriptd.sh` uses the compiled binary when present and falls back to `cargo run --release` for development.
 
 ## Service Configuration
 
@@ -245,48 +237,22 @@ The `status` command combines:
 - `start root` writes the LaunchAgent plist, re-enables the launchd item, and starts or restarts it as needed.
 - The LaunchAgent points at `~/Library/Application Support/scriptd/Scriptd.app/Contents/MacOS/scriptd`; that launcher executes this checkout's `scriptd.sh run root`.
 - Daemon modules are started immediately when enabled.
-- Interval modules are scheduled from `service.yaml`; `intervalMs` and `interval_seconds` remain the module's fallback cadence.
+- Interval modules are scheduled from `service.yaml`; `interval_seconds` remains the module fallback cadence.
 - Interval runs do not overlap.
 - Daemon modules are restarted after crashes with a short delay.
-- Disabling a module aborts its signal and calls the module's optional `stop()` hook.
+- Disabling a module stops its runtime scheduling immediately and updates module state.
 - With `watch: true`, `service.yaml` changes are applied by the running supervisor automatically.
 
 ## Writing A Module
 
 Each module lives in `modules/<id>/` and must include:
 
-- `module.ts`
+- `module.rs`
 - `module.yaml`
 
 Rules enforced by the loader:
 
-- folder name, `module.yaml` `id`, and `module.ts` `id` must match
-- `mode` must match between `module.ts` and `module.yaml`
-- daemon modules must implement `start()`
-- interval modules must implement `runOnce()`
-- interval modules must define both:
-  - `intervalMs` in `module.ts`
-  - `interval_seconds` in `module.yaml`
-- those interval values must match exactly
-
-Minimal interval example:
-
-```ts
-import type { RootServiceModule } from "../../src/interfaces.ts";
-
-const modulePlugin: RootServiceModule = {
-  id: "example-job",
-  mode: "interval",
-  intervalMs: 60_000,
-  async runOnce(ctx) {
-    ctx.log.info("example-job ran");
-  },
-};
-
-export default modulePlugin;
-```
-
-Matching manifest:
+Each module folder is validated against a single manifest:
 
 ```yaml
 id: example-job
@@ -295,15 +261,11 @@ interval_seconds: 60
 display_name: Example Job
 ```
 
-Useful module hooks:
+Runtime hooks in Rust are module-specific but follow the same conceptual shape in this port:
 
-- `loadConfig(ctx)`
-- `setup(ctx)`
-- `start(ctx, config)`
-- `stop(ctx)`
-- `runOnce(ctx, config)`
-- `status(ctx)`
-- `health(ctx)`
+- `setup(context)`
+- `run_once(context)`
+- `status() -> Option<(ModuleStatus, ModuleHealth)>`
 
 ## Testing
 
@@ -324,7 +286,7 @@ The repo includes tests for:
 ## Operational Notes
 
 - This project is designed around a user LaunchAgent in `~/Library/LaunchAgents`.
-- The root `package.json` defines scripts only; the supervisor executes TypeScript directly.
+- The repo is built as a single Rust binary.
 - The bundled modules are macOS-oriented personal automations, but the module interface is generic enough for additional local services and scheduled tasks.
 
 ## License

@@ -1,0 +1,30 @@
+[package]
+name = "scriptd"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+cron = "0.12"
+dirs = "6.0"
+notify = "6.1"
+objc2-core-wlan = { version = "0.3", optional = true, default-features = false, features = ["std", "CWChannel", "CWInterface", "CWNetwork", "CoreWLANTypes"] }
+objc2-foundation = { version = "0.3", optional = true, default-features = false, features = ["std", "NSEnumerator", "NSSet", "NSString"] }
+once_cell = "1.19"
+rpassword = "7.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+sysinfo = { version = "0.32", default-features = true, features = ["system"] }
+tokio = { version = "1.39", features = ["macros", "rt", "fs", "process", "signal", "time", "sync"] }
+
+[features]
+corewlan = ["objc2-core-wlan", "objc2-foundation"]
+default = []
+
+[dev-dependencies]
+assert_cmd = "2.0"
+predicates = "3.1"
+serial_test = "3.0"
+tempfile = "3.10"

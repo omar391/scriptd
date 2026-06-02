@@ -3,7 +3,7 @@ wifi-monitor
 
 This is a small macOS Wi-Fi monitor that filters to known SSIDs, scores each candidate, and switches only when a better choice is worth disrupting the current connection.
 
-It prefers the legacy `airport -s` scan output when available, and falls back to a CoreWLAN scan through `swift` on newer macOS setups where the private `airport` binary is missing.
+It prefers the legacy `airport -s` scan output when available and falls back to a lightweight command-based path when needed.
 
 How ranking works
 - If `WIFI_MONITOR_SSIDS` is set, only those SSIDs are considered.
@@ -15,7 +15,7 @@ How ranking works
 - It also respects `WIFI_MONITOR_MIN_DWELL`, so it will not switch again until the dwell window has passed.
 
 Files
-- `module.ts` — TypeScript plugin implementation.
+- `module.rs` — Rust module implementation.
 - `module.yaml` — the single module manifest/config file.
 
 Usage
@@ -31,7 +31,7 @@ Configuration
   - `WIFI_MONITOR_PING_TARGET` — host used to check whether the current connection is healthy.
   - `WIFI_MONITOR_PING_TIMEOUT` — ping timeout in seconds (default 1).
   - `WIFI_MONITOR_MIN_SWITCH_SCORE_DELTA` — score margin required before switching within the same priority.
-  - `WIFI_MONITOR_AIRPORT_PATH` — override the `airport` scanner path; if the command is missing or fails, the module falls back to CoreWLAN via `swift`.
+- `WIFI_MONITOR_AIRPORT_PATH` — override the `airport` scanner path; if the command is missing or fails, the module uses a safer command-based fallback.
 
 Config file
 - `module.yaml` is the single module manifest/config file. Example keys:
