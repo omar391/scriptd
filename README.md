@@ -82,7 +82,7 @@ Module-specific tools:
 5. Install the supervisor LaunchAgent:
 
 ```bash
-./scriptd.sh install root
+./scriptd.sh start root
 ```
 
 6. Check runtime status:
@@ -99,10 +99,10 @@ Notes:
 ## Commands
 
 ```bash
-./scriptd.sh install root      # install the LaunchAgent
+./scriptd.sh start root        # install or update the LaunchAgent, then start it
+./scriptd.sh restart root      # install or update the LaunchAgent, then restart it
 ./scriptd.sh stop root         # stop the LaunchAgent but keep it installed
 ./scriptd.sh uninstall root    # remove the LaunchAgent
-./scriptd.sh run root          # run the supervisor in the foreground
 ./scriptd.sh run <module>      # run one module directly
 ./scriptd.sh setup <module>    # run one-time module setup
 ./scriptd.sh reload            # reload service.yaml in the running supervisor
@@ -232,6 +232,7 @@ The `status` command combines:
 
 ## Runtime Behavior
 
+- `start root` and `restart root` write the LaunchAgent plist and call `launchctl load -w`, so a disabled login item is re-enabled.
 - Daemon modules are started immediately when enabled.
 - Interval modules are scheduled from `service.yaml`; `intervalMs` and `interval_seconds` remain the module's fallback cadence.
 - Interval runs do not overlap.

@@ -16,10 +16,10 @@ type PersistedState = {
 
 function usage(): string {
     return `Usage:
-  scriptd.sh install root
+  scriptd.sh start root
+  scriptd.sh restart root
   scriptd.sh stop root
   scriptd.sh uninstall root
-  scriptd.sh run root
   scriptd.sh run <module>
   scriptd.sh reload
   scriptd.sh status
@@ -41,6 +41,11 @@ function runLaunchctl(args: string[], check: boolean): void {
     if (check && result.status !== 0) {
         throw new Error(result.stderr || `launchctl ${args.join(" ")} failed`);
     }
+}
+
+function launchdDomainLabel(label: string): string {
+    const uid = typeof process.getuid === "function" ? process.getuid() : 0;
+    return `gui/${uid}/${label}`;
 }
 
 function rootPlistPath(label: string): string {
@@ -101,7 +106,7 @@ function plistContents(options: {
 `;
 }
 
-async function installRoot(): Promise<number> {
+async function writeRootPlist(): Promise<{ label: string; plistPath: string }> {
     const repoRoot = resolveRepoRoot();
     const config = await loadServiceConfig(repoRoot);
     const plistPath = rootPlistPath(config.label);
@@ -123,9 +128,18 @@ async function installRoot(): Promise<number> {
         "utf8",
     );
 
-    runLaunchctl(["unload", plistPath], false);
+    return { label: config.label, plistPath };
+}
+
+async function startRoot(options: { restart?: boolean; alias?: "install" } = {}): Promise<number> {
+    const { label, plistPath } = await writeRootPlist();
+
+    if (options.restart) {
+        runLaunchctl(["unload", plistPath], false);
+    }
+    runLaunchctl(["enable", launchdDomainLabel(label)], false);
     runLaunchctl(["load", "-w", plistPath], true);
-    console.log(`Installed root LaunchAgent ${config.label}`);
+    console.log(`${options.alias === "install" ? "Installed" : options.restart ? "Restarted" : "Started"} root LaunchAgent ${label}`);
     return 0;
 }
 
@@ -164,8 +178,7 @@ async function reloadRoot(): Promise<number> {
         // fall back to launchctl
     }
 
-    const uid = typeof process.getuid === "function" ? process.getuid() : 0;
-    const result = spawnSync("launchctl", ["kill", "HUP", `gui/${uid}/${config.label}`], { encoding: "utf8" });
+    const result = spawnSync("launchctl", ["kill", "HUP", launchdDomainLabel(config.label)], { encoding: "utf8" });
     if (result.status !== 0) {
         throw new Error("Could not find a running scriptd service to reload.");
     }
@@ -208,13 +221,16 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<nu
         return command ? 0 : 2;
     }
 
-    if (command === "install") {
+    if (command === "install" || command === "start" || command === "restart") {
         if (target !== "root") {
             console.error(usage());
             return 2;
         }
 
-        return await installRoot();
+        return await startRoot({
+            restart: command === "restart",
+            alias: command === "install" ? "install" : undefined,
+        });
     }
 
     if (command === "uninstall") {

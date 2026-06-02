@@ -160,7 +160,16 @@ async function writeRuntimeWrapper(
         mode === "delegate"
             ? `#!/bin/bash
 echo "${name}" >> "${sandbox.runtimeLogPath}"
-PATH="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+PATH="${sandbox.binDir}:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+exec "${targetPath}" "$@"
+`
+            : name === "node"
+              ? `#!/bin/bash
+echo "${name}" >> "${sandbox.runtimeLogPath}"
+if [ "$1" = "--experimental-strip-types" ]; then
+  exit 1
+fi
+PATH="${sandbox.binDir}:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 exec "${targetPath}" "$@"
 `
             : `#!/bin/bash
@@ -299,7 +308,7 @@ export function createIntegrationTests(): TestCase[] {
                     const result = runManageCommand(sandbox, ["status"]);
                     assert.equal(result.status, 0);
                     const runtimes = readFileSync(sandbox.runtimeLogPath, "utf8").trim().split("\n");
-                    assert.deepEqual(runtimes.slice(0, 4), ["bun", "node", "npx", "npx"]);
+                    assert.deepEqual(runtimes.slice(0, 4), ["bun", "node", "npx", "node"]);
                 } finally {
                     await cleanupSandbox(sandbox);
                 }
@@ -504,7 +513,7 @@ modules:
             },
         },
         {
-            name: "install root and uninstall root operate on the sandbox launch agents path",
+            name: "start restart stop and uninstall root operate on the sandbox launch agents path",
             run: async () => {
                 const sandbox = await createSandbox();
                 try {
@@ -515,13 +524,20 @@ modules:
                     });
 
                     await mkdir(path.join(sandbox.repoRoot, "node_modules"), { recursive: true });
-                    const install = runManageCommand(sandbox, ["install", "root"]);
-                    assert.equal(install.status, 0);
+                    const start = runManageCommand(sandbox, ["start", "root"]);
+                    assert.equal(start.status, 0);
                     const plistPath = path.join(sandbox.homeDir, "Library", "LaunchAgents", "com.omar.scriptd.plist");
                     const sandboxManage = path.join(sandbox.repoRoot, "scriptd.sh");
                     assert.equal(existsSync(plistPath), true);
                     assert.match(readFileSync(plistPath, "utf8"), new RegExp(sandboxManage.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
                     assert.match(readFileSync(plistPath, "utf8"), new RegExp(sandbox.repoRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+
+                    const restart = runManageCommand(sandbox, ["restart", "root"]);
+                    assert.equal(restart.status, 0);
+                    const launchctlLog = readFileSync(sandbox.launchctlLogPath, "utf8");
+                    assert.match(launchctlLog, /enable gui\/\d+\/com\.omar\.scriptd/);
+                    assert.match(launchctlLog, /load -w .*com\.omar\.scriptd\.plist/);
+                    assert.match(launchctlLog, /unload .*com\.omar\.scriptd\.plist/);
 
                     const stop = runManageCommand(sandbox, ["stop", "root"]);
                     assert.equal(stop.status, 0);
