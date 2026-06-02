@@ -26,13 +26,11 @@ type CpuMonitorState = {
 
 type CpuMonitorConfig = {
     cpuThreshold: number;
-    checkIntervalMs: number;
     timeLimitSeconds: number;
     excludeApps: string[];
 };
 
 const DEFAULT_CPU_THRESHOLD = 50;
-const DEFAULT_CHECK_INTERVAL_MS = 30_000;
 const DEFAULT_TIME_LIMIT_SECONDS = 600;
 const DEFAULT_EXCLUDE_APPS = ["Finder", "Dock", "Terminal", "Activity Monitor", "kernel_task", "loginwindow"];
 
@@ -69,10 +67,6 @@ function toStringArray(value: unknown, fallback: string[]): string[] {
 function resolveCpuMonitorConfig(raw: Record<string, unknown>): CpuMonitorConfig {
     return {
         cpuThreshold: assertPositiveInteger(raw.cpu_threshold ?? DEFAULT_CPU_THRESHOLD, "cpu-monitor.cpu_threshold"),
-        checkIntervalMs: assertPositiveInteger(
-            raw.check_interval_seconds ?? DEFAULT_CHECK_INTERVAL_MS / 1000,
-            "cpu-monitor.check_interval_seconds",
-        ) * 1000,
         timeLimitSeconds: assertPositiveInteger(raw.time_limit_seconds ?? DEFAULT_TIME_LIMIT_SECONDS, "cpu-monitor.time_limit_seconds"),
         excludeApps: toStringArray(raw.exclude_apps, DEFAULT_EXCLUDE_APPS),
     };
@@ -140,62 +134,39 @@ export function reconcileTrackedProcesses(
     return next;
 }
 
-function sleep(ms: number, signal: AbortSignal): Promise<void> {
-    if (signal.aborted) {
-        return Promise.resolve();
-    }
+async function monitorPass(log: { info(message: string): void; error(message: string): void }, config: CpuMonitorConfig): Promise<void> {
+    const now = Math.floor(Date.now() / 1000);
+    const snapshot = parseCpuSnapshot(readPsSnapshot(), config.cpuThreshold, config.excludeApps);
+    moduleState.tracked = reconcileTrackedProcesses(moduleState.tracked, snapshot, now, config.timeLimitSeconds);
 
-    return new Promise((resolve) => {
-        const timer = setTimeout(resolve, ms);
-        signal.addEventListener(
-            "abort",
-            () => {
-                clearTimeout(timer);
-                resolve();
-            },
-            { once: true },
-        );
-    });
-}
-
-async function monitorLoop(
-    log: { info(message: string): void; error(message: string): void },
-    signal: AbortSignal,
-    config: CpuMonitorConfig,
-): Promise<void> {
-    while (!signal.aborted) {
-        const now = Math.floor(Date.now() / 1000);
-        const snapshot = parseCpuSnapshot(readPsSnapshot(), config.cpuThreshold, config.excludeApps);
-        moduleState.tracked = reconcileTrackedProcesses(moduleState.tracked, snapshot, now, config.timeLimitSeconds);
-
-        for (const tracked of moduleState.tracked.values()) {
-            if (now - tracked.firstSeenAt >= config.timeLimitSeconds) {
-                try {
-                    process.kill(tracked.pid, "SIGKILL");
-                    moduleState.lastKilledPid = tracked.pid;
-                    moduleState.lastMessage = `Killed PID ${tracked.pid} (${tracked.name}) after sustained ${tracked.cpu}% CPU`;
-                    log.info(moduleState.lastMessage);
-                    moduleState.tracked.delete(tracked.pid);
-                } catch (error) {
-                    moduleState.lastError = error instanceof Error ? error.message : String(error);
-                    log.error(moduleState.lastError);
-                }
+    for (const tracked of moduleState.tracked.values()) {
+        if (now - tracked.firstSeenAt >= config.timeLimitSeconds) {
+            try {
+                process.kill(tracked.pid, "SIGKILL");
+                moduleState.lastKilledPid = tracked.pid;
+                moduleState.lastMessage = `Killed PID ${tracked.pid} (${tracked.name}) after sustained ${tracked.cpu}% CPU`;
+                moduleState.lastError = undefined;
+                log.info(moduleState.lastMessage);
+                moduleState.tracked.delete(tracked.pid);
+            } catch (error) {
+                moduleState.lastError = error instanceof Error ? error.message : String(error);
+                log.error(moduleState.lastError);
             }
         }
-
-        moduleState.lastRunAt = new Date().toISOString();
-        await sleep(config.checkIntervalMs, signal);
     }
+
+    moduleState.lastRunAt = new Date().toISOString();
 }
 
 const modulePlugin: RootServiceModule<CpuMonitorConfig> = {
     id: "cpu-monitor",
-    mode: "daemon",
+    mode: "interval",
+    intervalMs: 30_000,
     async loadConfig(ctx: ModuleContext) {
         return resolveCpuMonitorConfig(await loadConfigFile(ctx.moduleDir));
     },
-    async start(ctx, config) {
-        await monitorLoop(ctx.log, ctx.signal, config);
+    async runOnce(ctx, config) {
+        await monitorPass(ctx.log, config);
     },
     status(): ModuleStatus {
         return {

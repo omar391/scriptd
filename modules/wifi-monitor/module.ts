@@ -16,16 +16,14 @@ export type Network = {
 };
 
 export type WifiMonitorConfig = {
-    scanIntervalSeconds: number;
     minDwellSeconds: number;
     pingTarget: string;
     pingTimeoutSeconds: number;
-    pingWeight: number;
     bandBonus2g: number;
     bandBonus5g: number;
     bandBonus6g: number;
     rssiOffset: number;
-    maxPingPenalty: number;
+    minSwitchScoreDelta: number;
     ssids: string[];
     stateFile: string;
     configPath: string;
@@ -46,8 +44,12 @@ const moduleState: WifiState = {
 };
 
 function envNumber(raw: string | undefined, fallback: number): number {
+    if (raw === undefined) {
+        return fallback;
+    }
+
     const parsed = Number(raw);
-    return Number.isFinite(parsed) ? parsed : fallback;
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 function airportPath(): string {
@@ -114,19 +116,20 @@ export function resolveWifiMonitorConfig(raw: Record<string, unknown>, env: Node
         .filter(Boolean);
 
     return {
-        scanIntervalSeconds: envNumber(env.WIFI_MONITOR_INTERVAL, assertPositiveInteger(raw.scan_interval ?? 30, "wifi-monitor.scan_interval")),
         minDwellSeconds: envNumber(env.WIFI_MONITOR_MIN_DWELL, assertPositiveInteger(raw.min_dwell ?? 180, "wifi-monitor.min_dwell")),
         pingTarget: (env.WIFI_MONITOR_PING_TARGET ?? ensureStringValue(raw.ping_target ?? "1.1.1.1", "wifi-monitor.ping_target")).trim(),
         pingTimeoutSeconds: envNumber(
             env.WIFI_MONITOR_PING_TIMEOUT,
             assertPositiveInteger(raw.ping_timeout ?? 1, "wifi-monitor.ping_timeout"),
         ),
-        pingWeight: envNumber(env.WIFI_MONITOR_PING_WEIGHT, assertPositiveInteger(raw.ping_weight ?? 8, "wifi-monitor.ping_weight")),
         bandBonus2g: Number(raw.band_bonus_2g ?? 0),
         bandBonus5g: Number(raw.band_bonus_5g ?? 100),
         bandBonus6g: Number(raw.band_bonus_6g ?? 150),
         rssiOffset: Number(raw.rssi_offset ?? 100),
-        maxPingPenalty: assertPositiveInteger(raw.max_ping_penalty ?? 30, "wifi-monitor.max_ping_penalty"),
+        minSwitchScoreDelta: envNumber(
+            env.WIFI_MONITOR_MIN_SWITCH_SCORE_DELTA,
+            assertPositiveInteger(raw.min_switch_score_delta ?? 10, "wifi-monitor.min_switch_score_delta"),
+        ),
         ssids: envSsids.length > 0 ? envSsids : toStringArray(raw.ssids),
         stateFile,
         configPath,
@@ -338,9 +341,7 @@ export function scoreNetwork(network: Network, config: WifiMonitorConfig): numbe
     const bandBonus =
         network.band === "6g" ? config.bandBonus6g : network.band === "5g" ? config.bandBonus5g : config.bandBonus2g;
     const signalScore = Math.max(0, Math.min(100, network.rssi + config.rssiOffset));
-    const pingPenalty =
-        network.pingMs === undefined ? 0 : Math.min(config.maxPingPenalty, Math.floor(network.pingMs / Math.max(1, config.pingWeight)));
-    return bandBonus + signalScore - pingPenalty;
+    return bandBonus + signalScore;
 }
 
 function preferredSsids(device: string): string[] {
@@ -356,72 +357,130 @@ function connect(device: string, ssid: string): void {
     command("networksetup", ["-setairportnetwork", device, ssid]);
 }
 
+type ScoredNetwork = {
+    network: Network;
+    score: number;
+    priority: number;
+};
+
+export type WifiDecision =
+    | { action: "stay"; ssid: string; reason: string }
+    | { action: "switch"; from: string; to: string; reason: string };
+
+function priorityFor(ssid: string, priorityOrder: string[]): number {
+    const index = priorityOrder.indexOf(ssid);
+    return index === -1 ? Number.MAX_SAFE_INTEGER : index;
+}
+
+function chooseBestNetwork(networks: Network[], config: WifiMonitorConfig, priorityOrder: string[]): ScoredNetwork | undefined {
+    return networks
+        .map((network) => ({
+            network,
+            score: scoreNetwork(network, config),
+            priority: priorityFor(network.ssid, priorityOrder),
+        }))
+        .sort((left, right) => left.priority - right.priority || right.score - left.score)[0];
+}
+
+export function decideWifiSwitch(options: {
+    currentSsid: string;
+    networks: Network[];
+    config: WifiMonitorConfig;
+    priorityOrder: string[];
+    dwellSatisfied: boolean;
+    currentHealthy: boolean;
+}): WifiDecision {
+    const best = chooseBestNetwork(options.networks, options.config, options.priorityOrder);
+    if (!best) {
+        return { action: "stay", ssid: options.currentSsid, reason: "no eligible networks found" };
+    }
+
+    const current = options.networks.find((network) => network.ssid === options.currentSsid);
+    if (best.network.ssid === options.currentSsid) {
+        return { action: "stay", ssid: options.currentSsid, reason: `staying on ${options.currentSsid}` };
+    }
+
+    if (!options.dwellSatisfied) {
+        return { action: "stay", ssid: options.currentSsid, reason: `holding ${options.currentSsid || "current network"} until dwell window completes` };
+    }
+
+    if (!current || !options.currentHealthy) {
+        return {
+            action: "switch",
+            from: options.currentSsid,
+            to: best.network.ssid,
+            reason: `switching to ${best.network.ssid}; current network is unavailable or unhealthy`,
+        };
+    }
+
+    const currentScore = scoreNetwork(current, options.config);
+    const currentPriority = priorityFor(options.currentSsid, options.priorityOrder);
+    if (best.priority < currentPriority) {
+        return {
+            action: "switch",
+            from: options.currentSsid,
+            to: best.network.ssid,
+            reason: `switching to higher-priority network ${best.network.ssid}`,
+        };
+    }
+
+    if (best.priority === currentPriority && best.score >= currentScore + options.config.minSwitchScoreDelta) {
+        return {
+            action: "switch",
+            from: options.currentSsid,
+            to: best.network.ssid,
+            reason: `switching to ${best.network.ssid}; score ${best.score} beats current ${currentScore}`,
+        };
+    }
+
+    return {
+        action: "stay",
+        ssid: options.currentSsid,
+        reason: `staying on ${options.currentSsid}; best alternative is not enough better`,
+    };
+}
+
 async function monitorPass(ctx: ModuleContext, config: WifiMonitorConfig): Promise<void> {
     const device = wifiDevice();
     const current = currentSsid(device);
     const preferences = preferredSsids(device);
     const allowedSsids = config.ssids.length > 0 ? config.ssids : preferences;
-    const networks = scanWifi(allowedSsids).map((network) => ({
-        ...network,
-        pingMs: pingMs(config.pingTarget, config.pingTimeoutSeconds),
-    }));
-    const scored = networks
-        .map((network) => ({ network, score: scoreNetwork(network, config) }))
-        .sort((left, right) => right.score - left.score);
+    const networks = scanWifi(allowedSsids);
+    const currentHealthy = pingMs(config.pingTarget, config.pingTimeoutSeconds) !== undefined;
 
     moduleState.loopCount += 1;
     moduleState.lastRunAt = new Date().toISOString();
     moduleState.currentSsid = current;
-
-    if (scored.length === 0) {
-        moduleState.lastDecision = "no eligible networks found";
-        ctx.log.warn(moduleState.lastDecision);
-        return;
-    }
-
-    const top = scored[0];
     const persisted = await readState(config.stateFile);
     const dwellSatisfied = !persisted.startedAt || Date.now() - persisted.startedAt >= config.minDwellSeconds * 1000;
-
-    if (top.network.ssid === current) {
-        moduleState.lastDecision = `staying on ${current}`;
-        return;
-    }
-
-    if (!dwellSatisfied && persisted.ssid === current) {
-        moduleState.lastDecision = `holding ${current} until dwell window completes`;
-        return;
-    }
-
-    connect(device, top.network.ssid);
-    await writeState(config.stateFile, top.network.ssid);
-    moduleState.currentSsid = top.network.ssid;
-    moduleState.lastSwitchAt = new Date().toISOString();
-    moduleState.lastDecision = `switched from ${current || "none"} to ${top.network.ssid}`;
-    ctx.log.info(moduleState.lastDecision);
-}
-
-function sleep(ms: number, signal: AbortSignal): Promise<void> {
-    if (signal.aborted) {
-        return Promise.resolve();
-    }
-
-    return new Promise((resolve) => {
-        const timer = setTimeout(resolve, ms);
-        signal.addEventListener(
-            "abort",
-            () => {
-                clearTimeout(timer);
-                resolve();
-            },
-            { once: true },
-        );
+    const decision = decideWifiSwitch({
+        currentSsid: current,
+        networks,
+        config,
+        priorityOrder: allowedSsids,
+        dwellSatisfied,
+        currentHealthy,
     });
+
+    moduleState.lastDecision = decision.reason;
+    if (decision.action === "stay") {
+        if (networks.length === 0) {
+            ctx.log.warn(decision.reason);
+        }
+        return;
+    }
+
+    connect(device, decision.to);
+    await writeState(config.stateFile, decision.to);
+    moduleState.currentSsid = decision.to;
+    moduleState.lastSwitchAt = new Date().toISOString();
+    ctx.log.info(moduleState.lastDecision);
 }
 
 const modulePlugin: RootServiceModule<WifiMonitorConfig> = {
     id: "wifi-monitor",
-    mode: "daemon",
+    mode: "interval",
+    intervalMs: 30_000,
     async loadConfig(ctx) {
         const configPath = path.join(ctx.moduleDir, "module.yaml");
         const raw = await readConfigFile(configPath);
@@ -430,17 +489,14 @@ const modulePlugin: RootServiceModule<WifiMonitorConfig> = {
             WIFI_MONITOR_CONFIG_PATH: configPath,
         });
     },
-    async start(ctx, config) {
-        while (!ctx.signal.aborted) {
-            try {
-                await monitorPass(ctx, config);
-                moduleState.lastError = undefined;
-            } catch (error) {
-                moduleState.lastError = error instanceof Error ? error.message : String(error);
-                ctx.log.error(moduleState.lastError);
-            }
-
-            await sleep(config.scanIntervalSeconds * 1000, ctx.signal);
+    async runOnce(ctx, config) {
+        try {
+            await monitorPass(ctx, config);
+            moduleState.lastError = undefined;
+        } catch (error) {
+            moduleState.lastError = error instanceof Error ? error.message : String(error);
+            ctx.log.error(moduleState.lastError);
+            throw error;
         }
     },
     status(): ModuleStatus {

@@ -6,6 +6,7 @@ import { resolveHomeDir, resolveModulesDir, resolveServiceConfigPath, resolveSta
 
 export type ServiceModuleConfig = {
     enabled: boolean;
+    schedule?: ModuleSchedule;
 };
 
 export type ServiceConfig = {
@@ -17,6 +18,21 @@ export type ServiceConfig = {
     rootDir: string;
     stateDir: string;
     stateFile: string;
+};
+
+export type Weekday = "sun" | "mon" | "tue" | "wed" | "thu" | "fri" | "sat";
+
+export type ScheduleWindow = {
+    start: string;
+    end: string;
+};
+
+export type ModuleSchedule = {
+    cron?: string[];
+    everySeconds?: number;
+    dailyAt?: string[];
+    weekdays?: Weekday[];
+    window?: ScheduleWindow;
 };
 
 export type ModuleManifest = {
@@ -36,7 +52,7 @@ export type DiscoveredModule = {
 };
 
 type YamlScalar = boolean | number | string;
-type YamlValue = YamlObject | YamlScalar;
+type YamlValue = YamlObject | YamlScalar | YamlScalar[];
 type YamlObject = Record<string, YamlValue>;
 
 type YamlStackEntry = {
@@ -134,12 +150,40 @@ function ensurePositiveInteger(value: unknown, label: string): number {
     return value;
 }
 
+function ensureOptionalPositiveInteger(value: unknown, label: string): number | undefined {
+    if (value === undefined) {
+        return undefined;
+    }
+
+    return ensurePositiveInteger(value, label);
+}
+
 function ensureOptionalString(value: unknown, label: string): string | undefined {
     if (value === undefined) {
         return undefined;
     }
 
     return ensureString(value, label);
+}
+
+function ensureStringArray(value: unknown, label: string): string[] {
+    if (typeof value === "string") {
+        return [value];
+    }
+
+    if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
+        throw new Error(`${label} must be a string or a list of strings`);
+    }
+
+    return value;
+}
+
+function ensureOptionalStringArray(value: unknown, label: string): string[] | undefined {
+    if (value === undefined) {
+        return undefined;
+    }
+
+    return ensureStringArray(value, label);
 }
 
 function assertAllowedKeys(record: Record<string, unknown>, allowedKeys: string[], label: string): void {
@@ -149,6 +193,75 @@ function assertAllowedKeys(record: Record<string, unknown>, allowedKeys: string[
     if (unexpected.length > 0) {
         throw new Error(`${label} contains unsupported keys: ${unexpected.join(", ")}`);
     }
+}
+
+function parseTimeOfDay(value: string, label: string): { hour: number; minute: number } {
+    const match = value.match(/^([01]\d|2[0-3]):([0-5]\d)$/);
+    if (!match) {
+        throw new Error(`${label} must use HH:MM 24-hour time`);
+    }
+
+    return {
+        hour: Number(match[1]),
+        minute: Number(match[2]),
+    };
+}
+
+function parseWeekday(value: string, label: string): Weekday {
+    const normalized = value.toLowerCase();
+    if (!["sun", "mon", "tue", "wed", "thu", "fri", "sat"].includes(normalized)) {
+        throw new Error(`${label} must be one of sun, mon, tue, wed, thu, fri, sat`);
+    }
+
+    return normalized as Weekday;
+}
+
+function parseSchedule(rawValue: unknown, label: string): ModuleSchedule {
+    const record = ensureObject(rawValue, label);
+    assertAllowedKeys(record, ["cron", "every_seconds", "every_minutes", "every_hours", "daily_at", "weekdays", "window"], label);
+
+    const cron = ensureOptionalStringArray(record.cron, `${label}.cron`);
+    const dailyAt = ensureOptionalStringArray(record.daily_at, `${label}.daily_at`);
+    const everySeconds = ensureOptionalPositiveInteger(record.every_seconds, `${label}.every_seconds`);
+    const everyMinutes = ensureOptionalPositiveInteger(record.every_minutes, `${label}.every_minutes`);
+    const everyHours = ensureOptionalPositiveInteger(record.every_hours, `${label}.every_hours`);
+    const triggerCount = [cron, dailyAt, everySeconds, everyMinutes, everyHours].filter((value) => value !== undefined).length;
+    if (triggerCount !== 1) {
+        throw new Error(`${label} must define exactly one trigger: cron, daily_at, every_seconds, every_minutes, or every_hours`);
+    }
+
+    for (const expression of cron ?? []) {
+        parseCronExpression(expression, `${label}.cron`);
+    }
+
+    const parsedDailyAt = dailyAt?.map((value, index) => {
+        parseTimeOfDay(value, `${label}.daily_at[${index}]`);
+        return value;
+    });
+
+    const weekdays = ensureOptionalStringArray(record.weekdays, `${label}.weekdays`)?.map((value, index) =>
+        parseWeekday(value, `${label}.weekdays[${index}]`),
+    );
+
+    let window: ScheduleWindow | undefined;
+    if (record.window !== undefined) {
+        const windowRecord = ensureObject(record.window, `${label}.window`);
+        assertAllowedKeys(windowRecord, ["start", "end"], `${label}.window`);
+        window = {
+            start: ensureString(windowRecord.start, `${label}.window.start`),
+            end: ensureString(windowRecord.end, `${label}.window.end`),
+        };
+        parseTimeOfDay(window.start, `${label}.window.start`);
+        parseTimeOfDay(window.end, `${label}.window.end`);
+    }
+
+    return {
+        cron,
+        dailyAt: parsedDailyAt,
+        everySeconds: everySeconds ?? (everyMinutes ? everyMinutes * 60 : everyHours ? everyHours * 3600 : undefined),
+        weekdays,
+        window,
+    };
 }
 
 function isRootServiceModule(value: unknown): value is RootServiceModule<unknown> {
@@ -344,6 +457,8 @@ export function buildIntervalPlan(options: {
     desiredEnabled: boolean;
     isRunning: boolean;
     intervalMs: number;
+    schedule?: ModuleSchedule;
+    now?: Date;
 }): { shouldSchedule: boolean; delayMs: number | null; reason: string } {
     if (!options.desiredEnabled) {
         return { shouldSchedule: false, delayMs: null, reason: "disabled" };
@@ -353,11 +468,151 @@ export function buildIntervalPlan(options: {
         return { shouldSchedule: false, delayMs: null, reason: "already running" };
     }
 
+    const nextRunAt = nextScheduledRun(options.schedule, options.now ?? new Date(), options.intervalMs);
+    if (!nextRunAt) {
+        return { shouldSchedule: false, delayMs: null, reason: "no matching schedule" };
+    }
+
     return {
         shouldSchedule: true,
-        delayMs: options.intervalMs,
+        delayMs: Math.max(0, nextRunAt.getTime() - (options.now ?? new Date()).getTime()),
         reason: "enabled",
     };
+}
+
+type CronField = {
+    min: number;
+    max: number;
+    values: Set<number>;
+};
+
+function parseCronField(raw: string, min: number, max: number, label: string): CronField {
+    const values = new Set<number>();
+
+    for (const part of raw.split(",")) {
+        const stepMatch = part.match(/^(\*|\d+)(?:-(\d+))?(?:\/(\d+))?$/);
+        if (!stepMatch) {
+            throw new Error(`${label} contains unsupported cron field: ${raw}`);
+        }
+
+        const start = stepMatch[1] === "*" ? min : Number(stepMatch[1]);
+        const end = stepMatch[2] ? Number(stepMatch[2]) : stepMatch[1] === "*" ? max : start;
+        const step = stepMatch[3] ? Number(stepMatch[3]) : 1;
+        if (start < min || end > max || start > end || step <= 0) {
+            throw new Error(`${label} contains out-of-range cron field: ${raw}`);
+        }
+
+        for (let value = start; value <= end; value += step) {
+            values.add(value);
+        }
+    }
+
+    return { min, max, values };
+}
+
+function parseCronExpression(expression: string, label = "cron"): CronField[] {
+    const parts = expression.trim().split(/\s+/);
+    if (parts.length !== 6) {
+        throw new Error(`${label} must use six fields: second minute hour day month weekday`);
+    }
+
+    return [
+        parseCronField(parts[0], 0, 59, label),
+        parseCronField(parts[1], 0, 59, label),
+        parseCronField(parts[2], 0, 23, label),
+        parseCronField(parts[3], 1, 31, label),
+        parseCronField(parts[4], 1, 12, label),
+        parseCronField(parts[5], 0, 6, label),
+    ];
+}
+
+function cronMatches(expression: string, date: Date): boolean {
+    const fields = parseCronExpression(expression);
+    const values = [date.getSeconds(), date.getMinutes(), date.getHours(), date.getDate(), date.getMonth() + 1, date.getDay()];
+    return fields.every((field, index) => field.values.has(values[index]));
+}
+
+function weekdayMatches(schedule: ModuleSchedule, date: Date): boolean {
+    if (!schedule.weekdays || schedule.weekdays.length === 0) {
+        return true;
+    }
+
+    const weekdays: Weekday[] = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+    return schedule.weekdays.includes(weekdays[date.getDay()]);
+}
+
+function minutesOfDay(date: Date): number {
+    return date.getHours() * 60 + date.getMinutes();
+}
+
+function windowMatches(schedule: ModuleSchedule, date: Date): boolean {
+    if (!schedule.window) {
+        return true;
+    }
+
+    const start = parseTimeOfDay(schedule.window.start, "schedule.window.start");
+    const end = parseTimeOfDay(schedule.window.end, "schedule.window.end");
+    const now = minutesOfDay(date);
+    const startMinute = start.hour * 60 + start.minute;
+    const endMinute = end.hour * 60 + end.minute;
+
+    if (startMinute <= endMinute) {
+        return now >= startMinute && now <= endMinute;
+    }
+
+    return now >= startMinute || now <= endMinute;
+}
+
+function scheduleGatesMatch(schedule: ModuleSchedule, date: Date): boolean {
+    return weekdayMatches(schedule, date) && windowMatches(schedule, date);
+}
+
+export function cronFromSchedule(schedule: ModuleSchedule, fallbackIntervalMs: number): string[] {
+    if (schedule.cron) {
+        return schedule.cron.slice();
+    }
+
+    if (schedule.dailyAt) {
+        return schedule.dailyAt.map((value) => {
+            const parsed = parseTimeOfDay(value, "schedule.daily_at");
+            return `0 ${parsed.minute} ${parsed.hour} * * *`;
+        });
+    }
+
+    const seconds = schedule.everySeconds ?? Math.max(1, Math.round(fallbackIntervalMs / 1000));
+    if (seconds < 60) {
+        return [`*/${seconds} * * * * *`];
+    }
+
+    if (seconds % 3600 === 0) {
+        return [`0 0 */${Math.max(1, seconds / 3600)} * * *`];
+    }
+
+    if (seconds % 60 === 0) {
+        return [`0 */${Math.max(1, seconds / 60)} * * * *`];
+    }
+
+    return [`*/${seconds} * * * * *`];
+}
+
+export function nextScheduledRun(schedule: ModuleSchedule | undefined, after: Date, fallbackIntervalMs: number): Date | undefined {
+    const effectiveSchedule: ModuleSchedule = schedule ?? {
+        everySeconds: Math.max(1, Math.round(fallbackIntervalMs / 1000)),
+    };
+    const expressions = cronFromSchedule(effectiveSchedule, fallbackIntervalMs);
+    const candidate = new Date(after.getTime() + 1000);
+    candidate.setMilliseconds(0);
+    const deadline = after.getTime() + 366 * 24 * 60 * 60 * 1000;
+
+    while (candidate.getTime() <= deadline) {
+        if (scheduleGatesMatch(effectiveSchedule, candidate) && expressions.some((expression) => cronMatches(expression, candidate))) {
+            return candidate;
+        }
+
+        candidate.setSeconds(candidate.getSeconds() + 1);
+    }
+
+    return undefined;
 }
 
 export async function loadServiceConfig(rootDir: string, configPath = resolveServiceConfigPath(rootDir)): Promise<ServiceConfig> {
@@ -369,9 +624,10 @@ export async function loadServiceConfig(rootDir: string, configPath = resolveSer
 
     for (const [moduleName, rawValue] of Object.entries(modulesValue)) {
         const moduleConfig = ensureObject(rawValue, `service.modules.${moduleName}`);
-        assertAllowedKeys(moduleConfig, ["enabled"], `service.modules.${moduleName}`);
+        assertAllowedKeys(moduleConfig, ["enabled", "schedule"], `service.modules.${moduleName}`);
         modules[moduleName] = {
             enabled: ensureBoolean(moduleConfig.enabled, `service.modules.${moduleName}.enabled`),
+            schedule: moduleConfig.schedule ? parseSchedule(moduleConfig.schedule, `service.modules.${moduleName}.schedule`) : undefined,
         };
     }
 

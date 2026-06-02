@@ -131,7 +131,9 @@ export async function runSupervisor(): Promise<void> {
         }
 
         await ensureDirectory(currentConfig.stateDir);
-        await fs.writeFile(currentConfig.stateFile, `${JSON.stringify(persisted, null, 2)}\n`, "utf8");
+        const tempPath = `${currentConfig.stateFile}.${process.pid}.tmp`;
+        await fs.writeFile(tempPath, `${JSON.stringify(persisted, null, 2)}\n`, "utf8");
+        await fs.rename(tempPath, currentConfig.stateFile);
     }
 
     function setState(state: ModuleRuntimeState, status: RuntimeStatus, message: string): void {
@@ -279,6 +281,7 @@ export async function runSupervisor(): Promise<void> {
             desiredEnabled: state.desiredEnabled,
             isRunning: Boolean(state.runPromise),
             intervalMs: state.moduleDef.plugin.intervalMs ?? 0,
+            schedule: currentConfig.modules[state.moduleDef.id]?.schedule,
         });
 
         if (!plan.shouldSchedule || plan.delayMs === null) {
@@ -321,7 +324,9 @@ export async function runSupervisor(): Promise<void> {
     function ensureModuleState(moduleDef: DiscoveredModule): ModuleRuntimeState {
         const existing = moduleStates.get(moduleDef.id);
         if (existing) {
-            existing.moduleDef = moduleDef;
+            if (!existing.context && !existing.runPromise && !existing.timer) {
+                existing.moduleDef = moduleDef;
+            }
             return existing;
         }
 

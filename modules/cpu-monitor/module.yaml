@@ -1,8 +1,8 @@
 id: cpu-monitor
 display_name: CPU Monitor
-mode: daemon
+mode: interval
+interval_seconds: 30
 cpu_threshold: 50
-check_interval_seconds: 30
 time_limit_seconds: 600
 exclude_apps:
   - Finder

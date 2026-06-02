@@ -126,11 +126,17 @@ log_dir: ~/Library/Logs/scriptd
 watch: true
 modules:
   wifi-monitor:
-    enabled: true
+    enabled: false
+    schedule:
+      every_minutes: 5
   cpu-monitor:
     enabled: false
+    schedule:
+      every_minutes: 1
   brew-manager:
     enabled: true
+    schedule:
+      every_hours: 12
 ```
 
 Fields:
@@ -139,27 +145,55 @@ Fields:
 - `log_dir`: shared log directory for root and module logs
 - `watch`: when `true`, the supervisor watches `service.yaml` and reapplies config automatically
 - `modules.<name>.enabled`: desired on/off state for each discovered module
+- `modules.<name>.schedule`: interval-module runtime schedule
 
-Module-specific settings are not stored in `service.yaml`; each module loads its own `module.yaml` from its module directory.
+Schedules are local-time and wall-clock anchored. You can use exactly one trigger per module:
+
+```yaml
+schedule:
+  every_seconds: 30
+  # or: every_minutes: 5
+  # or: every_hours: 12
+  # or: daily_at: "09:30"
+  # or: cron: "0 */5 * * * *"
+```
+
+Optional gates can restrict when a trigger is allowed to start:
+
+```yaml
+schedule:
+  daily_at: "09:30"
+  weekdays:
+    - mon
+    - wed
+    - fri
+  window:
+    start: "09:00"
+    end: "17:00"
+```
+
+Module-specific algorithm settings still live in each module's `module.yaml`.
 
 ## Bundled Modules
 
 ### `wifi-monitor`
 
-- Mode: `daemon`
-- Default: enabled
+- Mode: `interval`
+- Default: disabled
+- Default schedule: every 5 minutes
 - Purpose: scans nearby Wi-Fi networks, scores candidates, and switches to the best allowed SSID
 - Inputs: preferred network list or `ssids` configured in `modules/wifi-monitor/module.yaml`
-- Tuning: scan interval, dwell time, ping target, band bonuses, RSSI offset, ping penalty
+- Tuning: dwell time, ping target, manual SSID priority, band bonuses, RSSI offset, switch threshold
 
 See [`modules/wifi-monitor/README.md`](./modules/wifi-monitor/README.md).
 
 ### `cpu-monitor`
 
-- Mode: `daemon`
+- Mode: `interval`
 - Default: disabled
+- Default schedule: every 1 minute
 - Purpose: tracks processes that stay above a CPU threshold and kills them after a sustained time limit
-- Tuning: CPU threshold, poll interval, time limit, excluded app names
+- Tuning: CPU threshold, time limit, excluded app names
 
 See [`modules/cpu-monitor/README.md`](./modules/cpu-monitor/README.md).
 
@@ -167,7 +201,7 @@ See [`modules/cpu-monitor/README.md`](./modules/cpu-monitor/README.md).
 
 - Mode: `interval`
 - Default: enabled
-- Schedule: every `43200` seconds (12 hours)
+- Default schedule: every 12 hours
 - Purpose: runs `brew update`, formula upgrades, cask upgrades, repair fallback flow, and `brew cleanup`
 - Setup: stores a sudo password in Keychain, writes an askpass helper, and installs sudoers rules
 
@@ -199,7 +233,7 @@ The `status` command combines:
 ## Runtime Behavior
 
 - Daemon modules are started immediately when enabled.
-- Interval modules are scheduled from their configured `intervalMs`.
+- Interval modules are scheduled from `service.yaml`; `intervalMs` and `interval_seconds` remain the module's fallback cadence.
 - Interval runs do not overlap.
 - Daemon modules are restarted after crashes with a short delay.
 - Disabling a module aborts its signal and calls the module's optional `stop()` hook.
@@ -223,19 +257,17 @@ Rules enforced by the loader:
   - `interval_seconds` in `module.yaml`
 - those interval values must match exactly
 
-Minimal daemon example:
+Minimal interval example:
 
 ```ts
 import type { RootServiceModule } from "../../src/interfaces.ts";
 
 const modulePlugin: RootServiceModule = {
-  id: "example-daemon",
-  mode: "daemon",
-  async start(ctx) {
-    ctx.log.info("example-daemon started");
-    await new Promise((resolve) => {
-      ctx.signal.addEventListener("abort", resolve, { once: true });
-    });
+  id: "example-job",
+  mode: "interval",
+  intervalMs: 60_000,
+  async runOnce(ctx) {
+    ctx.log.info("example-job ran");
   },
 };
 
@@ -245,9 +277,10 @@ export default modulePlugin;
 Matching manifest:
 
 ```yaml
-id: example-daemon
-mode: daemon
-display_name: Example Daemon
+id: example-job
+mode: interval
+interval_seconds: 60
+display_name: Example Job
 ```
 
 Useful module hooks:

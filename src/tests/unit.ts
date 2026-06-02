@@ -9,10 +9,11 @@ import {
     discoverModules,
     expandHome,
     loadServiceConfig,
+    nextScheduledRun,
     parseSimpleYaml,
 } from "../config.ts";
 import { resolveRepoRoot, resolveServiceConfigPath } from "../paths.ts";
-import { parseSwiftWifiScanOutput, scoreNetwork, resolveWifiMonitorConfig } from "../../modules/wifi-monitor/module.ts";
+import { decideWifiSwitch, parseSwiftWifiScanOutput, scoreNetwork, resolveWifiMonitorConfig } from "../../modules/wifi-monitor/module.ts";
 import { buildBrewCommands } from "../../modules/brew-manager/module.ts";
 import { parseCpuSnapshot, reconcileTrackedProcesses } from "../../modules/cpu-monitor/module.ts";
 import type { TestCase } from "./harness.ts";
@@ -92,6 +93,8 @@ watch: true
 modules:
   brew-manager:
     enabled: true
+    schedule:
+      every_hours: 12
 `,
                     );
 
@@ -99,6 +102,7 @@ modules:
                     assert.equal(config.path, path.join(rootDir, "service.yaml"));
                     assert.equal(config.logDir, path.join(process.env.HOME ?? os.homedir(), "Library", "Logs", "scriptd"));
                     assert.equal(config.modules["brew-manager"]?.enabled, true);
+                    assert.equal(config.modules["brew-manager"]?.schedule?.everySeconds, 43_200);
                 } finally {
                     await cleanupTempDirs();
                 }
@@ -204,12 +208,33 @@ mode: daemon
                         desiredEnabled: true,
                         isRunning: false,
                         intervalMs: 30000,
+                        now: new Date("2026-06-02T10:00:00.000Z"),
                     });
                     assert.equal(scheduled.shouldSchedule, true);
                     assert.equal(scheduled.delayMs, 30000);
                 } finally {
                     await cleanupTempDirs();
                 }
+            },
+        },
+        {
+            name: "service schedules normalize friendly timing to cron-backed next runs",
+            run: () => {
+                const everyHour = nextScheduledRun(
+                    { everySeconds: 3600 },
+                    new Date("2026-06-02T10:15:00.000Z"),
+                    30000,
+                );
+                assert.equal(everyHour?.toISOString(), "2026-06-02T11:00:00.000Z");
+
+                const daily = nextScheduledRun(
+                    { dailyAt: ["09:30"], weekdays: ["wed"], window: { start: "09:00", end: "17:00" } },
+                    new Date("2026-06-02T10:15:00.000Z"),
+                    30000,
+                );
+                assert.equal(daily?.getDay(), 3);
+                assert.equal(daily?.getHours(), 9);
+                assert.equal(daily?.getMinutes(), 30);
             },
         },
         {
@@ -247,16 +272,14 @@ mode: daemon
             run: () => {
                 const config = resolveWifiMonitorConfig(
                     {
-                        scan_interval: 30,
                         min_dwell: 180,
                         ping_target: "1.1.1.1",
                         ping_timeout: 1,
-                        ping_weight: 8,
                         band_bonus_2g: 0,
                         band_bonus_5g: 100,
                         band_bonus_6g: 150,
                         rssi_offset: 100,
-                        max_ping_penalty: 30,
+                        min_switch_score_delta: 10,
                         ssids: ["One"],
                     },
                     { WIFI_MONITOR_SSIDS: "Two,Three" },
@@ -269,6 +292,54 @@ mode: daemon
                         config,
                     ) > 0,
                     true,
+                );
+            },
+        },
+        {
+            name: "wifi-monitor decision keeps stable connections unless priority or score clearly wins",
+            run: () => {
+                const config = resolveWifiMonitorConfig(
+                    {
+                        min_dwell: 180,
+                        ping_target: "1.1.1.1",
+                        ping_timeout: 1,
+                        band_bonus_2g: 0,
+                        band_bonus_5g: 100,
+                        band_bonus_6g: 150,
+                        rssi_offset: 100,
+                        min_switch_score_delta: 10,
+                        ssids: ["Office", "Home"],
+                    },
+                    {},
+                );
+
+                const networks = [
+                    { ssid: "Home", band: "5g" as const, rssi: -45, channel: "36", security: "WPA2" },
+                    { ssid: "Office", band: "2g" as const, rssi: -40, channel: "6", security: "WPA2" },
+                ];
+
+                assert.deepEqual(
+                    decideWifiSwitch({
+                        currentSsid: "Home",
+                        networks,
+                        config,
+                        priorityOrder: ["Home", "Office"],
+                        dwellSatisfied: true,
+                        currentHealthy: true,
+                    }).action,
+                    "stay",
+                );
+
+                assert.deepEqual(
+                    decideWifiSwitch({
+                        currentSsid: "Home",
+                        networks,
+                        config,
+                        priorityOrder: ["Office", "Home"],
+                        dwellSatisfied: true,
+                        currentHealthy: true,
+                    }).action,
+                    "switch",
                 );
             },
         },

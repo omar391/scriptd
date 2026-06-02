@@ -46,19 +46,25 @@ watch: true
 modules:
   wifi-monitor:
     enabled: true
+    schedule:
+      every_seconds: 30
   cpu-monitor:
     enabled: false
+    schedule:
+      every_seconds: 30
   brew-manager:
     enabled: true
+    schedule:
+      every_seconds: 30
 `,
     );
-                    await writeFile(
-                        path.join(repoRoot, "scriptd.sh"),
-                        `#!/bin/bash
+    await writeFile(
+        path.join(repoRoot, "scriptd.sh"),
+        `#!/bin/bash
 exit 0
 `,
-                    );
-                    await chmod(path.join(repoRoot, "scriptd.sh"), 0o755);
+    );
+    await chmod(path.join(repoRoot, "scriptd.sh"), 0o755);
     await writeFile(path.join(repoRoot, "package.json"), `{"name":"scriptd","private":true,"type":"module","workspaces":["modules/*"]}\n`);
     await writeFile(
         path.join(repoRoot, "tsconfig.json"),
@@ -70,10 +76,10 @@ exit 0
         path.join(repoRoot, "modules", "wifi-monitor", "module.ts"),
         `export default {
   id: "wifi-monitor",
-  mode: "daemon",
-  async start(ctx) {
-    ctx.log.info("sandbox module started");
-    await new Promise((resolve) => ctx.signal.addEventListener("abort", resolve, { once: true }));
+  mode: "interval",
+  intervalMs: 30000,
+  async runOnce(ctx) {
+    ctx.log.info("sandbox wifi module ran");
   },
   status() {
     return { state: "running", message: "sandbox-ok", metrics: { loops: 1 } };
@@ -86,24 +92,26 @@ exit 0
     await writeFile(
         path.join(repoRoot, "modules", "wifi-monitor", "module.yaml"),
         `id: wifi-monitor
-mode: daemon
+mode: interval
+interval_seconds: 30
 `,
     );
     await writeFile(
         path.join(repoRoot, "modules", "cpu-monitor", "module.ts"),
         `export default {
   id: "cpu-monitor",
-  mode: "daemon",
-  async start(ctx) {
-    ctx.log.info("sandbox cpu module started");
-    await new Promise((resolve) => ctx.signal.addEventListener("abort", resolve, { once: true }));
+  mode: "interval",
+  intervalMs: 30000,
+  async runOnce(ctx) {
+    ctx.log.info("sandbox cpu module ran");
   }
 };`,
     );
     await writeFile(
         path.join(repoRoot, "modules", "cpu-monitor", "module.yaml"),
         `id: cpu-monitor
-mode: daemon
+mode: interval
+interval_seconds: 30
 `,
     );
     await writeFile(
@@ -227,6 +235,14 @@ async function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void
     throw new Error(`Timed out after ${timeoutMs}ms`);
 }
 
+function readJsonFile<T>(filePath: string): T | undefined {
+    try {
+        return JSON.parse(readFileSync(filePath, "utf8")) as T;
+    } catch {
+        return undefined;
+    }
+}
+
 export function createIntegrationTests(): TestCase[] {
     return [
         {
@@ -328,7 +344,7 @@ export function createIntegrationTests(): TestCase[] {
                                     "cpu-monitor": {
                                         desiredEnabled: false,
                                         status: "disabled",
-                                        mode: "daemon",
+                                        mode: "interval",
                                         runs: 0,
                                         restarts: 0,
                                         message: "module disabled",
@@ -336,7 +352,7 @@ export function createIntegrationTests(): TestCase[] {
                                     "wifi-monitor": {
                                         desiredEnabled: false,
                                         status: "disabled",
-                                        mode: "daemon",
+                                        mode: "interval",
                                         runs: 0,
                                         restarts: 0,
                                         message: "module disabled",
@@ -351,12 +367,33 @@ export function createIntegrationTests(): TestCase[] {
                     const result = runManageCommand(sandbox, ["status"]);
                     assert.equal(result.status, 0);
                     assert.match(result.stdout, /scriptd state: stale snapshot \(LaunchAgent not loaded\)/);
-                    assert.match(
-                        result.stdout,
-                        /brew-manager: desired=enabled, interval, last=disabled, next=30s after service starts/,
-                    );
-                    assert.match(result.stdout, /wifi-monitor: desired=enabled, daemon, last=disabled, next=immediately when service starts/);
+                    assert.match(result.stdout, /brew-manager: desired=enabled, interval, last=disabled, next=\d{4}-/);
+                    assert.match(result.stdout, /wifi-monitor: desired=enabled, interval, last=disabled, next=/);
                     assert.doesNotMatch(result.stdout, /module disabled/);
+                } finally {
+                    await cleanupSandbox(sandbox);
+                }
+            },
+        },
+        {
+            name: "status reports unreadable state without crashing",
+            run: async () => {
+                const sandbox = await createSandbox();
+                try {
+                    await prepareRuntimeWrappers(sandbox, {
+                        bun: "delegate",
+                        node: "delegate",
+                        npx: "delegate",
+                    });
+
+                    const stateDir = path.join(sandbox.homeDir, "Library", "Application Support", "scriptd");
+                    await mkdir(stateDir, { recursive: true });
+                    await writeFile(path.join(stateDir, "state.json"), "{bad-json", "utf8");
+
+                    const result = runManageCommand(sandbox, ["status"]);
+                    assert.equal(result.status, 0);
+                    assert.match(result.stdout, /scriptd state: unreadable/);
+                    assert.match(result.stdout, /wifi-monitor: desired=enabled, interval, runtime=unknown, next=/);
                 } finally {
                     await cleanupSandbox(sandbox);
                 }
@@ -395,6 +432,69 @@ export function createIntegrationTests(): TestCase[] {
                     assert.equal(state.modules["brew-manager"]?.message, "supervisor stopped");
                     assert.equal(state.modules["cpu-monitor"]?.desiredEnabled, false);
                 } finally {
+                    await cleanupSandbox(sandbox);
+                }
+            },
+        },
+        {
+            name: "run root reloads service.yaml changes into live state",
+            run: async () => {
+                const sandbox = await createSandbox();
+                let child: ReturnType<typeof startManageCommand> | undefined;
+                try {
+                    await prepareRuntimeWrappers(sandbox, {
+                        bun: "delegate",
+                        node: "delegate",
+                        npx: "delegate",
+                    });
+
+                    child = startManageCommand(sandbox, ["run", "root"]);
+                    const stateFile = path.join(sandbox.homeDir, "Library", "Application Support", "scriptd", "state.json");
+                    type State = {
+                        modules: Record<string, { desiredEnabled: boolean; status: string; mode: string; nextRunAt?: string }>;
+                    };
+
+                    await waitFor(() => readJsonFile<State>(stateFile)?.modules["wifi-monitor"]?.desiredEnabled === true);
+                    await writeFile(
+                        path.join(sandbox.repoRoot, "service.yaml"),
+                        `label: com.omar.scriptd
+log_dir: ~/Library/Logs/scriptd
+watch: true
+modules:
+  wifi-monitor:
+    enabled: false
+    schedule:
+      every_seconds: 30
+  cpu-monitor:
+    enabled: true
+    schedule:
+      every_seconds: 30
+  brew-manager:
+    enabled: true
+    schedule:
+      every_seconds: 30
+`,
+                    );
+
+                    await waitFor(() => {
+                        const state = readJsonFile<State>(stateFile);
+                        return (
+                            state?.modules["wifi-monitor"]?.desiredEnabled === false &&
+                            state.modules["wifi-monitor"]?.status === "disabled" &&
+                            state.modules["cpu-monitor"]?.desiredEnabled === true &&
+                            state.modules["cpu-monitor"]?.status === "scheduled"
+                        );
+                    });
+
+                    child.kill("SIGTERM");
+                    await new Promise<void>((resolve, reject) => {
+                        child.once("exit", () => resolve());
+                        child.once("error", reject);
+                    });
+                } finally {
+                    if (child && !child.killed) {
+                        child.kill("SIGTERM");
+                    }
                     await cleanupSandbox(sandbox);
                 }
             },

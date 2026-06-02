@@ -3,8 +3,14 @@ log_dir: ~/Library/Logs/scriptd
 watch: true
 modules:
   wifi-monitor:
-    enabled: true
+    enabled: false
+    schedule:
+      every_minutes: 5
   cpu-monitor:
     enabled: false
+    schedule:
+      every_minutes: 1
   brew-manager:
     enabled: true
+    schedule:
+      every_hours: 12

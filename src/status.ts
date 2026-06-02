@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { discoverModules, loadServiceConfig } from "./config.ts";
+import { discoverModules, loadServiceConfig, nextScheduledRun } from "./config.ts";
 import { resolveRepoRoot } from "./paths.ts";
 import type { ModuleHealth, ModuleStatus } from "./interfaces.ts";
 
@@ -133,24 +133,21 @@ function staleNextHint(options: {
     desiredEnabled: boolean;
     mode?: string;
     intervalMs?: number;
+    nextRunAt?: Date;
 }): string | undefined {
     if (!options.desiredEnabled || !options.mode) {
         return undefined;
     }
 
-    if (options.mode === "daemon") {
-        return "immediately when service starts";
+    if (options.nextRunAt) {
+        return options.nextRunAt.toISOString();
     }
 
     if (options.mode === "interval" && typeof options.intervalMs === "number" && options.intervalMs > 0) {
         return `${formatDurationMs(options.intervalMs)} after service starts`;
     }
 
-    if (options.mode === "interval") {
-        return "after service starts";
-    }
-
-    return undefined;
+    return options.mode === "daemon" ? "immediately when service starts" : "after service starts";
 }
 
 function shouldShowModuleMessage(
@@ -188,7 +185,15 @@ export async function renderStatus(): Promise<void> {
     console.log(`Shared log dir: ${config.logDir}`);
     console.log(`State file: ${config.stateFile}`);
 
-    const state = existsSync(config.stateFile) ? (JSON.parse(readFileSync(config.stateFile, "utf8")) as PersistedState) : undefined;
+    let state: PersistedState | undefined;
+    let stateReadError: string | undefined;
+    if (existsSync(config.stateFile)) {
+        try {
+            state = JSON.parse(readFileSync(config.stateFile, "utf8")) as PersistedState;
+        } catch (error) {
+            stateReadError = error instanceof Error ? error.message : String(error);
+        }
+    }
     const stateFreshness = state
         ? resolveStateFreshness(state, {
               launchd,
@@ -199,7 +204,7 @@ export async function renderStatus(): Promise<void> {
     const stateIsCurrent = Boolean(stateFreshness?.current);
 
     if (!state) {
-        console.log("scriptd state: unavailable");
+        console.log(stateReadError ? `scriptd state: unreadable (${stateReadError})` : "scriptd state: unavailable");
     } else {
         console.log(stateIsCurrent ? "scriptd state: current" : `scriptd state: stale snapshot (${stateFreshness?.reason})`);
         console.log(`${stateIsCurrent ? "scriptd PID" : "Last known scriptd PID"}: ${state.supervisor.pid}`);
@@ -220,6 +225,10 @@ export async function renderStatus(): Promise<void> {
         const desiredEnabled = config.modules[moduleName]?.enabled ?? false;
         const discoveredModule = modules.get(moduleName);
         const details: string[] = [`desired=${desiredEnabled ? "enabled" : "disabled"}`];
+        const nextFromConfig =
+            discoveredModule?.plugin.mode === "interval"
+                ? nextScheduledRun(config.modules[moduleName]?.schedule, new Date(), discoveredModule.plugin.intervalMs ?? 0)
+                : undefined;
 
         if (moduleState?.mode) {
             details.push(moduleState.mode);
@@ -233,6 +242,7 @@ export async function renderStatus(): Promise<void> {
                 desiredEnabled,
                 mode: discoveredModule?.plugin.mode,
                 intervalMs: discoveredModule?.plugin.intervalMs,
+                nextRunAt: nextFromConfig,
             });
             if (nextHint) {
                 details.push(`next=${nextHint}`);
@@ -254,6 +264,7 @@ export async function renderStatus(): Promise<void> {
                 desiredEnabled,
                 mode: moduleState.mode,
                 intervalMs: discoveredModule?.plugin.intervalMs,
+                nextRunAt: nextFromConfig,
             });
             if (nextHint) {
                 details.push(`next=${nextHint}`);
