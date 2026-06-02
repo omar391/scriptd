@@ -17,6 +17,7 @@ type PersistedState = {
 function usage(): string {
     return `Usage:
   scriptd.sh install root
+  scriptd.sh stop root
   scriptd.sh uninstall root
   scriptd.sh run root
   scriptd.sh run <module>
@@ -138,6 +139,14 @@ async function uninstallRoot(): Promise<number> {
     return 0;
 }
 
+async function stopRoot(): Promise<number> {
+    const config = await loadServiceConfig(resolveRepoRoot());
+    const plistPath = rootPlistPath(config.label);
+    runLaunchctl(["unload", plistPath], false);
+    console.log(`Stopped root LaunchAgent ${config.label}`);
+    return 0;
+}
+
 async function reloadRoot(): Promise<number> {
     const repoRoot = resolveRepoRoot();
     const config = await loadServiceConfig(repoRoot);
@@ -215,6 +224,15 @@ export async function runCli(argv: string[] = process.argv.slice(2)): Promise<nu
         }
 
         return await uninstallRoot();
+    }
+
+    if (command === "stop") {
+        if (target !== "root") {
+            console.error(usage());
+            return 2;
+        }
+
+        return await stopRoot();
     }
 
     if (command === "run") {

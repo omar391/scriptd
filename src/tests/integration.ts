@@ -419,6 +419,10 @@ export function createIntegrationTests(): TestCase[] {
                     assert.match(readFileSync(plistPath, "utf8"), new RegExp(sandboxManage.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
                     assert.match(readFileSync(plistPath, "utf8"), new RegExp(sandbox.repoRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 
+                    const stop = runManageCommand(sandbox, ["stop", "root"]);
+                    assert.equal(stop.status, 0);
+                    assert.equal(existsSync(plistPath), true);
+
                     const uninstall = runManageCommand(sandbox, ["uninstall", "root"]);
                     assert.equal(uninstall.status, 0);
                     assert.equal(existsSync(plistPath), false);

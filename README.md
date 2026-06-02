@@ -100,6 +100,7 @@ Notes:
 
 ```bash
 ./scriptd.sh install root      # install the LaunchAgent
+./scriptd.sh stop root         # stop the LaunchAgent but keep it installed
 ./scriptd.sh uninstall root    # remove the LaunchAgent
 ./scriptd.sh run root          # run the supervisor in the foreground
 ./scriptd.sh run <module>      # run one module directly
