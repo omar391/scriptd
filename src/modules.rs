@@ -207,28 +207,41 @@ pub struct ModuleContext {
 
 #[derive(Clone, Debug)]
 pub struct ModuleLogger {
+    module_id: String,
     out_path: PathBuf,
     err_path: PathBuf,
+    mirror_to_console: bool,
 }
 
 impl ModuleLogger {
-    pub fn new(log_dir: PathBuf, module_id: &str) -> Self {
+    pub fn new(log_dir: PathBuf, module_id: &str, mirror_to_console: bool) -> Self {
         Self {
+            module_id: module_id.to_string(),
             out_path: log_dir.join(format!("{module_id}.log")),
             err_path: log_dir.join(format!("{module_id}.err")),
+            mirror_to_console,
         }
     }
 
     pub fn info(&self, message: &str) {
         crate::logger::append_info(&self.out_path, message);
+        if self.mirror_to_console {
+            println!("[{}] INFO: {}", self.module_id, message);
+        }
     }
 
     pub fn warn(&self, message: &str) {
         crate::logger::append_warn(&self.out_path, message);
+        if self.mirror_to_console {
+            println!("[{}] WARN: {}", self.module_id, message);
+        }
     }
 
     pub fn error(&self, message: &str) {
         crate::logger::append_error(&self.err_path, message);
+        if self.mirror_to_console {
+            eprintln!("[{}] ERROR: {}", self.module_id, message);
+        }
     }
 }
 
@@ -258,6 +271,16 @@ pub fn module_context(
     module_dir: PathBuf,
     log_dir: PathBuf,
 ) -> ModuleContext {
+    module_context_with_console(id, repo_root, module_dir, log_dir, false)
+}
+
+pub fn module_context_with_console(
+    id: &str,
+    repo_root: PathBuf,
+    module_dir: PathBuf,
+    log_dir: PathBuf,
+    mirror_to_console: bool,
+) -> ModuleContext {
     let mut env = std::env::vars().collect::<HashMap<_, _>>();
     env.insert(
         "SCRIPTD_ROOT_DIR".to_string(),
@@ -279,7 +302,7 @@ pub fn module_context(
         module_dir,
         log_dir: log_dir.clone(),
         env,
-        logger: ModuleLogger::new(log_dir, id),
+        logger: ModuleLogger::new(log_dir, id, mirror_to_console),
     }
 }
 

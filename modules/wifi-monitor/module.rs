@@ -753,6 +753,79 @@ pub fn decide_wifi_switch(
     format!("stay:{}", current.network.ssid)
 }
 
+fn format_metric(value: f64) -> String {
+    let mut rendered = format!("{value:.3}");
+    while rendered.contains('.') && rendered.ends_with('0') {
+        rendered.pop();
+    }
+    if rendered.ends_with('.') {
+        rendered.pop();
+    }
+    rendered
+}
+
+fn build_decision_reason(
+    decision: &str,
+    current_ssid: &str,
+    candidates: &[CandidateScore],
+    config: &WifiMonitorConfig,
+    health_failure_streak: u64,
+) -> String {
+    let mut ranked = candidates.to_vec();
+    ranked.sort_by(|left, right| {
+        right
+            .total_score
+            .total_cmp(&left.total_score)
+            .then(left.rank.cmp(&right.rank))
+    });
+
+    let current_label = if current_ssid.is_empty() {
+        "current network"
+    } else {
+        current_ssid
+    };
+    let Some(best) = ranked.first() else {
+        return "no eligible networks found".to_string();
+    };
+    let current = ranked
+        .iter()
+        .find(|candidate| candidate.network.ssid == current_ssid);
+    let delta = current
+        .map(|candidate| best.total_score - candidate.total_score)
+        .unwrap_or(0.0);
+
+    if let Some(ssid) = decision.strip_prefix("hold:") {
+        let label = if ssid.is_empty() { current_label } else { ssid };
+        return format!("holding {label} until dwell window completes");
+    }
+
+    if let Some(rest) = decision.strip_prefix("switch:") {
+        let mut parts = rest.splitn(2, ':');
+        let _from = parts.next().unwrap_or_default();
+        let to = parts.next().unwrap_or_default();
+        if health_failure_streak >= config.health_failure_switch_runs && delta >= 10.0 {
+            return format!(
+                "switching to {to}; repeated health failures and score delta {} >= 10",
+                format_metric(delta)
+            );
+        }
+        return format!(
+            "switching to {to}; score delta {} >= {}",
+            format_metric(delta),
+            format_metric(config.min_switch_score_delta)
+        );
+    }
+
+    if best.network.ssid == current_ssid || current.is_none() {
+        return format!("staying on {current_label}");
+    }
+
+    format!(
+        "staying on {current_label}; best score delta {} is below required threshold",
+        format_metric(delta)
+    )
+}
+
 fn connect_network(device: &str, ssid: &str) -> anyhow::Result<()> {
     let status = Command::new("networksetup")
         .args(["-setairportnetwork", device, ssid])
@@ -878,21 +951,61 @@ pub fn run_once(context: &mut ModuleContext) -> anyhow::Result<Option<ModuleStat
     state.current_ssid = effective.clone();
     state.last_run_at = Some(now.to_rfc3339());
 
+    let current_description = if !current.is_empty() {
+        current.clone()
+    } else if !effective.is_empty() {
+        format!("unknown; using last known {effective}")
+    } else {
+        "unknown".to_string()
+    };
     let reason = format!(
-        "current={}; health=loss:{} latency:{:?} streak:{}; candidates={}",
-        effective,
+        "current={}; health=loss:{}% latency:{}ms streak:{}; candidates={}",
+        current_description,
         current_health.packet_loss_percent,
-        current_health.avg_latency_ms,
+        current_health
+            .avg_latency_ms
+            .map(format_metric)
+            .unwrap_or_else(|| "n/a".to_string()),
         next_failure_streak,
         describe_candidates(&candidates),
     );
     context.logger.info(&reason);
+    let decision_reason = build_decision_reason(
+        &decision,
+        &effective,
+        &candidates,
+        &config,
+        next_failure_streak,
+    );
+    state.last_decision = Some(decision_reason.clone());
 
     match decision.split(':').next() {
         Some("switch") => {
             let parts = decision.split(':').collect::<Vec<_>>();
             if parts.len() >= 3 {
                 let to = parts[2];
+                if to == effective {
+                    let message = format!("staying on {effective}; chosen SSID already matches current");
+                    state.last_decision = Some(message.clone());
+                    context.logger.info(&message);
+                    return Ok(Some(ModuleStatus {
+                        state: "running".to_string(),
+                        message: state.last_decision.clone(),
+                        started_at: None,
+                        last_run_at: state.last_run_at.clone(),
+                        next_run_at: None,
+                        metrics: Some(HashMap::from([
+                            (
+                                "loops".to_string(),
+                                serde_json::Value::from(state.loop_count),
+                            ),
+                            (
+                                "connected".to_string(),
+                                serde_json::Value::String(state.current_ssid.clone()),
+                            ),
+                        ])),
+                    }));
+                }
                 connect_network(&device, to)?;
                 let switched_at = Utc::now().to_rfc3339();
                 write_state(
@@ -900,7 +1013,7 @@ pub fn run_once(context: &mut ModuleContext) -> anyhow::Result<Option<ModuleStat
                     &PersistedWifiState {
                         last_ssid: to.to_string(),
                         last_connected_at: Some(switched_at.clone()),
-                        last_switch_at: Some(switched_at),
+                        last_switch_at: Some(switched_at.clone()),
                         health_failure_streak: 0,
                         last_health: Some(StoredHealth {
                             packet_loss_percent: current_health.packet_loss_percent,
@@ -909,18 +1022,25 @@ pub fn run_once(context: &mut ModuleContext) -> anyhow::Result<Option<ModuleStat
                     },
                 );
                 state.last_error = None;
-                state.last_decision = Some(format!("switch {current} -> {to}"));
-                state.last_switch_at = state.last_decision.clone();
-                context
-                    .logger
-                    .info(state.last_decision.as_deref().unwrap_or("switched wifi"));
+                state.current_ssid = to.to_string();
+                state.last_switch_at = Some(switched_at);
+                context.logger.info(&decision_reason);
             }
         }
         _ => {
+            if networks.is_empty() {
+                context.logger.warn(&decision_reason);
+            } else {
+                context.logger.info(&decision_reason);
+            }
             write_state(
                 &config.state_file,
                 &PersistedWifiState {
-                    last_ssid: effective,
+                    last_ssid: if effective.is_empty() {
+                        persisted.last_ssid
+                    } else {
+                        effective
+                    },
                     last_connected_at: persisted
                         .last_connected_at
                         .or(Some(Utc::now().to_rfc3339())),
@@ -933,7 +1053,6 @@ pub fn run_once(context: &mut ModuleContext) -> anyhow::Result<Option<ModuleStat
                 },
             );
             state.last_error = None;
-            state.last_decision = Some(format!("stay {}", reason));
         }
     }
 

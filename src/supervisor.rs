@@ -584,10 +584,18 @@ pub fn run_one_module(root: PathBuf, module: &str) -> Result<()> {
     let log_dir_path = log_dir.to_string_lossy().to_string();
     let watch = config.watch;
 
-    let mut context = modules::module_context(module, root_for_context, module_dir, log_dir);
+    let mut context = modules::module_context_with_console(
+        module,
+        root_for_context,
+        module_dir,
+        log_dir,
+        true,
+    );
     let mut runtime = ModuleRuntime::from_definition(definition.clone());
     runtime.schedule = module_schedule;
+    println!("Running {module}...");
     let status = modules::run_once(&kind, &mut context, &runtime.schedule)?;
+    println!("Completed {module}.");
 
     let mut module_states = BTreeMap::new();
     let health = status

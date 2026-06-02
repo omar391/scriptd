@@ -129,35 +129,13 @@ fn reconcile_tracked_processes(
 pub fn run_once(context: &mut ModuleContext) -> anyhow::Result<Option<ModuleStatus>> {
     let mut system = System::new_all();
     let config = read_cpu_config(&context.module_dir);
-    let mut snapshot = Vec::new();
     system.refresh_processes(ProcessesToUpdate::All, true);
-    for (&pid, process) in system.processes() {
-        if (process.cpu_usage() as u64) <= config.cpu_threshold {
-            continue;
-        }
-        let name = process.name().to_string_lossy().into_owned();
-        if config.exclude_apps.iter().any(|value| value == &name) {
-            continue;
-        }
-        snapshot.push((
-            pid.as_u32(),
-            TrackedProcess {
-                first_seen_at: now_secs(),
-                cpu: process.cpu_usage(),
-                name,
-            },
-        ));
-    }
+    let snapshot = parse_cpu_snapshot(&config, &context.logger);
 
     let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
+    state.tracked =
+        reconcile_tracked_processes(snapshot, &state.tracked, config.time_limit_seconds);
     let now = now_secs();
-    for (pid, sample) in snapshot.iter() {
-        let _ = state.tracked.entry(*pid).or_insert_with(|| TrackedProcess {
-            first_seen_at: now,
-            cpu: sample.cpu,
-            name: sample.name.clone(),
-        });
-    }
 
     let stale: Vec<u32> = state
         .tracked
@@ -167,17 +145,7 @@ pub fn run_once(context: &mut ModuleContext) -> anyhow::Result<Option<ModuleStat
         .collect();
 
     let mut killed: Option<String> = None;
-    if stale.is_empty() {
-        if !state.tracked.is_empty() {
-            let candidate_count = state.tracked.len();
-            let message = format!(
-                "CPU monitor sampled {} hot process candidates",
-                candidate_count
-            );
-            state.last_message = Some(message.clone());
-            context.logger.info(&message);
-        }
-    } else {
+    if !stale.is_empty() {
         for pid in stale {
             let _ = state.tracked.remove(&pid);
             if let Some(process) = system.process(sysinfo::Pid::from_u32(pid)) {
@@ -188,6 +156,7 @@ pub fn run_once(context: &mut ModuleContext) -> anyhow::Result<Option<ModuleStat
                         config.cpu_threshold
                     );
                     context.logger.info(&message);
+                    state.last_message = Some(message.clone());
                     state.last_killed_pid = Some(pid);
                     state.last_error = None;
                     killed = Some(message);
