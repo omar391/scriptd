@@ -18,10 +18,16 @@ export type Network = {
 export type WifiMonitorConfig = {
     minDwellSeconds: number;
     pingTarget: string;
+    pingCount: number;
     pingTimeoutSeconds: number;
+    pingHighLatencyMs: number;
+    healthFailureSwitchRuns: number;
     bandBonus2g: number;
     bandBonus5g: number;
     bandBonus6g: number;
+    preferenceTopBonus: number;
+    preferenceRankDecay: number;
+    currentStickyBonus: number;
     rssiOffset: number;
     minSwitchScoreDelta: number;
     ssids: string[];
@@ -41,6 +47,36 @@ type WifiState = {
 const moduleState: WifiState = {
     currentSsid: "",
     loopCount: 0,
+};
+
+type PingHealth = {
+    packetLossPercent: number;
+    avgLatencyMs?: number;
+    healthy: boolean;
+    severe: boolean;
+    penalty: number;
+};
+
+type PersistedWifiState = {
+    lastSsid: string;
+    lastConnectedAt?: string;
+    lastSwitchAt?: string;
+    healthFailureStreak: number;
+    lastHealth?: {
+        packetLossPercent: number;
+        avgLatencyMs?: number;
+    };
+};
+
+type CandidateScore = {
+    network: Network;
+    rank: number;
+    rssiScore: number;
+    bandBonus: number;
+    preferenceBonus: number;
+    stickyBonus: number;
+    healthPenalty: number;
+    totalScore: number;
 };
 
 function envNumber(raw: string | undefined, fallback: number): number {
@@ -118,17 +154,29 @@ export function resolveWifiMonitorConfig(raw: Record<string, unknown>, env: Node
     return {
         minDwellSeconds: envNumber(env.WIFI_MONITOR_MIN_DWELL, assertPositiveInteger(raw.min_dwell ?? 180, "wifi-monitor.min_dwell")),
         pingTarget: (env.WIFI_MONITOR_PING_TARGET ?? ensureStringValue(raw.ping_target ?? "1.1.1.1", "wifi-monitor.ping_target")).trim(),
+        pingCount: envNumber(env.WIFI_MONITOR_PING_COUNT, assertPositiveInteger(raw.ping_count ?? 3, "wifi-monitor.ping_count")),
         pingTimeoutSeconds: envNumber(
             env.WIFI_MONITOR_PING_TIMEOUT,
             assertPositiveInteger(raw.ping_timeout ?? 1, "wifi-monitor.ping_timeout"),
         ),
+        pingHighLatencyMs: envNumber(
+            env.WIFI_MONITOR_PING_HIGH_LATENCY_MS,
+            assertPositiveInteger(raw.ping_high_latency_ms ?? 250, "wifi-monitor.ping_high_latency_ms"),
+        ),
+        healthFailureSwitchRuns: envNumber(
+            env.WIFI_MONITOR_HEALTH_FAILURE_SWITCH_RUNS,
+            assertPositiveInteger(raw.health_failure_switch_runs ?? 2, "wifi-monitor.health_failure_switch_runs"),
+        ),
         bandBonus2g: Number(raw.band_bonus_2g ?? 0),
-        bandBonus5g: Number(raw.band_bonus_5g ?? 100),
-        bandBonus6g: Number(raw.band_bonus_6g ?? 150),
+        bandBonus5g: Number(raw.band_bonus_5g ?? 35),
+        bandBonus6g: Number(raw.band_bonus_6g ?? 50),
+        preferenceTopBonus: Number(raw.preference_top_bonus ?? 30),
+        preferenceRankDecay: Number(raw.preference_rank_decay ?? 5),
+        currentStickyBonus: Number(raw.current_sticky_bonus ?? 25),
         rssiOffset: Number(raw.rssi_offset ?? 100),
         minSwitchScoreDelta: envNumber(
             env.WIFI_MONITOR_MIN_SWITCH_SCORE_DELTA,
-            assertPositiveInteger(raw.min_switch_score_delta ?? 10, "wifi-monitor.min_switch_score_delta"),
+            assertPositiveInteger(raw.min_switch_score_delta ?? 25, "wifi-monitor.min_switch_score_delta"),
         ),
         ssids: envSsids.length > 0 ? envSsids : toStringArray(raw.ssids),
         stateFile,
@@ -189,18 +237,47 @@ if let iface = CWWiFiClient.shared().interface(), let ssid = iface.ssid() {
     return "";
 }
 
-function pingMs(target: string, timeoutSeconds: number): number | undefined {
+export function parsePingHealth(output: string, config: Pick<WifiMonitorConfig, "pingHighLatencyMs">, priorFailureStreak = 0): PingHealth {
+    const lossMatch = output.match(/([0-9.]+)%\s+packet loss/);
+    const avgMatch = output.match(/=\s*[0-9.]+\/([0-9.]+)\/[0-9.]+\/[0-9.]+\s*ms/);
+    const packetLossPercent = lossMatch ? Number(lossMatch[1]) : 100;
+    const avgLatencyMs = avgMatch ? Math.round(Number(avgMatch[1])) : undefined;
+    const degraded = packetLossPercent > 0 || (avgLatencyMs !== undefined && avgLatencyMs > config.pingHighLatencyMs);
+    const severe = packetLossPercent >= 100;
+    let penalty = 0;
+    if (severe) {
+        penalty = 45;
+    } else if (degraded) {
+        penalty = 15;
+    }
+
+    if ((severe || degraded) && priorFailureStreak >= 1) {
+        penalty += 25;
+    }
+
+    return {
+        packetLossPercent,
+        avgLatencyMs,
+        healthy: !degraded,
+        severe,
+        penalty,
+    };
+}
+
+function pingHealth(target: string, config: Pick<WifiMonitorConfig, "pingCount" | "pingTimeoutSeconds" | "pingHighLatencyMs">, priorFailureStreak = 0): PingHealth {
     if (!target) {
-        return undefined;
+        return {
+            packetLossPercent: 100,
+            healthy: false,
+            severe: true,
+            penalty: priorFailureStreak >= 1 ? 70 : 45,
+        };
     }
 
-    const result = spawnSync("ping", ["-c", "1", "-W", String(timeoutSeconds * 1000), target], { encoding: "utf8" });
-    if (result.status !== 0) {
-        return undefined;
-    }
-
-    const match = (result.stdout ?? "").match(/time=([0-9.]+)\s*ms/);
-    return match ? Math.round(Number(match[1])) : undefined;
+    const result = spawnSync("ping", ["-c", String(config.pingCount), "-W", String(config.pingTimeoutSeconds * 1000), target], {
+        encoding: "utf8",
+    });
+    return parsePingHealth(`${result.stdout ?? ""}\n${result.stderr ?? ""}`, config, priorFailureStreak);
 }
 
 type SwiftScanRecord = {
@@ -322,19 +399,37 @@ function scanWifi(allowedSsids: string[]): Network[] {
     return networks;
 }
 
-async function readState(stateFile: string): Promise<{ ssid: string; startedAt: number }> {
+async function readState(stateFile: string): Promise<PersistedWifiState> {
     try {
         const contents = await fs.readFile(stateFile, "utf8");
-        const [ssid = "", startedAt = "0"] = contents.trim().split("\n");
-        return { ssid, startedAt: Number(startedAt) || 0 };
+        const trimmed = contents.trim();
+        if (trimmed.startsWith("{")) {
+            const parsed = JSON.parse(trimmed) as PersistedWifiState;
+            return {
+                lastSsid: parsed.lastSsid ?? "",
+                lastConnectedAt: parsed.lastConnectedAt,
+                lastSwitchAt: parsed.lastSwitchAt,
+                healthFailureStreak: parsed.healthFailureStreak ?? 0,
+                lastHealth: parsed.lastHealth,
+            };
+        }
+
+        const [ssid = "", startedAt = "0"] = trimmed.split("\n");
+        const startedAtMs = Number(startedAt) || 0;
+        return {
+            lastSsid: ssid,
+            lastConnectedAt: startedAtMs > 0 ? new Date(startedAtMs).toISOString() : undefined,
+            lastSwitchAt: startedAtMs > 0 ? new Date(startedAtMs).toISOString() : undefined,
+            healthFailureStreak: 0,
+        };
     } catch {
-        return { ssid: "", startedAt: 0 };
+        return { lastSsid: "", healthFailureStreak: 0 };
     }
 }
 
-async function writeState(stateFile: string, ssid: string): Promise<void> {
+async function writeState(stateFile: string, state: PersistedWifiState): Promise<void> {
     await fs.mkdir(path.dirname(stateFile), { recursive: true });
-    await fs.writeFile(stateFile, `${ssid}\n${Date.now()}\n`, "utf8");
+    await fs.writeFile(stateFile, `${JSON.stringify(state, null, 2)}\n`, "utf8");
 }
 
 export function scoreNetwork(network: Network, config: WifiMonitorConfig): number {
@@ -372,71 +467,136 @@ function priorityFor(ssid: string, priorityOrder: string[]): number {
     return index === -1 ? Number.MAX_SAFE_INTEGER : index;
 }
 
-function chooseBestNetwork(networks: Network[], config: WifiMonitorConfig, priorityOrder: string[]): ScoredNetwork | undefined {
-    return networks
-        .map((network) => ({
+function preferenceBonus(rank: number, config: Pick<WifiMonitorConfig, "preferenceTopBonus" | "preferenceRankDecay">): number {
+    if (!Number.isFinite(rank) || rank === Number.MAX_SAFE_INTEGER) {
+        return 0;
+    }
+
+    return Math.max(0, config.preferenceTopBonus - rank * config.preferenceRankDecay);
+}
+
+function bandBonusFor(network: Network, config: Pick<WifiMonitorConfig, "bandBonus2g" | "bandBonus5g" | "bandBonus6g">): number {
+    return network.band === "6g" ? config.bandBonus6g : network.band === "5g" ? config.bandBonus5g : config.bandBonus2g;
+}
+
+export function buildCandidateScore(options: {
+    network: Network;
+    config: WifiMonitorConfig;
+    priorityOrder: string[];
+    currentSsid: string;
+    currentHealthPenalty: number;
+}): CandidateScore {
+    const rank = priorityFor(options.network.ssid, options.priorityOrder);
+    const rssiScore = Math.max(0, Math.min(100, options.network.rssi + options.config.rssiOffset));
+    const bandBonus = bandBonusFor(options.network, options.config);
+    const prefBonus = preferenceBonus(rank, options.config);
+    const stickyBonus = options.network.ssid === options.currentSsid ? options.config.currentStickyBonus : 0;
+    const healthPenalty = options.network.ssid === options.currentSsid ? options.currentHealthPenalty : 0;
+
+    return {
+        network: options.network,
+        rank,
+        rssiScore,
+        bandBonus,
+        preferenceBonus: prefBonus,
+        stickyBonus,
+        healthPenalty,
+        totalScore: rssiScore + bandBonus + prefBonus + stickyBonus - healthPenalty,
+    };
+}
+
+export function dedupeNetworksBySsid(networks: Network[], config: WifiMonitorConfig, priorityOrder: string[]): Network[] {
+    const bestBySsid = new Map<string, ScoredNetwork>();
+    for (const network of networks) {
+        const scored = {
             network,
-            score: scoreNetwork(network, config),
+            score: scoreNetwork(network, config) + preferenceBonus(priorityFor(network.ssid, priorityOrder), config),
             priority: priorityFor(network.ssid, priorityOrder),
-        }))
-        .sort((left, right) => left.priority - right.priority || right.score - left.score)[0];
+        };
+        const current = bestBySsid.get(network.ssid);
+        if (!current || scored.score > current.score) {
+            bestBySsid.set(network.ssid, scored);
+        }
+    }
+
+    return Array.from(bestBySsid.values()).map((entry) => entry.network);
+}
+
+export function effectiveCurrentSsid(currentSsid: string, persistedSsid: string, networks: Network[]): string {
+    const current = currentSsid.trim();
+    if (current) {
+        return current;
+    }
+
+    const persisted = persistedSsid.trim();
+    if (persisted && networks.some((network) => network.ssid === persisted)) {
+        return persisted;
+    }
+
+    return "";
+}
+
+function describeCandidates(candidates: CandidateScore[]): string {
+    if (candidates.length === 0) {
+        return "none";
+    }
+
+    return candidates
+        .slice()
+        .sort((left, right) => right.totalScore - left.totalScore || left.rank - right.rank)
+        .map(
+            (candidate) =>
+                `${candidate.network.ssid}(band=${candidate.network.band}, rssi=${candidate.network.rssi}, pref=${candidate.preferenceBonus}, bandBonus=${candidate.bandBonus}, sticky=${candidate.stickyBonus}, healthPenalty=${candidate.healthPenalty}, total=${candidate.totalScore})`,
+        )
+        .join("; ");
 }
 
 export function decideWifiSwitch(options: {
     currentSsid: string;
-    networks: Network[];
+    candidates: CandidateScore[];
     config: WifiMonitorConfig;
-    priorityOrder: string[];
     dwellSatisfied: boolean;
-    currentHealthy: boolean;
+    healthFailureStreak: number;
 }): WifiDecision {
-    const best = chooseBestNetwork(options.networks, options.config, options.priorityOrder);
+    const ranked = options.candidates.slice().sort((left, right) => right.totalScore - left.totalScore || left.rank - right.rank);
+    const best = ranked[0];
     if (!best) {
         return { action: "stay", ssid: options.currentSsid, reason: "no eligible networks found" };
     }
 
-    const current = options.networks.find((network) => network.ssid === options.currentSsid);
-    if (best.network.ssid === options.currentSsid) {
-        return { action: "stay", ssid: options.currentSsid, reason: `staying on ${options.currentSsid}` };
+    const current = ranked.find((candidate) => candidate.network.ssid === options.currentSsid);
+    if (best.network.ssid === options.currentSsid || !current) {
+        return { action: "stay", ssid: options.currentSsid, reason: `staying on ${options.currentSsid || "current network"}` };
     }
 
     if (!options.dwellSatisfied) {
         return { action: "stay", ssid: options.currentSsid, reason: `holding ${options.currentSsid || "current network"} until dwell window completes` };
     }
 
-    if (!current || !options.currentHealthy) {
+    const healthDriven = options.healthFailureStreak >= options.config.healthFailureSwitchRuns;
+    const delta = best.totalScore - current.totalScore;
+    if (healthDriven && delta >= 10) {
         return {
             action: "switch",
             from: options.currentSsid,
             to: best.network.ssid,
-            reason: `switching to ${best.network.ssid}; current network is unavailable or unhealthy`,
+            reason: `switching to ${best.network.ssid}; repeated health failures and score delta ${delta} >= 10`,
         };
     }
 
-    const currentScore = scoreNetwork(current, options.config);
-    const currentPriority = priorityFor(options.currentSsid, options.priorityOrder);
-    if (best.priority < currentPriority) {
+    if (delta >= options.config.minSwitchScoreDelta) {
         return {
             action: "switch",
             from: options.currentSsid,
             to: best.network.ssid,
-            reason: `switching to higher-priority network ${best.network.ssid}`,
-        };
-    }
-
-    if (best.priority === currentPriority && best.score >= currentScore + options.config.minSwitchScoreDelta) {
-        return {
-            action: "switch",
-            from: options.currentSsid,
-            to: best.network.ssid,
-            reason: `switching to ${best.network.ssid}; score ${best.score} beats current ${currentScore}`,
+            reason: `switching to ${best.network.ssid}; score delta ${delta} >= ${options.config.minSwitchScoreDelta}`,
         };
     }
 
     return {
         action: "stay",
         ssid: options.currentSsid,
-        reason: `staying on ${options.currentSsid}; best alternative is not enough better`,
+        reason: `staying on ${options.currentSsid}; best score delta ${delta} is below required threshold`,
     };
 }
 
@@ -445,35 +605,75 @@ async function monitorPass(ctx: ModuleContext, config: WifiMonitorConfig): Promi
     const current = currentSsid(device);
     const preferences = preferredSsids(device);
     const allowedSsids = config.ssids.length > 0 ? config.ssids : preferences;
-    const networks = scanWifi(allowedSsids);
-    const currentHealthy = pingMs(config.pingTarget, config.pingTimeoutSeconds) !== undefined;
+    const scannedNetworks = scanWifi(allowedSsids);
 
     moduleState.loopCount += 1;
     moduleState.lastRunAt = new Date().toISOString();
-    moduleState.currentSsid = current;
     const persisted = await readState(config.stateFile);
-    const dwellSatisfied = !persisted.startedAt || Date.now() - persisted.startedAt >= config.minDwellSeconds * 1000;
+    const networks = dedupeNetworksBySsid(scannedNetworks, config, allowedSsids);
+    const effectiveCurrent = effectiveCurrentSsid(current, persisted.lastSsid, networks);
+    moduleState.currentSsid = effectiveCurrent;
+    const currentHealth = pingHealth(config.pingTarget, config, persisted.healthFailureStreak);
+    const nextFailureStreak = currentHealth.healthy ? 0 : persisted.healthFailureStreak + 1;
+    const lastConnectedAtMs = persisted.lastConnectedAt ? Date.parse(persisted.lastConnectedAt) : 0;
+    const dwellSatisfied = !lastConnectedAtMs || Date.now() - lastConnectedAtMs >= config.minDwellSeconds * 1000;
+    const currentDescription = current || (effectiveCurrent ? `unknown; using last known ${effectiveCurrent}` : "unknown");
+    const candidates = networks.map((network) =>
+        buildCandidateScore({
+            network,
+            config,
+            priorityOrder: allowedSsids,
+            currentSsid: effectiveCurrent,
+            currentHealthPenalty: currentHealth.penalty,
+        }),
+    );
+    ctx.log.info(
+        `current=${currentDescription}; health=loss:${currentHealth.packetLossPercent}% latency:${currentHealth.avgLatencyMs ?? "n/a"}ms streak:${nextFailureStreak}; candidates=${describeCandidates(candidates)}`,
+    );
     const decision = decideWifiSwitch({
-        currentSsid: current,
-        networks,
+        currentSsid: effectiveCurrent,
+        candidates,
         config,
-        priorityOrder: allowedSsids,
         dwellSatisfied,
-        currentHealthy,
+        healthFailureStreak: nextFailureStreak,
     });
 
     moduleState.lastDecision = decision.reason;
     if (decision.action === "stay") {
-        if (networks.length === 0) {
-            ctx.log.warn(decision.reason);
-        }
+        const log = networks.length === 0 ? ctx.log.warn : ctx.log.info;
+        log(decision.reason);
+        await writeState(config.stateFile, {
+            lastSsid: effectiveCurrent || persisted.lastSsid,
+            lastConnectedAt: effectiveCurrent ? persisted.lastConnectedAt ?? new Date().toISOString() : persisted.lastConnectedAt,
+            lastSwitchAt: persisted.lastSwitchAt,
+            healthFailureStreak: nextFailureStreak,
+            lastHealth: {
+                packetLossPercent: currentHealth.packetLossPercent,
+                avgLatencyMs: currentHealth.avgLatencyMs,
+            },
+        });
+        return;
+    }
+
+    if (decision.to === effectiveCurrent) {
+        ctx.log.info(`staying on ${effectiveCurrent}; chosen SSID already matches current`);
         return;
     }
 
     connect(device, decision.to);
-    await writeState(config.stateFile, decision.to);
+    const switchedAt = new Date().toISOString();
+    await writeState(config.stateFile, {
+        lastSsid: decision.to,
+        lastConnectedAt: switchedAt,
+        lastSwitchAt: switchedAt,
+        healthFailureStreak: 0,
+        lastHealth: {
+            packetLossPercent: currentHealth.packetLossPercent,
+            avgLatencyMs: currentHealth.avgLatencyMs,
+        },
+    });
     moduleState.currentSsid = decision.to;
-    moduleState.lastSwitchAt = new Date().toISOString();
+    moduleState.lastSwitchAt = switchedAt;
     ctx.log.info(moduleState.lastDecision);
 }
 

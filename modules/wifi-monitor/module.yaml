@@ -4,12 +4,18 @@ mode: interval
 interval_seconds: 30
 min_dwell: 180
 ping_target: 1.1.1.1
+ping_count: 3
 ping_timeout: 1
+ping_high_latency_ms: 250
+health_failure_switch_runs: 2
 band_bonus_2g: 0
-band_bonus_5g: 100
-band_bonus_6g: 150
+band_bonus_5g: 35
+band_bonus_6g: 50
+preference_top_bonus: 30
+preference_rank_decay: 5
+current_sticky_bonus: 25
 rssi_offset: 100
-min_switch_score_delta: 10
+min_switch_score_delta: 25
 ssids:
   # - HomeWiFi
   # - OfficeNet

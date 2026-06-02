@@ -13,7 +13,16 @@ import {
     parseSimpleYaml,
 } from "../config.ts";
 import { resolveRepoRoot, resolveServiceConfigPath } from "../paths.ts";
-import { decideWifiSwitch, parseSwiftWifiScanOutput, scoreNetwork, resolveWifiMonitorConfig } from "../../modules/wifi-monitor/module.ts";
+import {
+    buildCandidateScore,
+    decideWifiSwitch,
+    dedupeNetworksBySsid,
+    effectiveCurrentSsid,
+    parsePingHealth,
+    parseSwiftWifiScanOutput,
+    scoreNetwork,
+    resolveWifiMonitorConfig,
+} from "../../modules/wifi-monitor/module.ts";
 import { buildBrewCommands, ensureAskpassHelper, type BrewManagerConfig } from "../../modules/brew-manager/module.ts";
 import { parseCpuSnapshot, reconcileTrackedProcesses } from "../../modules/cpu-monitor/module.ts";
 import type { TestCase } from "./harness.ts";
@@ -274,12 +283,18 @@ mode: daemon
                     {
                         min_dwell: 180,
                         ping_target: "1.1.1.1",
+                        ping_count: 3,
                         ping_timeout: 1,
+                        ping_high_latency_ms: 250,
+                        health_failure_switch_runs: 2,
                         band_bonus_2g: 0,
-                        band_bonus_5g: 100,
-                        band_bonus_6g: 150,
+                        band_bonus_5g: 35,
+                        band_bonus_6g: 50,
+                        preference_top_bonus: 30,
+                        preference_rank_decay: 5,
+                        current_sticky_bonus: 25,
                         rssi_offset: 100,
-                        min_switch_score_delta: 10,
+                        min_switch_score_delta: 25,
                         ssids: ["One"],
                     },
                     { WIFI_MONITOR_SSIDS: "Two,Three" },
@@ -302,45 +317,253 @@ mode: daemon
                     {
                         min_dwell: 180,
                         ping_target: "1.1.1.1",
+                        ping_count: 3,
                         ping_timeout: 1,
+                        ping_high_latency_ms: 250,
+                        health_failure_switch_runs: 2,
                         band_bonus_2g: 0,
-                        band_bonus_5g: 100,
-                        band_bonus_6g: 150,
+                        band_bonus_5g: 35,
+                        band_bonus_6g: 50,
+                        preference_top_bonus: 30,
+                        preference_rank_decay: 5,
+                        current_sticky_bonus: 25,
                         rssi_offset: 100,
-                        min_switch_score_delta: 10,
+                        min_switch_score_delta: 25,
                         ssids: ["Office", "Home"],
                     },
                     {},
                 );
 
                 const networks = [
-                    { ssid: "Home", band: "5g" as const, rssi: -45, channel: "36", security: "WPA2" },
+                    { ssid: "Home", band: "5g" as const, rssi: -40, channel: "36", security: "WPA2" },
                     { ssid: "Office", band: "2g" as const, rssi: -40, channel: "6", security: "WPA2" },
                 ];
+                const stickyCandidates = networks.map((network) =>
+                    buildCandidateScore({
+                        network,
+                        config,
+                        priorityOrder: ["Home", "Office"],
+                        currentSsid: "Home",
+                        currentHealthPenalty: 0,
+                    }),
+                );
 
                 assert.deepEqual(
                     decideWifiSwitch({
                         currentSsid: "Home",
-                        networks,
+                        candidates: stickyCandidates,
                         config,
-                        priorityOrder: ["Home", "Office"],
                         dwellSatisfied: true,
-                        currentHealthy: true,
+                        healthFailureStreak: 0,
                     }).action,
                     "stay",
                 );
 
+                const strongerOffice = [
+                    { ssid: "Home", band: "5g" as const, rssi: -70, channel: "36", security: "WPA2" },
+                    { ssid: "Office", band: "6g" as const, rssi: -20, channel: "233", security: "WPA3" },
+                ].map((network) =>
+                    buildCandidateScore({
+                        network,
+                        config,
+                        priorityOrder: ["Office", "Home"],
+                        currentSsid: "Home",
+                        currentHealthPenalty: 0,
+                    }),
+                );
                 assert.deepEqual(
                     decideWifiSwitch({
                         currentSsid: "Home",
-                        networks,
+                        candidates: strongerOffice,
                         config,
-                        priorityOrder: ["Office", "Home"],
                         dwellSatisfied: true,
-                        currentHealthy: true,
+                        healthFailureStreak: 0,
                     }).action,
                     "switch",
                 );
+            },
+        },
+        {
+            name: "wifi-monitor weighted scoring prefers strong 5g over weak 6g when total score is higher",
+            run: () => {
+                const config = resolveWifiMonitorConfig(
+                    {
+                        min_dwell: 180,
+                        ping_target: "1.1.1.1",
+                        ping_count: 3,
+                        ping_timeout: 1,
+                        ping_high_latency_ms: 250,
+                        health_failure_switch_runs: 2,
+                        band_bonus_2g: 0,
+                        band_bonus_5g: 35,
+                        band_bonus_6g: 50,
+                        preference_top_bonus: 30,
+                        preference_rank_decay: 5,
+                        current_sticky_bonus: 25,
+                        rssi_offset: 100,
+                        min_switch_score_delta: 25,
+                        ssids: ["Five", "Six"],
+                    },
+                    {},
+                );
+
+                const strong5g = buildCandidateScore({
+                    network: { ssid: "Five", band: "5g", rssi: -35, channel: "149", security: "WPA2" },
+                    config,
+                    priorityOrder: ["Five", "Six"],
+                    currentSsid: "",
+                    currentHealthPenalty: 0,
+                });
+                const weak6g = buildCandidateScore({
+                    network: { ssid: "Six", band: "6g", rssi: -70, channel: "233", security: "WPA3" },
+                    config,
+                    priorityOrder: ["Five", "Six"],
+                    currentSsid: "",
+                    currentHealthPenalty: 0,
+                });
+
+                assert.equal(strong5g.totalScore > weak6g.totalScore, true);
+                assert.equal(weak6g.bandBonus > strong5g.bandBonus, true);
+            },
+        },
+        {
+            name: "wifi-monitor treats visible last-known SSID as current when macOS reports unknown",
+            run: () => {
+                const networks = [
+                    { ssid: "knight_riders_5G", band: "5g" as const, rssi: -50, channel: "149", security: "WPA2" },
+                    { ssid: "knight_riders", band: "2g" as const, rssi: -42, channel: "6", security: "WPA2" },
+                ];
+
+                assert.equal(effectiveCurrentSsid("", "knight_riders_5G", networks), "knight_riders_5G");
+                assert.equal(effectiveCurrentSsid("", "missing", networks), "");
+            },
+        },
+        {
+            name: "wifi-monitor parses ping health penalties conservatively",
+            run: () => {
+                const healthy = parsePingHealth(
+                    "3 packets transmitted, 3 packets received, 0.0% packet loss\nround-trip min/avg/max/stddev = 10.000/20.000/30.000/1.000 ms",
+                    { pingHighLatencyMs: 250 },
+                    0,
+                );
+                assert.equal(healthy.penalty, 0);
+                assert.equal(healthy.healthy, true);
+
+                const degraded = parsePingHealth(
+                    "3 packets transmitted, 2 packets received, 33.3% packet loss\nround-trip min/avg/max/stddev = 10.000/260.000/400.000/1.000 ms",
+                    { pingHighLatencyMs: 250 },
+                    0,
+                );
+                assert.equal(degraded.penalty, 15);
+                assert.equal(degraded.healthy, false);
+
+                const severe = parsePingHealth(
+                    "3 packets transmitted, 0 packets received, 100.0% packet loss",
+                    { pingHighLatencyMs: 250 },
+                    1,
+                );
+                assert.equal(severe.penalty, 70);
+                assert.equal(severe.severe, true);
+            },
+        },
+        {
+            name: "wifi-monitor allows health-driven switch only after repeated failures",
+            run: () => {
+                const config = resolveWifiMonitorConfig(
+                    {
+                        min_dwell: 180,
+                        ping_target: "1.1.1.1",
+                        ping_count: 3,
+                        ping_timeout: 1,
+                        ping_high_latency_ms: 250,
+                        health_failure_switch_runs: 2,
+                        band_bonus_2g: 0,
+                        band_bonus_5g: 35,
+                        band_bonus_6g: 50,
+                        preference_top_bonus: 30,
+                        preference_rank_decay: 5,
+                        current_sticky_bonus: 25,
+                        rssi_offset: 100,
+                        min_switch_score_delta: 25,
+                        ssids: ["Home", "Backup"],
+                    },
+                    {},
+                );
+                const candidates = [
+                    buildCandidateScore({
+                        network: { ssid: "Home", band: "5g", rssi: -50, channel: "149", security: "WPA2" },
+                        config,
+                        priorityOrder: ["Home", "Backup"],
+                        currentSsid: "Home",
+                        currentHealthPenalty: 70,
+                    }),
+                    buildCandidateScore({
+                        network: { ssid: "Backup", band: "2g", rssi: -40, channel: "6", security: "WPA2" },
+                        config,
+                        priorityOrder: ["Home", "Backup"],
+                        currentSsid: "Home",
+                        currentHealthPenalty: 70,
+                    }),
+                ];
+
+                assert.equal(
+                    decideWifiSwitch({
+                        currentSsid: "Home",
+                        candidates,
+                        config,
+                        dwellSatisfied: true,
+                        healthFailureStreak: 1,
+                    }).action,
+                    "stay",
+                );
+
+                assert.equal(
+                    decideWifiSwitch({
+                        currentSsid: "Home",
+                        candidates,
+                        config,
+                        dwellSatisfied: true,
+                        healthFailureStreak: 2,
+                    }).action,
+                    "switch",
+                );
+            },
+        },
+        {
+            name: "wifi-monitor deduplicates duplicate SSIDs to the strongest sample",
+            run: () => {
+                const config = resolveWifiMonitorConfig(
+                    {
+                        min_dwell: 180,
+                        ping_target: "1.1.1.1",
+                        ping_count: 3,
+                        ping_timeout: 1,
+                        ping_high_latency_ms: 250,
+                        health_failure_switch_runs: 2,
+                        band_bonus_2g: 0,
+                        band_bonus_5g: 35,
+                        band_bonus_6g: 50,
+                        preference_top_bonus: 30,
+                        preference_rank_decay: 5,
+                        current_sticky_bonus: 25,
+                        rssi_offset: 100,
+                        min_switch_score_delta: 25,
+                        ssids: ["Same", "Other"],
+                    },
+                    {},
+                );
+                const deduped = dedupeNetworksBySsid(
+                    [
+                        { ssid: "Same", band: "5g", rssi: -70, channel: "36", security: "WPA2" },
+                        { ssid: "Same", band: "5g", rssi: -40, channel: "149", security: "WPA2" },
+                        { ssid: "Other", band: "2g", rssi: -30, channel: "6", security: "WPA2" },
+                    ],
+                    config,
+                    ["Same", "Other"],
+                );
+
+                assert.equal(deduped.length, 2);
+                assert.equal(deduped.find((network) => network.ssid === "Same")?.rssi, -40);
             },
         },
         {
