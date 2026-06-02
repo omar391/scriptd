@@ -412,7 +412,13 @@ export function createIntegrationTests(): TestCase[] {
 
                     const child = startManageCommand(sandbox, ["run", "root"]);
                     const stateFile = path.join(sandbox.homeDir, "Library", "Application Support", "scriptd", "state.json");
-                    await waitFor(() => existsSync(stateFile));
+                    type State = {
+                        modules: Record<string, { desiredEnabled: boolean; status: string; message: string }>;
+                    };
+                    await waitFor(() => {
+                        const state = readJsonFile<State>(stateFile);
+                        return state?.modules["wifi-monitor"]?.status === "scheduled" && state.modules["brew-manager"]?.status === "scheduled";
+                    });
 
                     child.kill("SIGTERM");
                     await new Promise<void>((resolve, reject) => {
@@ -420,9 +426,7 @@ export function createIntegrationTests(): TestCase[] {
                         child.once("error", reject);
                     });
 
-                    const state = JSON.parse(readFileSync(stateFile, "utf8")) as {
-                        modules: Record<string, { desiredEnabled: boolean; status: string; message: string }>;
-                    };
+                    const state = JSON.parse(readFileSync(stateFile, "utf8")) as State;
 
                     assert.equal(state.modules["wifi-monitor"]?.desiredEnabled, true);
                     assert.equal(state.modules["wifi-monitor"]?.status, "stopped");

@@ -280,7 +280,7 @@ runCli().then(
         process.exitCode = code;
     },
     (error) => {
-        console.error(error instanceof Error ? error.stack ?? error.message : String(error));
+        console.error(error instanceof Error ? `Error: ${error.message}` : String(error));
         process.exitCode = 1;
     },
 );
