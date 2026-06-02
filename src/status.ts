@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { loadServiceConfig } from "./config.ts";
+import { discoverModules, loadServiceConfig } from "./config.ts";
 import { resolveRepoRoot } from "./paths.ts";
 import type { ModuleHealth, ModuleStatus } from "./interfaces.ts";
 
@@ -109,6 +109,50 @@ function resolveStateFreshness(
     return { current: true };
 }
 
+function formatDurationMs(durationMs: number): string {
+    const totalSeconds = Math.max(0, Math.round(durationMs / 1000));
+    if (totalSeconds < 60) {
+        return `${totalSeconds}s`;
+    }
+
+    const totalMinutes = Math.round(totalSeconds / 60);
+    if (totalMinutes < 60) {
+        return `${totalMinutes}m`;
+    }
+
+    const totalHours = Math.round(totalMinutes / 60);
+    if (totalHours < 24) {
+        return `${totalHours}h`;
+    }
+
+    const totalDays = Math.round(totalHours / 24);
+    return `${totalDays}d`;
+}
+
+function staleNextHint(options: {
+    desiredEnabled: boolean;
+    mode?: string;
+    intervalMs?: number;
+}): string | undefined {
+    if (!options.desiredEnabled || !options.mode) {
+        return undefined;
+    }
+
+    if (options.mode === "daemon") {
+        return "immediately when service starts";
+    }
+
+    if (options.mode === "interval" && typeof options.intervalMs === "number" && options.intervalMs > 0) {
+        return `${formatDurationMs(options.intervalMs)} after service starts`;
+    }
+
+    if (options.mode === "interval") {
+        return "after service starts";
+    }
+
+    return undefined;
+}
+
 function shouldShowModuleMessage(
     moduleState: PersistedModuleState,
     options: {
@@ -133,6 +177,7 @@ function shouldShowModuleMessage(
 export async function renderStatus(): Promise<void> {
     const repoRoot = resolveRepoRoot();
     const config = await loadServiceConfig(repoRoot);
+    const modules = await discoverModules(repoRoot);
     const launchd = launchctlStatus(config.label);
 
     console.log(`scriptd label: ${config.label}`);
@@ -173,14 +218,25 @@ export async function renderStatus(): Promise<void> {
     for (const moduleName of [...moduleNames].sort()) {
         const moduleState = state?.modules[moduleName];
         const desiredEnabled = config.modules[moduleName]?.enabled ?? false;
+        const discoveredModule = modules.get(moduleName);
         const details: string[] = [`desired=${desiredEnabled ? "enabled" : "disabled"}`];
 
         if (moduleState?.mode) {
             details.push(moduleState.mode);
+        } else if (discoveredModule?.plugin.mode) {
+            details.push(discoveredModule.plugin.mode);
         }
 
         if (!moduleState) {
             details.push("runtime=unknown");
+            const nextHint = staleNextHint({
+                desiredEnabled,
+                mode: discoveredModule?.plugin.mode,
+                intervalMs: discoveredModule?.plugin.intervalMs,
+            });
+            if (nextHint) {
+                details.push(`next=${nextHint}`);
+            }
             console.log(`- ${moduleName}: ${details.join(", ")}`);
             continue;
         }
@@ -194,7 +250,23 @@ export async function renderStatus(): Promise<void> {
         if (moduleState.nextRunAt) {
             details.push(`next=${moduleState.nextRunAt}`);
         } else if (!stateIsCurrent && desiredEnabled && moduleState.mode === "interval") {
-            details.push("next=unknown (service not running)");
+            const nextHint = staleNextHint({
+                desiredEnabled,
+                mode: moduleState.mode,
+                intervalMs: discoveredModule?.plugin.intervalMs,
+            });
+            if (nextHint) {
+                details.push(`next=${nextHint}`);
+            }
+        } else if (!stateIsCurrent && desiredEnabled && moduleState.mode === "daemon") {
+            const nextHint = staleNextHint({
+                desiredEnabled,
+                mode: moduleState.mode,
+                intervalMs: discoveredModule?.plugin.intervalMs,
+            });
+            if (nextHint) {
+                details.push(`next=${nextHint}`);
+            }
         }
 
         details.push(`runs=${moduleState.runs}`);

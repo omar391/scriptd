@@ -353,9 +353,9 @@ export function createIntegrationTests(): TestCase[] {
                     assert.match(result.stdout, /scriptd state: stale snapshot \(LaunchAgent not loaded\)/);
                     assert.match(
                         result.stdout,
-                        /brew-manager: desired=enabled, interval, last=disabled, next=unknown \(service not running\)/,
+                        /brew-manager: desired=enabled, interval, last=disabled, next=30s after service starts/,
                     );
-                    assert.match(result.stdout, /wifi-monitor: desired=enabled, daemon, last=disabled/);
+                    assert.match(result.stdout, /wifi-monitor: desired=enabled, daemon, last=disabled, next=immediately when service starts/);
                     assert.doesNotMatch(result.stdout, /module disabled/);
                 } finally {
                     await cleanupSandbox(sandbox);
