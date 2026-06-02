@@ -36,7 +36,8 @@ Repo layout:
 
 ```text
 .
-├── scriptd.sh
+    ├── scriptd.sh
+    ├── assets/
 ├── service.yaml
 ├── src/
 │   ├── main.ts
@@ -94,7 +95,7 @@ Module-specific tools:
 Notes:
 
 - `root` means the top-level `scriptd` service, not the root user.
-- The LaunchAgent points at this checkout's `scriptd.sh`, so if you move the repo after installing, reinstall the service.
+- The LaunchAgent runs through a generated `Scriptd.app` wrapper in `~/Library/Application Support/scriptd` so macOS Login Items can show a real `scriptd` icon. If you move the repo after starting the service, run `./scriptd.sh restart root`.
 
 ## Commands
 
@@ -233,6 +234,7 @@ The `status` command combines:
 ## Runtime Behavior
 
 - `start root` and `restart root` write the LaunchAgent plist and call `launchctl load -w`, so a disabled login item is re-enabled.
+- The LaunchAgent points at `~/Library/Application Support/scriptd/Scriptd.app/Contents/MacOS/scriptd`; that launcher executes this checkout's `scriptd.sh run root`.
 - Daemon modules are started immediately when enabled.
 - Interval modules are scheduled from `service.yaml`; `intervalMs` and `interval_seconds` remain the module's fallback cadence.
 - Interval runs do not overlap.

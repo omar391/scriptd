@@ -32,6 +32,7 @@ async function createSandbox(): Promise<Sandbox> {
 
     await mkdir(repoRoot, { recursive: true });
     await mkdir(path.join(repoRoot, "src"), { recursive: true });
+    await mkdir(path.join(repoRoot, "assets"), { recursive: true });
     await mkdir(path.join(repoRoot, "modules", "wifi-monitor"), { recursive: true });
     await mkdir(path.join(repoRoot, "modules", "cpu-monitor"), { recursive: true });
     await mkdir(path.join(repoRoot, "modules", "brew-manager"), { recursive: true });
@@ -65,6 +66,7 @@ exit 0
 `,
     );
     await chmod(path.join(repoRoot, "scriptd.sh"), 0o755);
+    await writeFile(path.join(repoRoot, "assets", "Scriptd.icns"), "fake-icns\n", "utf8");
     await writeFile(path.join(repoRoot, "package.json"), `{"name":"scriptd","private":true,"type":"module","workspaces":["modules/*"]}\n`);
     await writeFile(
         path.join(repoRoot, "tsconfig.json"),
@@ -527,10 +529,15 @@ modules:
                     const start = runManageCommand(sandbox, ["start", "root"]);
                     assert.equal(start.status, 0);
                     const plistPath = path.join(sandbox.homeDir, "Library", "LaunchAgents", "com.omar.scriptd.plist");
+                    const appPath = path.join(sandbox.homeDir, "Library", "Application Support", "scriptd", "Scriptd.app");
+                    const appExecutable = path.join(appPath, "Contents", "MacOS", "scriptd");
                     const sandboxManage = path.join(sandbox.repoRoot, "scriptd.sh");
                     assert.equal(existsSync(plistPath), true);
-                    assert.match(readFileSync(plistPath, "utf8"), new RegExp(sandboxManage.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+                    assert.match(readFileSync(plistPath, "utf8"), new RegExp(appExecutable.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
                     assert.match(readFileSync(plistPath, "utf8"), new RegExp(sandbox.repoRoot.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+                    assert.match(readFileSync(path.join(appPath, "Contents", "Info.plist"), "utf8"), /CFBundleIconFile/);
+                    assert.equal(existsSync(path.join(appPath, "Contents", "Resources", "Scriptd.icns")), true);
+                    assert.match(readFileSync(appExecutable, "utf8"), new RegExp(sandboxManage.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 
                     const restart = runManageCommand(sandbox, ["restart", "root"]);
                     assert.equal(restart.status, 0);

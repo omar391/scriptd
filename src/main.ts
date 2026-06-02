@@ -3,7 +3,7 @@ import { promises as fs } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { discoverModules, ensureDirectory, loadServiceConfig } from "./config.ts";
 import { runModuleDirect, runModuleSetup } from "./module-runner.ts";
-import { resolveManageScriptPath, resolveRepoRoot, resolveStateFile } from "./paths.ts";
+import { resolveManageScriptPath, resolveRepoRoot, resolveStateDir, resolveStateFile } from "./paths.ts";
 import { renderStatus } from "./status.ts";
 import { runSupervisor } from "./supervisor.ts";
 import { runAllTests } from "./test.ts";
@@ -36,6 +36,10 @@ function escapeXml(value: string): string {
         .replaceAll("'", "&apos;");
 }
 
+function shellQuote(value: string): string {
+    return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
 function runLaunchctl(args: string[], check: boolean): void {
     const result = spawnSync("launchctl", args, { encoding: "utf8" });
     if (check && result.status !== 0) {
@@ -50,6 +54,14 @@ function launchdDomainLabel(label: string): string {
 
 function rootPlistPath(label: string): string {
     return path.join(process.env.HOME ?? "", "Library", "LaunchAgents", `${label}.plist`);
+}
+
+function rootAppPath(): string {
+    return path.join(resolveStateDir(), "Scriptd.app");
+}
+
+function rootAppExecutablePath(): string {
+    return path.join(rootAppPath(), "Contents", "MacOS", "scriptd");
 }
 
 function legacyLabels(): string[] {
@@ -68,7 +80,7 @@ async function cleanupLegacyServices(): Promise<void> {
 
 function plistContents(options: {
     label: string;
-    manageScriptPath: string;
+    executablePath: string;
     workingDirectory: string;
     logDir: string;
 }): string {
@@ -80,9 +92,7 @@ function plistContents(options: {
   <string>${escapeXml(options.label)}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${escapeXml(options.manageScriptPath)}</string>
-    <string>run</string>
-    <string>root</string>
+    <string>${escapeXml(options.executablePath)}</string>
   </array>
   <key>WorkingDirectory</key>
   <string>${escapeXml(options.workingDirectory)}</string>
@@ -106,11 +116,53 @@ function plistContents(options: {
 `;
 }
 
+function appInfoPlistContents(label: string): string {
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDisplayName</key>
+  <string>scriptd</string>
+  <key>CFBundleExecutable</key>
+  <string>scriptd</string>
+  <key>CFBundleIconFile</key>
+  <string>Scriptd</string>
+  <key>CFBundleIdentifier</key>
+  <string>${escapeXml(label)}</string>
+  <key>CFBundleName</key>
+  <string>scriptd</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>LSBackgroundOnly</key>
+  <true/>
+</dict>
+</plist>
+`;
+}
+
+async function writeRootApp(repoRoot: string, label: string, manageScriptPath: string): Promise<string> {
+    const appPath = rootAppPath();
+    const contentsDir = path.join(appPath, "Contents");
+    const macosDir = path.join(contentsDir, "MacOS");
+    const resourcesDir = path.join(contentsDir, "Resources");
+    const iconSourcePath = path.join(repoRoot, "assets", "Scriptd.icns");
+    const executablePath = rootAppExecutablePath();
+
+    await ensureDirectory(macosDir);
+    await ensureDirectory(resourcesDir);
+    await fs.writeFile(path.join(contentsDir, "Info.plist"), appInfoPlistContents(label), "utf8");
+    await fs.copyFile(iconSourcePath, path.join(resourcesDir, "Scriptd.icns"));
+    await fs.writeFile(executablePath, `#!/bin/bash\nexec ${shellQuote(manageScriptPath)} run root\n`, "utf8");
+    await fs.chmod(executablePath, 0o755);
+    return executablePath;
+}
+
 async function writeRootPlist(): Promise<{ label: string; plistPath: string }> {
     const repoRoot = resolveRepoRoot();
     const config = await loadServiceConfig(repoRoot);
     const plistPath = rootPlistPath(config.label);
     const manageScriptPath = resolveManageScriptPath(repoRoot);
+    const executablePath = await writeRootApp(repoRoot, config.label, manageScriptPath);
 
     await ensureDirectory(path.dirname(plistPath));
     await ensureDirectory(config.logDir);
@@ -121,7 +173,7 @@ async function writeRootPlist(): Promise<{ label: string; plistPath: string }> {
         plistPath,
         plistContents({
             label: config.label,
-            manageScriptPath,
+            executablePath,
             workingDirectory: repoRoot,
             logDir: config.logDir,
         }),
