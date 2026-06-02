@@ -88,7 +88,7 @@ fn run_command(
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         Ok((
-            format!("{}{stderr}", stdout),
+            stdout.into_owned(),
             stderr.into_owned(),
             output.status.code().unwrap_or(1),
         ))
@@ -97,7 +97,7 @@ fn run_command(
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         Ok((
-            format!("{}{stderr}", stdout),
+            stdout.into_owned(),
             stderr.into_owned(),
             output.status.code().unwrap_or(1),
         ))
@@ -140,6 +140,10 @@ fn cleanup_legacy_logs(config: &BrewManagerConfig, logger: &ModuleLogger) {
     if !base.exists() {
         return;
     }
+    logger.info(&format!(
+        "Cleaning up legacy Homebrew logs in {}",
+        base.display()
+    ));
     rotate_log(
         base.join("autoupdate.log").as_path(),
         config.max_log_size_mb,
@@ -168,7 +172,7 @@ fn rotate_log(path: &std::path::Path, max_size_mb: u64, max_rotated: u64, logger
     }
     let _ = fs::rename(path, format!("{}.1", path.display()));
     let _ = fs::write(path, "");
-    logger.info(&format!("rotated legacy log {}", path.display()));
+    let _ = logger;
 }
 
 fn write_askpass(config: &BrewManagerConfig, logger: &ModuleLogger) -> anyhow::Result<()> {
@@ -296,10 +300,22 @@ fn brew_maintenance(
 ) -> anyhow::Result<Vec<String>> {
     cleanup_legacy_logs(config, logger);
     ensure_askpass(config, logger)?;
-    let (_, _, status) = command_for_brew(config, &["update"])?;
+    let (update_out, update_err, status) = command_for_brew(config, &["update"])?;
     if status != 0 {
-        bail!("brew update failed");
+        bail!(
+            "{}",
+            if update_err.trim().is_empty() {
+                "brew update failed".to_string()
+            } else {
+                update_err.trim().to_string()
+            }
+        );
     }
+    logger.info(if update_out.trim().is_empty() {
+        "brew update completed"
+    } else {
+        update_out.trim()
+    });
 
     let (formula_out, _formula_err, _formula_status) =
         command_for_brew(config, &["upgrade", "--formula"])?;
@@ -308,6 +324,7 @@ fn brew_maintenance(
     }
     let (_cask_out, _cask_err, cask_status) = command_for_brew(config, &["upgrade", "--cask"])?;
     if cask_status != 0 {
+        logger.warn("Regular cask upgrade failed, attempting repair flow");
         let (outdated_out, _outdated_err, _status) =
             command_for_brew(config, &["outdated", "--cask", "--quiet"])?;
         let casks: Vec<String> = outdated_out
@@ -319,20 +336,42 @@ fn brew_maintenance(
 
         let mut repaired = Vec::new();
         if casks.is_empty() {
-            let _ = command_for_brew(config, &["upgrade", "--cask", "--force"])?;
+            let (stdout, _stderr, _status) =
+                command_for_brew(config, &["upgrade", "--cask", "--force"])?;
+            if !stdout.trim().is_empty() {
+                logger.info(stdout.trim());
+            }
         } else {
             for cask in casks.iter() {
-                let _ = command_for_brew(config, &["upgrade", "--cask", "--force", cask])?;
-                let _ = command_for_brew(config, &["uninstall", "--cask", "--force", cask])?;
-                let _ = command_for_brew(config, &["install", "--cask", cask])?;
+                let (stdout, _stderr, _status) =
+                    command_for_brew(config, &["upgrade", "--cask", "--force", cask])?;
+                if !stdout.trim().is_empty() {
+                    logger.info(stdout.trim());
+                }
+                let (stdout, _stderr, _status) =
+                    command_for_brew(config, &["uninstall", "--cask", "--force", cask])?;
+                if !stdout.trim().is_empty() {
+                    logger.info(stdout.trim());
+                }
+                let (stdout, _stderr, _status) =
+                    command_for_brew(config, &["install", "--cask", cask])?;
+                if !stdout.trim().is_empty() {
+                    logger.info(stdout.trim());
+                }
                 repaired.push(cask.clone());
             }
         }
-        let _ = command_for_brew(config, &["cleanup"])?;
+        let (cleanup_out, _cleanup_err, _cleanup_status) = command_for_brew(config, &["cleanup"])?;
+        if !cleanup_out.trim().is_empty() {
+            logger.info(cleanup_out.trim());
+        }
         return Ok(repaired);
     }
 
-    let _ = command_for_brew(config, &["cleanup"])?;
+    let (cleanup_out, _cleanup_err, _cleanup_status) = command_for_brew(config, &["cleanup"])?;
+    if !cleanup_out.trim().is_empty() {
+        logger.info(cleanup_out.trim());
+    }
     Ok(Vec::new())
 }
 
@@ -387,6 +426,8 @@ pub fn setup(context: &mut ModuleContext) -> anyhow::Result<()> {
         )?;
         write_askpass(&config, &context.logger)?;
         configure_sudo(&config, &password, &context.logger)?;
+        context.logger.info("brew-manager setup complete");
+        println!("brew-manager setup complete.");
         return Ok(());
     }
 
@@ -401,10 +442,7 @@ pub fn run_once(context: &mut ModuleContext) -> anyhow::Result<Option<ModuleStat
     match result {
         Ok(repaired) => {
             state.last_error = None;
-            state.last_message = Some(format!(
-                "Homebrew maintenance completed (repaired={} casks)",
-                repaired.len()
-            ));
+            state.last_message = Some("Homebrew maintenance completed".to_string());
             state.last_run_at = Some(chrono::Utc::now().to_rfc3339());
             state.repaired_casks = repaired;
             Ok(Some(ModuleStatus {
@@ -414,8 +452,12 @@ pub fn run_once(context: &mut ModuleContext) -> anyhow::Result<Option<ModuleStat
                 last_run_at: state.last_run_at.clone(),
                 next_run_at: None,
                 metrics: Some(HashMap::from([(
-                    "repaired_casks".to_string(),
-                    serde_json::Value::String(state.repaired_casks.join(",")),
+                    "repairedCasks".to_string(),
+                    serde_json::Value::String(if state.repaired_casks.is_empty() {
+                        "none".to_string()
+                    } else {
+                        state.repaired_casks.join(",")
+                    }),
                 )])),
             }))
         }
@@ -445,7 +487,7 @@ pub fn status() -> Option<(ModuleStatus, ModuleHealth)> {
                 last_run_at: None,
                 next_run_at: None,
                 metrics: Some(HashMap::from([(
-                    "repaired_casks".to_string(),
+                    "repairedCasks".to_string(),
                     serde_json::Value::String("none".to_string()),
                 )])),
             },
@@ -468,8 +510,12 @@ pub fn status() -> Option<(ModuleStatus, ModuleHealth)> {
             last_run_at: state.last_run_at.clone(),
             next_run_at: None,
             metrics: Some(HashMap::from([(
-                "repaired_casks".to_string(),
-                serde_json::Value::String(state.repaired_casks.join(",")),
+                "repairedCasks".to_string(),
+                serde_json::Value::String(if state.repaired_casks.is_empty() {
+                    "none".to_string()
+                } else {
+                    state.repaired_casks.join(",")
+                }),
             )])),
         },
         ModuleHealth {

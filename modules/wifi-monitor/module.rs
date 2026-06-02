@@ -131,7 +131,7 @@ pub fn resolve_wifi_monitor_config(raw: &WifiMonitorConfig, env: &EnvMap) -> Wif
         .unwrap_or_else(|| {
             if raw.state_file.is_empty() {
                 let home = crate::paths::home_dir();
-                home.join(".local/share/wifi-monitor/state.json")
+                home.join(".local/share/wifi-monitor/state.txt")
                     .to_string_lossy()
                     .to_string()
             } else {
@@ -231,6 +231,35 @@ pub struct CandidateScore {
     pub sticky_bonus: f64,
     pub health_penalty: f64,
     pub total_score: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct SwiftScanRecord {
+    ssid: String,
+    rssi: i64,
+    channel: String,
+    #[serde(default)]
+    summary: Option<String>,
+}
+
+fn command_exists(command_name: &str) -> bool {
+    Command::new("sh")
+        .args(["-lc", &format!("command -v {command_name} >/dev/null 2>&1")])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn run_swift(code: &str) -> anyhow::Result<String> {
+    let output = Command::new("swift").args(["-e", code]).output()?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "{}",
+            String::from_utf8_lossy(&output.stderr).trim().to_string()
+        );
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 fn read_state(state_file: &str) -> PersistedWifiState {
@@ -359,6 +388,23 @@ fn parse_wifi_device() -> anyhow::Result<String> {
             }
         }
     }
+
+    if command_exists("swift") {
+        let output = run_swift(
+            r#"
+import Foundation
+import CoreWLAN
+
+if let iface = CWWiFiClient.shared().interface(), let name = iface.interfaceName {
+    print(name)
+}
+"#,
+        )?;
+        if !output.is_empty() {
+            return Ok(output);
+        }
+    }
+
     anyhow::bail!("Could not detect wifi device")
 }
 
@@ -371,34 +417,81 @@ fn current_ssid(device: &str) -> anyhow::Result<String> {
     }
     let text = String::from_utf8_lossy(&output.stdout);
     let prefix = "Current Wi-Fi Network: ";
-    Ok(text
+    let current = text
         .lines()
         .find_map(|line| line.strip_prefix(prefix).map(str::trim).map(str::to_string))
-        .unwrap_or_default())
+        .unwrap_or_default();
+    if !current.is_empty() {
+        return Ok(current);
+    }
+
+    if command_exists("swift") {
+        let output = run_swift(
+            r#"
+import Foundation
+import CoreWLAN
+
+if let iface = CWWiFiClient.shared().interface(), let ssid = iface.ssid() {
+    print(ssid)
+}
+"#,
+        )?;
+        if !output.is_empty() {
+            return Ok(output);
+        }
+    }
+
+    Ok(String::new())
 }
 
 fn parse_airport_output(output: &str, allowed: &[String]) -> Vec<Network> {
     let mut out = Vec::new();
     for line in output.lines().skip(1) {
-        let mut parts = line.split_whitespace();
-        let ssid = parts
-            .next()
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
-        if ssid.is_none() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
             continue;
         }
-        let ssid = ssid.unwrap_or_default().to_string();
+
+        let tokens = trimmed.split_whitespace().collect::<Vec<_>>();
+        let Some(bssid_index) = tokens.iter().position(|token| {
+            let parts = token.split(':').collect::<Vec<_>>();
+            parts.len() == 6
+                && parts
+                    .iter()
+                    .all(|part| part.len() == 2 && part.chars().all(|ch| ch.is_ascii_hexdigit()))
+        }) else {
+            continue;
+        };
+        if bssid_index == 0 {
+            continue;
+        }
+
+        let ssid = tokens[..bssid_index].join(" ");
+        if ssid.is_empty() {
+            continue;
+        }
         if !allowed.is_empty() && !allowed.iter().any(|value| value == &ssid) {
             continue;
         }
-        let _bssid = parts.next();
+
+        let parts = &tokens[bssid_index..];
+        if parts.len() < 4 {
+            continue;
+        }
+
         let rssi = parts
-            .next()
+            .get(1)
+            .copied()
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(-999);
-        let channel = parts.next().unwrap_or("1").to_string();
-        let security = parts.collect::<Vec<_>>().join(" ");
+        let channel = parts.get(2).copied().unwrap_or("1").to_string();
+        let security = if parts.len() >= 6 {
+            parts[5..].join(" ")
+        } else if parts.len() >= 4 {
+            parts[3..].join(" ")
+        } else {
+            String::new()
+        };
         let channel_num = channel.parse::<u32>().unwrap_or(0);
         let band = if channel_num > 165 {
             "6g"
@@ -421,6 +514,102 @@ fn parse_airport_output(output: &str, allowed: &[String]) -> Vec<Network> {
         });
     }
     out
+}
+
+fn parse_security(summary: &str) -> String {
+    let marker = "security=";
+    let Some(start) = summary.find(marker) else {
+        return "unknown".to_string();
+    };
+    let rest = &summary[start + marker.len()..];
+    let end = rest.find([',', ']']).unwrap_or(rest.len());
+    let parsed = rest[..end].trim();
+    if parsed.is_empty() {
+        "unknown".to_string()
+    } else {
+        parsed.to_string()
+    }
+}
+
+fn parse_swift_wifi_scan_output(output: &str) -> Vec<Network> {
+    let Ok(parsed) = serde_json::from_str::<Vec<SwiftScanRecord>>(output) else {
+        return Vec::new();
+    };
+
+    parsed
+        .into_iter()
+        .filter(|item| !item.ssid.trim().is_empty())
+        .map(|item| {
+            let channel_number = item
+                .channel
+                .chars()
+                .filter(|ch| ch.is_ascii_digit())
+                .collect::<String>()
+                .parse::<u32>()
+                .unwrap_or(0);
+            let band = if channel_number > 165 {
+                "6g"
+            } else if channel_number >= 36 {
+                "5g"
+            } else {
+                "2g"
+            };
+
+            Network {
+                ssid: item.ssid.trim().to_string(),
+                band: band.to_string(),
+                rssi: item.rssi,
+                channel: item.channel,
+                security: item
+                    .summary
+                    .as_deref()
+                    .map(parse_security)
+                    .unwrap_or_else(|| "unknown".to_string()),
+                ping_ms: None,
+            }
+        })
+        .collect()
+}
+
+fn scan_wifi_via_swift(allowed: &[String]) -> anyhow::Result<Vec<Network>> {
+    if !command_exists("swift") {
+        anyhow::bail!("swift is not available for Wi-Fi scanning");
+    }
+
+    let output = run_swift(
+        r#"
+import Foundation
+import CoreWLAN
+
+let client = CWWiFiClient.shared()
+guard let iface = client.interface() else {
+    throw NSError(domain: "scriptd", code: 1, userInfo: [NSLocalizedDescriptionKey: "No Wi-Fi interface available"])
+}
+
+let networks = try iface.scanForNetworks(withSSID: nil)
+let rows: [[String: Any]] = networks.compactMap { network in
+    guard let ssid = network.ssid, !ssid.isEmpty else {
+        return nil
+    }
+
+    return [
+        "ssid": ssid,
+        "rssi": network.rssiValue,
+        "channel": String(network.wlanChannel?.channelNumber ?? 0),
+        "summary": String(describing: network),
+    ]
+}
+
+let data = try JSONSerialization.data(withJSONObject: rows, options: [])
+print(String(data: data, encoding: .utf8) ?? "[]")
+"#,
+    )?;
+
+    let parsed = parse_swift_wifi_scan_output(&output);
+    Ok(parsed
+        .into_iter()
+        .filter(|network| allowed.is_empty() || allowed.iter().any(|value| value == &network.ssid))
+        .collect())
 }
 
 #[cfg(feature = "corewlan")]
@@ -508,28 +697,34 @@ fn scan_networks(allowed: &[String]) -> Vec<Network> {
             .map(|_| String::new())
     });
     let output = output.unwrap_or_default();
-    if output.is_empty() {
+    let parsed = if output.is_empty() {
         Vec::new()
     } else {
         parse_airport_output(&output, allowed)
+    };
+    if !parsed.is_empty() {
+        return parsed;
     }
+
+    scan_wifi_via_swift(allowed).unwrap_or_default()
 }
 
 fn command_time_ms(output: &str) -> Option<f64> {
     if output.is_empty() {
         return None;
     }
-    for token in output.split_whitespace() {
-        if token.ends_with("ms") {
-            let numeric = token.trim_end_matches("ms").parse::<f64>().ok()?;
-            return Some(numeric);
+
+    for line in output.lines() {
+        if line.contains("round-trip") && line.contains(" = ") && line.contains(" ms") {
+            let metrics = line.split(" = ").nth(1)?.trim();
+            let mut parts = metrics.split('/');
+            let _min = parts.next()?;
+            let avg = parts.next()?.trim();
+            return avg.parse::<f64>().ok().map(|value| value.round());
         }
     }
-    let has_ms = output.split('\n').find_map(|line| {
-        line.split('=')
-            .find_map(|value| value.trim().parse::<f64>().ok())
-    });
-    has_ms
+
+    None
 }
 
 fn parse_ping_health_output(
@@ -601,15 +796,13 @@ pub fn priority_for(ssid: &str, preference: &[String]) -> usize {
 }
 
 fn score_band(network: &Network, config: &WifiMonitorConfig) -> f64 {
-    let band_bonus = if network.band == "6g" {
+    if network.band == "6g" {
         config.band_bonus_6g
     } else if network.band == "5g" {
         config.band_bonus_5g
     } else {
         config.band_bonus_2g
-    };
-    let rssi_score = (network.rssi as f64 + config.rssi_offset).clamp(0.0, 100.0);
-    band_bonus + rssi_score
+    }
 }
 
 fn preference_bonus(rank: usize, config: &WifiMonitorConfig) -> f64 {
@@ -671,31 +864,37 @@ fn dedupe_networks(
 }
 
 fn score_network(network: &Network, config: &WifiMonitorConfig) -> f64 {
-    score_band(network, config)
+    score_band(network, config) + (network.rssi as f64 + config.rssi_offset).clamp(0.0, 100.0)
 }
 
 pub fn describe_candidates(candidates: &[CandidateScore]) -> String {
     if candidates.is_empty() {
         return "none".to_string();
     }
-    let mut lines = candidates
+    let mut ranked = candidates.to_vec();
+    ranked.sort_by(|left, right| {
+        right
+            .total_score
+            .total_cmp(&left.total_score)
+            .then(left.rank.cmp(&right.rank))
+    });
+    ranked
         .iter()
         .map(|candidate| {
             format!(
-                "{}(band={},rssi={},pref={},bandBonus={},sticky={},penalty={},total={})",
+                "{}(band={}, rssi={}, pref={}, bandBonus={}, sticky={}, healthPenalty={}, total={})",
                 candidate.network.ssid,
                 candidate.network.band,
                 candidate.network.rssi,
-                candidate.preference_bonus,
-                candidate.band_bonus,
-                candidate.sticky_bonus,
-                candidate.health_penalty,
-                candidate.total_score
+                format_metric(candidate.preference_bonus),
+                format_metric(candidate.band_bonus),
+                format_metric(candidate.sticky_bonus),
+                format_metric(candidate.health_penalty),
+                format_metric(candidate.total_score)
             )
         })
-        .collect::<Vec<_>>();
-    lines.sort_unstable();
-    lines.join("; ")
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 pub fn effective_current_ssid(current: &str, persisted: &str, networks: &[Network]) -> String {
@@ -850,7 +1049,7 @@ fn load_config(context: &ModuleContext) -> WifiMonitorConfig {
 
     let home_dir = crate::paths::home_dir().to_string_lossy().to_string();
     config.state_file = if config.state_file.is_empty() {
-        format!("{home_dir}/.local/share/wifi-monitor/state.json")
+        format!("{home_dir}/.local/share/wifi-monitor/state.txt")
     } else {
         config.state_file
     };
