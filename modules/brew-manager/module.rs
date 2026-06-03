@@ -638,7 +638,7 @@ exit 1
         let previous_log = std::env::var("BREW_TEST_LOG").ok();
         std::env::set_var("BREW_TEST_LOG", &brew_log);
         with_path_scope(&fake_bin, || {
-            let logger = ModuleLogger::new(root.path().to_path_buf(), "brew-manager");
+            let logger = ModuleLogger::new(root.path().to_path_buf(), "brew-manager", false);
             let repaired = brew_maintenance(&config, &logger).expect("maintenance");
             assert_eq!(repaired, vec!["brew-offending-cask".to_string()]);
         });
@@ -670,7 +670,7 @@ exit 1
             assert!(!askpass.exists());
             ensure_askpass(
                 &config,
-                &ModuleLogger::new(root.path().to_path_buf(), "brew-manager"),
+                &ModuleLogger::new(root.path().to_path_buf(), "brew-manager", false),
             )
             .expect("askpass written");
             assert!(askpass.exists());
@@ -700,7 +700,7 @@ exit 1
         let result = with_path_scope(&fake_bin, || {
             ensure_askpass(
                 &config,
-                &ModuleLogger::new(root.path().to_path_buf(), "brew-manager"),
+                &ModuleLogger::new(root.path().to_path_buf(), "brew-manager", false),
             )
         });
         assert!(result.is_err());

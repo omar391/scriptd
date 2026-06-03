@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -6,6 +8,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
 use notify::event::EventKind;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use sysinfo::{Pid, ProcessesToUpdate, System};
 use tokio::select;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -145,7 +148,60 @@ impl ModuleRuntime {
 }
 
 #[derive(Debug)]
+struct SingletonLock {
+    path: PathBuf,
+}
+
+impl Drop for SingletonLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn process_is_alive(pid: u32) -> bool {
+    let mut system = System::new_all();
+    system.refresh_processes(ProcessesToUpdate::All, true);
+    system.process(Pid::from_u32(pid)).is_some()
+}
+
+fn acquire_singleton_lock(config: &ServiceConfig) -> Result<SingletonLock> {
+    let Some(state_dir) = config.state_file.parent() else {
+        anyhow::bail!("state file has no parent directory");
+    };
+    std::fs::create_dir_all(state_dir).context("ensure state directory for singleton lock")?;
+    let lock_path = state_dir.join("scriptd.lock");
+
+    loop {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(mut file) => {
+                writeln!(file, "{}", std::process::id()).context("write singleton lock pid")?;
+                return Ok(SingletonLock { path: lock_path });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                let existing_pid = std::fs::read_to_string(&lock_path)
+                    .ok()
+                    .and_then(|value| value.trim().parse::<u32>().ok());
+                if let Some(pid) = existing_pid {
+                    if process_is_alive(pid) {
+                        anyhow::bail!(
+                            "scriptd root supervisor is already running with pid {pid}"
+                        );
+                    }
+                }
+                let _ = std::fs::remove_file(&lock_path);
+            }
+            Err(error) => return Err(error).context("create singleton lock"),
+        }
+    }
+}
+
+#[derive(Debug)]
 struct RunningSupervisor {
+    _singleton_lock: SingletonLock,
     root: PathBuf,
     state_file: PathBuf,
     config_path: PathBuf,
@@ -160,7 +216,12 @@ struct RunningSupervisor {
 }
 
 impl RunningSupervisor {
-    fn build(root: &Path, config: ServiceConfig, registry: ModulesRegistry) -> Self {
+    fn build(
+        root: &Path,
+        config: ServiceConfig,
+        registry: ModulesRegistry,
+        singleton_lock: SingletonLock,
+    ) -> Self {
         let mut modules = BTreeMap::new();
         for definition in registry.modules() {
             let mut runtime = ModuleRuntime::from_definition(definition.clone());
@@ -176,6 +237,7 @@ impl RunningSupervisor {
         }
 
         RunningSupervisor {
+            _singleton_lock: singleton_lock,
             root: root.to_path_buf(),
             state_file: config.state_file.clone(),
             config_path: config.path.clone(),
@@ -658,7 +720,8 @@ pub fn run_one_module(root: PathBuf, module: &str) -> Result<()> {
 
 async fn run_supervisor_async(root: PathBuf) -> Result<()> {
     let (config, registry) = read_state_config(&root)?;
-    let mut supervisor = RunningSupervisor::build(&root, config, registry);
+    let singleton_lock = acquire_singleton_lock(&config)?;
+    let mut supervisor = RunningSupervisor::build(&root, config, registry, singleton_lock);
     if supervisor.watch {
         let config_path = supervisor.config_path.clone();
         supervisor.start_watcher(&config_path)?;
