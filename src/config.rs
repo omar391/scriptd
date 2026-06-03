@@ -22,6 +22,8 @@ pub struct ServiceConfig {
     pub log_dir: String,
     #[serde(default)]
     pub watch: bool,
+    #[serde(default = "default_self_update_check_hours")]
+    pub self_update_check_hours: u64,
     #[serde(default)]
     pub modules: HashMap<String, ServiceModuleConfig>,
 
@@ -39,6 +41,14 @@ impl ServiceConfig {
     pub fn expanded_log_dir(&self) -> PathBuf {
         expand_home(&self.log_dir)
     }
+
+    pub fn self_update_check_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.self_update_check_hours.saturating_mul(60 * 60))
+    }
+}
+
+fn default_self_update_check_hours() -> u64 {
+    12
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -350,6 +360,9 @@ pub fn read_service_config(root: &Path) -> anyhow::Result<ServiceConfig> {
                 .with_context(|| format!("invalid schedule for module {module_id}"))?;
         }
     }
+    if config.self_update_check_hours == 0 {
+        anyhow::bail!("service self_update_check_hours must be greater than zero");
+    }
     Ok(config)
 }
 
@@ -583,12 +596,13 @@ mod tests {
         let temp = tempdir().expect("temp dir");
         let repo = temp.path();
         let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"));
-        let service_yaml = "label: com.omar.scriptd\nlog_dir: ~/Library/Logs/scriptd\nwatch: true\nmodules:\n  brew-manager:\n    enabled: true\n    schedule:\n      every_hours: 12\n";
+        let service_yaml = "label: com.omar.scriptd\nlog_dir: ~/Library/Logs/scriptd\nwatch: true\nself_update_check_hours: 12\nmodules:\n  brew-manager:\n    enabled: true\n    schedule:\n      every_hours: 12\n";
         fs::write(repo.join("service.yaml"), service_yaml).expect("write service config");
 
         let config = read_service_config(repo).expect("read config");
         assert_eq!(config.label, "com.omar.scriptd");
         assert!(config.watch);
+        assert_eq!(config.self_update_check_hours, 12);
         assert_eq!(config.log_dir, "~/Library/Logs/scriptd");
         assert_eq!(
             config.expanded_log_dir().to_string_lossy(),
@@ -625,7 +639,7 @@ mod tests {
     #[test]
     fn read_service_config_rejects_invalid_schedule() {
         let temp = tempdir().expect("temp dir");
-        let service_yaml = "label: com.omar.scriptd\nlog_dir: ~/Library/Logs/scriptd\nwatch: true\nmodules:\n  brew-manager:\n    enabled: true\n    schedule:\n      every_hours: 12\n      daily_at:\n        - \"09:00\"\n";
+        let service_yaml = "label: com.omar.scriptd\nlog_dir: ~/Library/Logs/scriptd\nwatch: true\nself_update_check_hours: 12\nmodules:\n  brew-manager:\n    enabled: true\n    schedule:\n      every_hours: 12\n      daily_at:\n        - \"09:00\"\n";
         fs::write(temp.path().join("service.yaml"), service_yaml).expect("write service config");
 
         let error = read_service_config(temp.path()).expect_err("invalid schedule should fail");
@@ -828,6 +842,7 @@ mod tests {
             label: "com.omar.scriptd".to_string(),
             log_dir: "/tmp/logs".to_string(),
             watch: true,
+            self_update_check_hours: 12,
             modules: Default::default(),
             path: "/tmp/service.yaml".into(),
             root_dir: "/tmp/repo".into(),
@@ -859,6 +874,7 @@ mod tests {
             label: "com.omar.scriptd".to_string(),
             log_dir: "/tmp/logs".to_string(),
             watch: true,
+            self_update_check_hours: 12,
             modules: Default::default(),
             path: "/tmp/service.yaml".into(),
             root_dir: "/tmp/repo".into(),
@@ -892,6 +908,7 @@ mod tests {
             label: "com.omar.scriptd".to_string(),
             log_dir: "/tmp/logs".to_string(),
             watch: true,
+            self_update_check_hours: 12,
             modules: Default::default(),
             path: "/tmp/service.yaml".into(),
             root_dir: "/tmp/repo".into(),
@@ -923,6 +940,7 @@ mod tests {
             label: "com.omar.scriptd".to_string(),
             log_dir: "/tmp/logs".to_string(),
             watch: true,
+            self_update_check_hours: 12,
             modules: Default::default(),
             path: "/tmp/service.yaml".into(),
             root_dir: "/tmp/repo".into(),

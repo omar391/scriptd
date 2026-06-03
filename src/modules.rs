@@ -135,6 +135,7 @@ mod tests {
             label: "com.test.scriptd".to_string(),
             log_dir: "/tmp/scriptd-test-logs".to_string(),
             watch: false,
+            self_update_check_hours: 12,
             modules: HashMap::new(),
             path: root.join("service.yaml"),
             root_dir: root.to_path_buf(),

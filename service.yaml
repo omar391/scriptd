@@ -1,6 +1,7 @@
 label: com.omar.scriptd
 log_dir: ~/Library/Logs/scriptd
 watch: true
+self_update_check_hours: 12
 modules:
   brew-manager:
     enabled: true

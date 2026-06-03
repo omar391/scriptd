@@ -1184,7 +1184,8 @@ pub fn run_once(context: &mut ModuleContext) -> anyhow::Result<Option<ModuleStat
             if parts.len() >= 3 {
                 let to = parts[2];
                 if to == effective {
-                    let message = format!("staying on {effective}; chosen SSID already matches current");
+                    let message =
+                        format!("staying on {effective}; chosen SSID already matches current");
                     state.last_decision = Some(message.clone());
                     context.logger.info(&message);
                     return Ok(Some(ModuleStatus {

@@ -114,8 +114,10 @@ fn write_scriptd_wrapper(binary_path: &Path, config: &ServiceConfig) -> Result<P
     }
 
     let script = format!(
-        "#!/bin/sh\nexport SCRIPTD_ROOT_DIR=\"{}\"\nexport SCRIPTD_ENTRY_SHELL_PATH=\"{}/scriptd.sh\"\nexec \"{}\" \"$@\"\n",
+        "#!/bin/sh\nset -eu\nexport SCRIPTD_ROOT_DIR=\"{}\"\nexport SCRIPTD_ENTRY_SHELL_PATH=\"{}/scriptd.sh\"\nrelease_binary_is_stale() {{\n  binary=\"$1\"\n  root=\"$2\"\n  [ -x \"$binary\" ] || return 0\n  [ \"$root/Cargo.toml\" -nt \"$binary\" ] && return 0\n  [ -f \"$root/Cargo.lock\" ] && [ \"$root/Cargo.lock\" -nt \"$binary\" ] && return 0\n  [ -f \"$root/build.rs\" ] && [ \"$root/build.rs\" -nt \"$binary\" ] && return 0\n  if find \"$root/src\" \"$root/modules\" -type f -name '*.rs' -newer \"$binary\" -print -quit 2>/dev/null | grep -q .; then\n    return 0\n  fi\n  return 1\n}}\nif release_binary_is_stale \"{}\" \"{}\"; then\n  exec \"$SCRIPTD_ENTRY_SHELL_PATH\" \"$@\"\nfi\nexec \"{}\" \"$@\"\n",
         config.root_dir.to_string_lossy(),
+        config.root_dir.to_string_lossy(),
+        binary_path.to_string_lossy(),
         config.root_dir.to_string_lossy(),
         binary_path.to_string_lossy(),
     );

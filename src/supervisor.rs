@@ -18,6 +18,8 @@ use crate::config::{self, ModuleSchedule, ServiceConfig, ServiceModuleConfig};
 use crate::modules::{self, BuiltInModule, ModuleDefinition, ModulesRegistry};
 use crate::status::{PersistedModuleState, PersistedState, PersistedSupervisorState};
 
+const SOURCE_STALENESS_TOLERANCE: Duration = Duration::from_secs(1);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RuntimeStatus {
     Disabled,
@@ -187,9 +189,7 @@ fn acquire_singleton_lock(config: &ServiceConfig) -> Result<SingletonLock> {
                     .and_then(|value| value.trim().parse::<u32>().ok());
                 if let Some(pid) = existing_pid {
                     if process_is_alive(pid) {
-                        anyhow::bail!(
-                            "scriptd root supervisor is already running with pid {pid}"
-                        );
+                        anyhow::bail!("scriptd root supervisor is already running with pid {pid}");
                     }
                 }
                 let _ = std::fs::remove_file(&lock_path);
@@ -213,6 +213,73 @@ struct RunningSupervisor {
     watcher: Option<RecommendedWatcher>,
     reload_receiver: Option<UnboundedReceiver<()>>,
     last_state_fingerprint: Option<String>,
+}
+
+fn file_modified_at(path: &Path) -> Result<std::time::SystemTime> {
+    std::fs::metadata(path)
+        .with_context(|| format!("stat {}", path.display()))?
+        .modified()
+        .with_context(|| format!("modified time {}", path.display()))
+}
+
+fn is_meaningfully_newer(left: std::time::SystemTime, right: std::time::SystemTime) -> bool {
+    left.duration_since(right)
+        .map(|delta| delta > SOURCE_STALENESS_TOLERANCE)
+        .unwrap_or(false)
+}
+
+fn path_contains_newer_file(path: &Path, binary_modified: std::time::SystemTime) -> Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+    if path.is_file() {
+        return Ok(is_meaningfully_newer(
+            file_modified_at(path)?,
+            binary_modified,
+        ));
+    }
+
+    for entry in std::fs::read_dir(path).with_context(|| format!("read {}", path.display()))? {
+        let entry = entry?;
+        if path_contains_newer_file(&entry.path(), binary_modified)? {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+fn sources_newer_than_binary(root: &Path, binary: &Path) -> Result<bool> {
+    if !binary.exists() {
+        return Ok(true);
+    }
+
+    let binary_modified = file_modified_at(binary)?;
+    let tracked_paths = [
+        root.join("Cargo.toml"),
+        root.join("Cargo.lock"),
+        root.join("build.rs"),
+        root.join("src"),
+        root.join("modules"),
+    ];
+
+    for path in tracked_paths {
+        if path_contains_newer_file(&path, binary_modified)? {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+fn request_self_restart() -> Result<()> {
+    let pid = unsafe { libc::getpid() };
+    let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error()).context("signal self for restart");
+    }
+
+    Ok(())
 }
 
 impl RunningSupervisor {
@@ -646,13 +713,8 @@ pub fn run_one_module(root: PathBuf, module: &str) -> Result<()> {
     let log_dir_path = log_dir.to_string_lossy().to_string();
     let watch = config.watch;
 
-    let mut context = modules::module_context_with_console(
-        module,
-        root_for_context,
-        module_dir,
-        log_dir,
-        true,
-    );
+    let mut context =
+        modules::module_context_with_console(module, root_for_context, module_dir, log_dir, true);
     let mut runtime = ModuleRuntime::from_definition(definition.clone());
     runtime.schedule = module_schedule;
     println!("Running {module}...");
@@ -720,12 +782,37 @@ pub fn run_one_module(root: PathBuf, module: &str) -> Result<()> {
 
 async fn run_supervisor_async(root: PathBuf) -> Result<()> {
     let (config, registry) = read_state_config(&root)?;
+    let update_interval = config.self_update_check_interval();
     let singleton_lock = acquire_singleton_lock(&config)?;
     let mut supervisor = RunningSupervisor::build(&root, config, registry, singleton_lock);
     if supervisor.watch {
         let config_path = supervisor.config_path.clone();
         supervisor.start_watcher(&config_path)?;
     }
+
+    let update_root = supervisor.root.clone();
+    let update_log_dir = supervisor.log_dir.clone();
+    let update_binary = std::env::current_exe().context("resolve current executable")?;
+    tokio::spawn(async move {
+        loop {
+            sleep(update_interval).await;
+            match sources_newer_than_binary(&update_root, &update_binary) {
+                Ok(true) => {
+                    let message =
+                        "Detected newer source files; restarting to pick up the latest build";
+                    crate::logger::append_info(&update_log_dir.join("scriptd.log"), message);
+                    println!("{message}");
+                    let _ = request_self_restart();
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    let message = format!("self-update check failed: {error}");
+                    crate::logger::append_warn(&update_log_dir.join("scriptd.log"), &message);
+                    eprintln!("{message}");
+                }
+            }
+        }
+    });
 
     supervisor.persist_if_changed()?;
     supervisor.run_event_loop().await
