@@ -7,3 +7,9 @@ venv/
 env/
 .pytest_cache/
 target/
+
+# git-land trunk
+.trunk/*
+!.trunk/trunk.yaml
+!.trunk/configs/
+!.trunk/configs/**

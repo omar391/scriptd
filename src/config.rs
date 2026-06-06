@@ -271,6 +271,25 @@ fn next_interval_candidates(
     ))
 }
 
+fn next_interval_candidate_in_window(
+    interval_seconds: u64,
+    schedule: &ModuleSchedule,
+    now: DateTime<Local>,
+) -> Option<DateTime<Local>> {
+    let mut candidate = next_interval_candidates(interval_seconds, now)?;
+    let max_checks = 14u64.saturating_mul(24 * 60 * 60) / interval_seconds.max(1) + 1;
+
+    for _ in 0..max_checks {
+        if schedule.allow_now(&candidate) {
+            return Some(candidate);
+        }
+
+        candidate = next_interval_candidates(interval_seconds, candidate)?;
+    }
+
+    None
+}
+
 fn next_daily_candidates(
     times: &[String],
     schedule: &ModuleSchedule,
@@ -390,7 +409,11 @@ pub fn next_scheduled_run(
     let schedule = schedule.as_ref()?;
 
     let candidate = if let Some(every) = schedule.interval_seconds() {
-        next_interval_candidates(every, now)
+        if schedule.window.is_some() || schedule.weekdays.is_some() {
+            next_interval_candidate_in_window(every, schedule, now)
+        } else {
+            next_interval_candidates(every, now)
+        }
     } else if let Some(times) = &schedule.daily_at {
         next_daily_candidates(times, schedule, now)
     } else if let Some(expressions) = &schedule.cron {
@@ -769,6 +792,31 @@ mod tests {
             .single()
             .expect("valid datetime");
         assert!(next_scheduled_run(&Some(schedule), now).is_none());
+    }
+
+    #[test]
+    fn next_scheduled_run_for_interval_schedule_advances_past_window_edge() {
+        let schedule = ModuleSchedule {
+            every_minutes: Some(5),
+            window: Some(ScheduleWindow {
+                start: "00:00".to_string(),
+                end: "06:00".to_string(),
+            }),
+            ..ModuleSchedule::default()
+        };
+
+        let now = Local
+            .with_ymd_and_hms(2026, 6, 2, 5, 58, 0)
+            .single()
+            .expect("valid datetime");
+        let next = next_scheduled_run(&Some(schedule), now).expect("next schedule");
+
+        assert_eq!(
+            next.date_naive(),
+            now.date_naive().succ_opt().expect("next day")
+        );
+        assert_eq!(next.hour(), 0);
+        assert_eq!(next.minute(), 3);
     }
 
     #[test]

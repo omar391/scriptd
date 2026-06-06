@@ -2,7 +2,22 @@
 
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
+resolve_script_path() {
+  local script_path="$1"
+
+  while [[ -L "${script_path}" ]]; do
+    local script_dir
+    script_dir="$(cd "$(dirname "${script_path}")" && pwd)"
+    script_path="$(readlink "${script_path}")"
+    if [[ "${script_path}" != /* ]]; then
+      script_path="${script_dir}/${script_path}"
+    fi
+  done
+
+  cd "$(dirname "${script_path}")" && pwd
+}
+
+ROOT_DIR="$(resolve_script_path "$0")"
 export SCRIPTD_ROOT_DIR="${SCRIPTD_ROOT_DIR:-${ROOT_DIR}}"
 export SCRIPTD_ENTRY_SHELL_PATH="${SCRIPTD_ENTRY_SHELL_PATH:-${ROOT_DIR}/scriptd.sh}"
 REPO_BIN="${ROOT_DIR}/target/release/scriptd"

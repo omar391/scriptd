@@ -132,7 +132,20 @@ pub fn render_status(config: &ServiceConfig, _config_path: PathBuf) -> anyhow::R
                 .map(|entry| entry.manifest.mode.clone())
                 .unwrap_or_else(|| "interval".to_string());
             let state_status = state.modules.get(name);
-            let (runtime_kind, status, runs, restarts) = state_status
+            let synthesized_next_run_at = if desired == "enabled" {
+                config.modules.get(name).and_then(|entry| {
+                    entry.schedule.as_ref().and_then(|schedule| {
+                        crate::config::next_scheduled_run(
+                            &Some(schedule.clone()),
+                            chrono::Local::now(),
+                        )
+                        .map(|value| value.to_rfc3339())
+                    })
+                })
+            } else {
+                None
+            };
+            let (runtime_kind, mut status, runs, restarts) = state_status
                 .as_ref()
                 .map(|entry| {
                     (
@@ -147,6 +160,9 @@ pub fn render_status(config: &ServiceConfig, _config_path: PathBuf) -> anyhow::R
                     )
                 })
                 .unwrap_or(("runtime", "unknown".to_string(), 0, 0));
+            if desired == "enabled" && status == "disabled" && synthesized_next_run_at.is_some() {
+                status = "scheduled".to_string();
+            }
             let mut details = vec![
                 format!("desired={desired}"),
                 definition,
@@ -156,6 +172,8 @@ pub fn render_status(config: &ServiceConfig, _config_path: PathBuf) -> anyhow::R
             ];
 
             if let Some(next_run_at) = state_status.and_then(|entry| entry.next_run_at.clone()) {
+                details.push(format!("next={next_run_at}"));
+            } else if let Some(next_run_at) = synthesized_next_run_at {
                 details.push(format!("next={next_run_at}"));
             } else if stale_reason.is_some() && desired == "enabled" {
                 if let Some(entry) = config.modules.get(name) {

@@ -253,10 +253,7 @@ fn command_exists(command_name: &str) -> bool {
 fn run_swift(code: &str) -> anyhow::Result<String> {
     let output = Command::new("swift").args(["-e", code]).output()?;
     if !output.status.success() {
-        anyhow::bail!(
-            "{}",
-            String::from_utf8_lossy(&output.stderr).trim().to_string()
-        );
+        anyhow::bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
