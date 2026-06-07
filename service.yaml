@@ -11,7 +11,7 @@ modules:
     enabled: false
     schedule:
       every_minutes: 1
-  wifi-monitor:
+  better-wifi:
     enabled: true
     schedule:
       every_minutes: 5

@@ -647,7 +647,7 @@ mod tests {
     #[test]
     fn read_module_manifest_rejects_id_mismatch() {
         let temp = tempdir().expect("temp dir");
-        let module_dir = temp.path().join("modules").join("wifi-monitor");
+        let module_dir = temp.path().join("modules").join("better-wifi");
         std::fs::create_dir_all(&module_dir).expect("create module dir");
         std::fs::write(
             module_dir.join("module.yaml"),
@@ -655,7 +655,7 @@ mod tests {
         )
         .expect("write manifest");
 
-        let result = read_module_manifest("wifi-monitor", temp.path());
+        let result = read_module_manifest("better-wifi", temp.path());
         assert!(result.is_err());
     }
 

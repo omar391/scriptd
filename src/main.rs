@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 mod config;
+mod credentials;
 mod launchd;
 mod logger;
 mod modules;
@@ -358,11 +359,11 @@ mod tests {
 
     fn write_service_yaml(root: &Path, body: &str) {
         fs::write(root.join("service.yaml"), body).expect("write service yaml");
-        for builtin in ["wifi-monitor", "cpu-monitor", "brew-manager"] {
+        for builtin in ["better-wifi", "cpu-monitor", "brew-manager"] {
             let dir = root.join("modules").join(builtin);
             fs::create_dir_all(&dir).expect("module dir");
             let manifest = match builtin {
-                "wifi-monitor" => "id: wifi-monitor\nmode: interval\ninterval_seconds: 30\n",
+                "better-wifi" => "id: better-wifi\nmode: interval\ninterval_seconds: 30\n",
                 "cpu-monitor" => "id: cpu-monitor\nmode: interval\ninterval_seconds: 30\n",
                 "brew-manager" => "id: brew-manager\nmode: interval\ninterval_seconds: 30\n",
                 _ => "",
@@ -376,12 +377,12 @@ mod tests {
         let temp = tempdir().expect("temp dir");
         write_service_yaml(
             temp.path(),
-            "label: com.omar.scriptd\nlog_dir: ~/Library/Logs/scriptd\nwatch: true\nmodules:\n  wifi-monitor:\n    enabled: true\n",
+            "label: com.omar.scriptd\nlog_dir: ~/Library/Logs/scriptd\nwatch: true\nmodules:\n  better-wifi:\n    enabled: true\n",
         );
 
         let err = parse_and_update_module_config(
             &[
-                "wifi-monitor".to_string(),
+                "better-wifi".to_string(),
                 "--enable".to_string(),
                 "--disable".to_string(),
             ],
@@ -399,12 +400,12 @@ mod tests {
         let temp = tempdir().expect("temp dir");
         write_service_yaml(
             temp.path(),
-            "label: com.omar.scriptd\nlog_dir: ~/Library/Logs/scriptd\nwatch: true\nmodules:\n  wifi-monitor:\n    enabled: true\n",
+            "label: com.omar.scriptd\nlog_dir: ~/Library/Logs/scriptd\nwatch: true\nmodules:\n  better-wifi:\n    enabled: true\n",
         );
 
         let err = parse_and_update_module_config(
             &[
-                "wifi-monitor".to_string(),
+                "better-wifi".to_string(),
                 "--every-minutes".to_string(),
                 "10".to_string(),
                 "--every-hours".to_string(),
@@ -424,12 +425,12 @@ mod tests {
         let temp = tempdir().expect("temp dir");
         write_service_yaml(
             temp.path(),
-            "label: com.omar.scriptd\nlog_dir: ~/Library/Logs/scriptd\nwatch: true\nmodules:\n  wifi-monitor:\n    enabled: true\n",
+            "label: com.omar.scriptd\nlog_dir: ~/Library/Logs/scriptd\nwatch: true\nmodules:\n  better-wifi:\n    enabled: true\n",
         );
 
         parse_and_update_module_config(
             &[
-                "wifi-monitor".to_string(),
+                "better-wifi".to_string(),
                 "--enable".to_string(),
                 "--every-minutes".to_string(),
                 "15".to_string(),
@@ -457,12 +458,12 @@ mod tests {
         let temp = tempdir().expect("temp dir");
         write_service_yaml(
             temp.path(),
-            "label: com.omar.scriptd\nlog_dir: ~/Library/Logs/scriptd\nwatch: true\nmodules:\n  wifi-monitor:\n    enabled: true\n",
+            "label: com.omar.scriptd\nlog_dir: ~/Library/Logs/scriptd\nwatch: true\nmodules:\n  better-wifi:\n    enabled: true\n",
         );
 
         let err = parse_and_update_module_config(
             &[
-                "wifi-monitor".to_string(),
+                "better-wifi".to_string(),
                 "--weekday".to_string(),
                 "funday".to_string(),
             ],
@@ -498,7 +499,7 @@ mod tests {
             );
         }
 
-        for module_id in ["brew-manager", "cpu-monitor", "wifi-monitor"] {
+        for module_id in ["brew-manager", "cpu-monitor", "better-wifi"] {
             assert!(
                 !root
                     .join(format!("modules/{module_id}/package.json"))

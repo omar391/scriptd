@@ -3,12 +3,12 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+#[path = "../modules/better-wifi/module.rs"]
+mod better_wifi;
 #[path = "../modules/brew-manager/module.rs"]
 mod brew_manager;
 #[path = "../modules/cpu-monitor/module.rs"]
 mod cpu_monitor;
-#[path = "../modules/wifi-monitor/module.rs"]
-mod wifi_monitor;
 
 use crate::config::{ModuleManifest, ModuleSchedule, ServiceConfig};
 
@@ -22,7 +22,7 @@ pub enum ModuleMode {
 pub enum BuiltInModule {
     BrewManager,
     CpuMonitor,
-    WifiMonitor,
+    BetterWifi,
 }
 
 impl BuiltInModule {
@@ -30,7 +30,7 @@ impl BuiltInModule {
         match self {
             Self::BrewManager => "brew-manager",
             Self::CpuMonitor => "cpu-monitor",
-            Self::WifiMonitor => "wifi-monitor",
+            Self::BetterWifi => "better-wifi",
         }
     }
 
@@ -38,19 +38,19 @@ impl BuiltInModule {
         match self {
             Self::BrewManager => ModuleMode::Interval,
             Self::CpuMonitor => ModuleMode::Interval,
-            Self::WifiMonitor => ModuleMode::Interval,
+            Self::BetterWifi => ModuleMode::Interval,
         }
     }
 
     pub fn all() -> &'static [Self; 3] {
-        &[Self::BrewManager, Self::CpuMonitor, Self::WifiMonitor]
+        &[Self::BrewManager, Self::CpuMonitor, Self::BetterWifi]
     }
 
     pub fn kind_from_id(id: &str) -> anyhow::Result<Self> {
         match id {
             "brew-manager" => Ok(Self::BrewManager),
             "cpu-monitor" => Ok(Self::CpuMonitor),
-            "wifi-monitor" => Ok(Self::WifiMonitor),
+            "better-wifi" => Ok(Self::BetterWifi),
             other => anyhow::bail!("module \"{other}\" not compiled into this build"),
         }
     }
@@ -150,12 +150,12 @@ mod tests {
         let root = temp.path();
         write_manifest(root, "brew-manager", "interval", Some(30));
         write_manifest(root, "cpu-monitor", "interval", Some(30));
-        write_manifest(root, "wifi-monitor", "interval", Some(10));
+        write_manifest(root, "better-wifi", "interval", Some(10));
 
         let config = service_config(root);
         let registry = ModulesRegistry::load_from_disk(&config).expect("load built-ins");
         assert_eq!(registry.modules.len(), 3);
-        assert!(registry.get("wifi-monitor").is_some());
+        assert!(registry.get("better-wifi").is_some());
         assert_eq!(
             registry
                 .get("cpu-monitor")
@@ -172,7 +172,7 @@ mod tests {
         let root = temp.path();
         write_manifest(root, "brew-manager", "interval", Some(30));
         write_manifest(root, "cpu-monitor", "interval", Some(30));
-        write_manifest(root, "wifi-monitor", "interval", None);
+        write_manifest(root, "better-wifi", "interval", None);
 
         let config = service_config(root);
         let error =
@@ -188,7 +188,7 @@ mod tests {
         let root = temp.path();
         write_manifest(root, "brew-manager", "interval", Some(30));
         write_manifest(root, "cpu-monitor", "daemon", Some(30));
-        write_manifest(root, "wifi-monitor", "stream", Some(30));
+        write_manifest(root, "better-wifi", "stream", Some(30));
 
         let config = service_config(root);
         let error = ModulesRegistry::load_from_disk(&config).expect_err("unknown mode");
@@ -315,7 +315,7 @@ pub fn run_once(
     match kind {
         BuiltInModule::BrewManager => brew_manager::run_once(context),
         BuiltInModule::CpuMonitor => cpu_monitor::run_once(context),
-        BuiltInModule::WifiMonitor => wifi_monitor::run_once(context),
+        BuiltInModule::BetterWifi => better_wifi::run_once(context),
     }
 }
 
@@ -323,7 +323,7 @@ pub fn setup_module(kind: &BuiltInModule, context: &mut ModuleContext) -> anyhow
     match kind {
         BuiltInModule::BrewManager => brew_manager::setup(context),
         BuiltInModule::CpuMonitor => cpu_monitor::setup(context),
-        BuiltInModule::WifiMonitor => wifi_monitor::setup(context),
+        BuiltInModule::BetterWifi => better_wifi::setup(context),
     }
 }
 
@@ -331,6 +331,6 @@ pub fn module_status(kind: &BuiltInModule) -> Option<(ModuleStatus, ModuleHealth
     match kind {
         BuiltInModule::BrewManager => brew_manager::status(),
         BuiltInModule::CpuMonitor => cpu_monitor::status(),
-        BuiltInModule::WifiMonitor => wifi_monitor::status(),
+        BuiltInModule::BetterWifi => better_wifi::status(),
     }
 }

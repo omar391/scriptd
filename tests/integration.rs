@@ -106,11 +106,15 @@ exit 1
 }
 
 fn create_fake_wifi_stack(fake_bin: &Path, wifi_log: &Path) -> anyhow::Result<()> {
+    let current_file = wifi_log.with_extension("current");
     fake_bin_script(
         &fake_bin.join("networksetup"),
         &format!(
             r#"#!/bin/sh
 echo "$@" >> "{log}"
+if [ ! -f "{current}" ]; then
+  echo "Home" > "{current}"
+fi
 case "$1" in
   -listallhardwareports)
     echo "Hardware Port: Wi-Fi"
@@ -118,7 +122,7 @@ case "$1" in
     exit 0
     ;;
   -getairportnetwork)
-    echo "Current Wi-Fi Network: Home"
+    echo "Current Wi-Fi Network: $(cat "{current}")"
     exit 0
     ;;
   -listpreferredwirelessnetworks)
@@ -128,12 +132,66 @@ case "$1" in
     exit 0
     ;;
   -setairportnetwork)
+    echo "$3" > "{current}"
     exit 0
     ;;
 esac
 exit 1
 "#,
-            log = wifi_log.to_string_lossy()
+            log = wifi_log.to_string_lossy(),
+            current = current_file.to_string_lossy()
+        ),
+    )?;
+    fake_bin_script(
+        &fake_bin.join("ping"),
+        "#!/bin/sh\necho '3 packets transmitted, 3 packets received, 0.0% packet loss'\nexit 0\n",
+    )?;
+    Ok(())
+}
+
+fn create_fake_wifi_stack_requiring_password(
+    fake_bin: &Path,
+    wifi_log: &Path,
+) -> anyhow::Result<()> {
+    let current_file = wifi_log.with_extension("current");
+    fake_bin_script(
+        &fake_bin.join("networksetup"),
+        &format!(
+            r#"#!/bin/sh
+echo "$@" >> "{log}"
+if [ ! -f "{current}" ]; then
+  echo "Home" > "{current}"
+fi
+case "$1" in
+  -listallhardwareports)
+    echo "Hardware Port: Wi-Fi"
+    echo "Device: en0"
+    exit 0
+    ;;
+  -getairportnetwork)
+    echo "Current Wi-Fi Network: $(cat "{current}")"
+    exit 0
+    ;;
+  -listpreferredwirelessnetworks)
+    echo "Preferred networks on en0:"
+    echo "Home"
+    echo "Office"
+    exit 0
+    ;;
+  -setairportnetwork)
+    if [ "${{4-}}" = "office-password" ]; then
+      echo "$3" > "{current}"
+      exit 0
+    fi
+    echo "Failed to join network $3."
+    echo "Error: -3900  The operation couldn't be completed. tmpErr"
+    exit 0
+    ;;
+esac
+exit 1
+"#,
+            log = wifi_log.to_string_lossy(),
+            current = current_file.to_string_lossy()
         ),
     )?;
     fake_bin_script(
@@ -144,7 +202,7 @@ exit 1
 }
 
 fn write_modules(root: &Path) {
-    for module in ["brew-manager", "cpu-monitor", "wifi-monitor"] {
+    for module in ["brew-manager", "cpu-monitor", "better-wifi"] {
         let module_dir = root.join("modules").join(module);
         fs::create_dir_all(&module_dir).expect("create module dir");
         fs::write(
@@ -173,12 +231,12 @@ fn write_brew_module(root: &Path, homebrew_bin: &Path, askpass_path: &Path) {
 }
 
 fn write_wifi_module(root: &Path, state_file: &Path) {
-    let module_dir = root.join("modules").join("wifi-monitor");
+    let module_dir = root.join("modules").join("better-wifi");
     fs::create_dir_all(&module_dir).expect("create wifi module dir");
     fs::write(
         module_dir.join("module.yaml"),
         format!(
-            "id: wifi-monitor\nmode: interval\ninterval_seconds: 30\nmin_dwell: 1\nping_target: 1.1.1.1\nping_count: 3\nping_timeout: 1\nping_high_latency_ms: 250\nhealth_failure_switch_runs: 2\nband_bonus_2g: 0\nband_bonus_5g: 35\nband_bonus_6g: 50\npreference_top_bonus: 30\npreference_rank_decay: 5\ncurrent_sticky_bonus: 25\nrssi_offset: 100\nmin_switch_score_delta: 10\nssids:\n  - Home\n  - Office\nstate_file: {}\nconfig_path: {}\n",
+            "id: better-wifi\nmode: interval\ninterval_seconds: 30\nmin_dwell: 1\nping_target: 1.1.1.1\nping_count: 3\nping_timeout: 1\nping_high_latency_ms: 250\nhealth_failure_switch_runs: 2\nband_bonus_2g: 0\nband_bonus_5g: 35\nband_bonus_6g: 50\npreference_top_bonus: 30\npreference_rank_decay: 5\ncurrent_sticky_bonus: 25\nrssi_offset: 100\nmin_switch_score_delta: 10\nssids:\n  - Home\n  - Office\nstate_file: {}\nconfig_path: {}\n",
             state_file.to_string_lossy(),
             module_dir.join("module.yaml").to_string_lossy()
         ),
@@ -197,12 +255,34 @@ fn write_service_yaml(
     fs::write(
         root.join("service.yaml"),
         format!(
-            "label: com.omar.scriptd\nlog_dir: ~/Library/Logs/scriptd\nwatch: {}\nmodules:\n  brew-manager:\n    enabled: {}\n  cpu-monitor:\n    enabled: {}\n  wifi-monitor:\n    enabled: {}\n",
+            "label: com.omar.scriptd\nlog_dir: ~/Library/Logs/scriptd\nwatch: {}\nmodules:\n  brew-manager:\n    enabled: {}\n  cpu-monitor:\n    enabled: {}\n  better-wifi:\n    enabled: {}\n",
             watch,
             brew_enabled,
             cpu_enabled,
             wifi_enabled
         ),
+    )
+    .unwrap();
+}
+
+fn test_credentials_file(home: &Path) -> std::path::PathBuf {
+    home.join("scriptd-test-credentials.json")
+}
+
+fn write_test_admin_credential(home: &Path, password: &str) {
+    let user = std::env::var("USER").unwrap_or_default();
+    let mut values = serde_json::Map::new();
+    values.insert(
+        format!("ScriptdAdmin\n{user}"),
+        Value::String(password.to_string()),
+    );
+    values.insert(
+        format!("BrewAutoUpdate\n{user}"),
+        Value::String(password.to_string()),
+    );
+    fs::write(
+        test_credentials_file(home),
+        serde_json::to_string_pretty(&Value::Object(values)).unwrap(),
     )
     .unwrap();
 }
@@ -216,6 +296,7 @@ fn run_scriptd(root: &Path, home: &Path, fake_bin: &Path) -> SysCommand {
             "PATH",
             format!("{}:{}", fake_bin.to_string_lossy(), original_path),
         )
+        .env("SCRIPTD_CREDENTIALS_FILE", test_credentials_file(home))
         .env("SCRIPTD_ENTRY_SHELL_PATH", root.join("scriptd.sh"));
     cmd
 }
@@ -373,6 +454,7 @@ fn integration_run_brew_manager_uses_fake_brew_security_and_sudo_boundary() {
     fs::create_dir_all(&fake_bin).unwrap();
     let brew_log = root.path().join("brew.log");
     create_fake_brew_stack(&fake_bin, &brew_log).unwrap();
+    write_test_admin_credential(home.path(), "super-secret");
     write_modules(root.path());
     write_brew_module(
         root.path(),
@@ -402,13 +484,13 @@ fn integration_run_brew_manager_uses_fake_brew_security_and_sudo_boundary() {
 
 #[test]
 #[serial]
-fn integration_run_wifi_monitor_uses_fake_networksetup_and_ping_boundary() {
+fn integration_run_better_wifi_uses_fake_networksetup_and_ping_boundary() {
     let root = tempdir().unwrap();
     let home = tempdir().unwrap();
     let fake_bin = root.path().join("fake_bin");
     fs::create_dir_all(&fake_bin).unwrap();
     let wifi_log = root.path().join("wifi.log");
-    let wifi_state = root.path().join("wifi-state.json");
+    let wifi_state = root.path().join("better-wifi-state.json");
     create_fake_wifi_stack(&fake_bin, &wifi_log).unwrap();
     write_modules(root.path());
     write_wifi_module(root.path(), &wifi_state);
@@ -416,9 +498,9 @@ fn integration_run_wifi_monitor_uses_fake_networksetup_and_ping_boundary() {
 
     let scan_output = "SSID BSSID RSSI CHANNEL SECURITY\nHome 00:11:22:33:44:55 -90 1 WPA2\nOffice 00:11:22:33:44:66 -20 233 WPA3\n";
     let output = run_scriptd(root.path(), home.path(), &fake_bin)
-        .env("SCRIPTD_WIFI_SCAN_OUTPUT", scan_output)
+        .env("SCRIPTD_BETTER_WIFI_SCAN_OUTPUT", scan_output)
         .arg("run")
-        .arg("wifi-monitor")
+        .arg("better-wifi")
         .output()
         .unwrap();
     assert!(
@@ -432,6 +514,46 @@ fn integration_run_wifi_monitor_uses_fake_networksetup_and_ping_boundary() {
     assert!(log.contains("-getairportnetwork en0"));
     assert!(log.contains("-listpreferredwirelessnetworks en0"));
     assert!(log.contains("-setairportnetwork en0 Office"));
+
+    let state_text = fs::read_to_string(&wifi_state).unwrap();
+    let state: Value = serde_json::from_str(&state_text).unwrap();
+    assert_eq!(
+        state.get("lastSsid").and_then(Value::as_str),
+        Some("Office")
+    );
+}
+
+#[test]
+#[serial]
+fn integration_run_better_wifi_retries_with_password_after_unobserved_zero_exit_join() {
+    let root = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    let fake_bin = root.path().join("fake_bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    let wifi_log = root.path().join("better-wifi-password.log");
+    let wifi_state = root.path().join("better-wifi-password-state.json");
+    create_fake_wifi_stack_requiring_password(&fake_bin, &wifi_log).unwrap();
+    write_modules(root.path());
+    write_wifi_module(root.path(), &wifi_state);
+    write_service_yaml(root.path(), false, false, false, true);
+
+    let scan_output = "SSID BSSID RSSI CHANNEL SECURITY\nHome 00:11:22:33:44:55 -90 1 WPA2\nOffice 00:11:22:33:44:66 -20 233 WPA3\n";
+    let output = run_scriptd(root.path(), home.path(), &fake_bin)
+        .env("SCRIPTD_BETTER_WIFI_SCAN_OUTPUT", scan_output)
+        .env("BETTER_WIFI_PASSWORD_OFFICE", "office-password")
+        .arg("run")
+        .arg("better-wifi")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = fs::read_to_string(&wifi_log).unwrap();
+    assert!(log.contains("-setairportnetwork en0 Office\n"));
+    assert!(log.contains("-setairportnetwork en0 Office office-password\n"));
 
     let state_text = fs::read_to_string(&wifi_state).unwrap();
     let state: Value = serde_json::from_str(&state_text).unwrap();

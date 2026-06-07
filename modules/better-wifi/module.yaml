@@ -1,4 +1,4 @@
-id: wifi-monitor
+id: better-wifi
 display_name: Wi-Fi Monitor
 mode: interval
 interval_seconds: 30
@@ -15,7 +15,7 @@ preference_top_bonus: 30
 preference_rank_decay: 5
 current_sticky_bonus: 25
 rssi_offset: 100
-min_switch_score_delta: 25
+min_switch_score_delta: 10
 ssids:
   # - HomeWiFi
   # - OfficeNet

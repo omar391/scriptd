@@ -19,6 +19,7 @@ serde_json = "1.0"
 serde_yaml = "0.9"
 sysinfo = { version = "0.32", default-features = true, features = ["system"] }
 tokio = { version = "1.39", features = ["macros", "rt", "fs", "process", "signal", "time", "sync"] }
+security-framework = "3.7.0"
 
 [features]
 corewlan = ["objc2-core-wlan", "objc2-foundation"]

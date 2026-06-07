@@ -2,12 +2,14 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::credentials;
 use crate::modules::{ModuleContext, ModuleHealth, ModuleStatus};
 
 #[derive(Debug, Clone)]
@@ -56,8 +58,14 @@ pub struct Network {
     pub ping_ms: Option<i64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WifiSignal {
+    channel: i64,
+    rssi: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WifiMonitorConfig {
+pub struct BetterWifiConfig {
     #[serde(rename = "min_dwell")]
     pub min_dwell_seconds: u64,
     pub ping_target: String,
@@ -90,7 +98,7 @@ pub struct WifiMonitorConfig {
     pub config_path: String,
 }
 
-impl Default for WifiMonitorConfig {
+impl Default for BetterWifiConfig {
     fn default() -> Self {
         Self {
             min_dwell_seconds: 180,
@@ -106,7 +114,7 @@ impl Default for WifiMonitorConfig {
             preference_rank_decay: 5.0,
             current_sticky_bonus: 25.0,
             rssi_offset: 100.0,
-            min_switch_score_delta: 25.0,
+            min_switch_score_delta: 10.0,
             ssids: Vec::new(),
             state_file: String::new(),
             config_path: String::new(),
@@ -115,9 +123,9 @@ impl Default for WifiMonitorConfig {
 }
 
 #[allow(dead_code)]
-pub fn resolve_wifi_monitor_config(raw: &WifiMonitorConfig, env: &EnvMap) -> WifiMonitorConfig {
+pub fn resolve_better_wifi_config(raw: &BetterWifiConfig, env: &EnvMap) -> BetterWifiConfig {
     let env_ssids = env
-        .get("WIFI_MONITOR_SSIDS")
+        .get("BETTER_WIFI_SSIDS")
         .unwrap_or_default()
         .split(',')
         .map(str::trim)
@@ -126,12 +134,12 @@ pub fn resolve_wifi_monitor_config(raw: &WifiMonitorConfig, env: &EnvMap) -> Wif
         .collect::<Vec<_>>();
 
     let state_file = env
-        .get("WIFI_MONITOR_STATE_FILE")
+        .get("BETTER_WIFI_STATE_FILE")
         .map(ToString::to_string)
         .unwrap_or_else(|| {
             if raw.state_file.is_empty() {
                 let home = crate::paths::home_dir();
-                home.join(".local/share/wifi-monitor/state.txt")
+                home.join(".local/share/better-wifi/state.txt")
                     .to_string_lossy()
                     .to_string()
             } else {
@@ -140,27 +148,27 @@ pub fn resolve_wifi_monitor_config(raw: &WifiMonitorConfig, env: &EnvMap) -> Wif
         });
 
     let config_path = env
-        .get("WIFI_MONITOR_CONFIG_PATH")
+        .get("BETTER_WIFI_CONFIG_PATH")
         .map(ToString::to_string)
         .unwrap_or_else(|| raw.config_path.clone());
 
-    WifiMonitorConfig {
-        min_dwell_seconds: parse_env_u64(env.get("WIFI_MONITOR_MIN_DWELL"), raw.min_dwell_seconds),
+    BetterWifiConfig {
+        min_dwell_seconds: parse_env_u64(env.get("BETTER_WIFI_MIN_DWELL"), raw.min_dwell_seconds),
         ping_target: env
-            .get("WIFI_MONITOR_PING_TARGET")
+            .get("BETTER_WIFI_PING_TARGET")
             .unwrap_or(raw.ping_target.as_str())
             .to_string(),
-        ping_count: parse_env_u64(env.get("WIFI_MONITOR_PING_COUNT"), raw.ping_count),
+        ping_count: parse_env_u64(env.get("BETTER_WIFI_PING_COUNT"), raw.ping_count),
         ping_timeout_seconds: parse_env_u64(
-            env.get("WIFI_MONITOR_PING_TIMEOUT"),
+            env.get("BETTER_WIFI_PING_TIMEOUT"),
             raw.ping_timeout_seconds,
         ),
         ping_high_latency_ms: parse_env_u64(
-            env.get("WIFI_MONITOR_PING_HIGH_LATENCY_MS"),
+            env.get("BETTER_WIFI_PING_HIGH_LATENCY_MS"),
             raw.ping_high_latency_ms,
         ),
         health_failure_switch_runs: parse_env_u64(
-            env.get("WIFI_MONITOR_HEALTH_FAILURE_SWITCH_RUNS"),
+            env.get("BETTER_WIFI_HEALTH_FAILURE_SWITCH_RUNS"),
             raw.health_failure_switch_runs,
         ),
         band_bonus_2g: raw.band_bonus_2g,
@@ -171,7 +179,7 @@ pub fn resolve_wifi_monitor_config(raw: &WifiMonitorConfig, env: &EnvMap) -> Wif
         current_sticky_bonus: raw.current_sticky_bonus,
         rssi_offset: raw.rssi_offset,
         min_switch_score_delta: parse_env_f64(
-            env.get("WIFI_MONITOR_MIN_SWITCH_SCORE_DELTA"),
+            env.get("BETTER_WIFI_MIN_SWITCH_SCORE_DELTA"),
             raw.min_switch_score_delta,
         ),
         ssids: if env_ssids.is_empty() {
@@ -191,6 +199,7 @@ struct PersistedWifiState {
     last_switch_at: Option<String>,
     health_failure_streak: u64,
     last_health: Option<StoredHealth>,
+    join_failures: HashMap<String, StoredJoinFailure>,
 }
 
 #[derive(Debug, Clone)]
@@ -199,8 +208,14 @@ struct StoredHealth {
     avg_latency_ms: Option<f64>,
 }
 
+#[derive(Debug, Clone)]
+struct StoredJoinFailure {
+    failed_at: String,
+    message: String,
+}
+
 #[derive(Debug, Default)]
-struct WifiMonitorState {
+struct BetterWifiState {
     current_ssid: String,
     last_switch_at: Option<String>,
     last_decision: Option<String>,
@@ -209,8 +224,8 @@ struct WifiMonitorState {
     last_error: Option<String>,
 }
 
-static STATE: once_cell::sync::Lazy<std::sync::Mutex<WifiMonitorState>> =
-    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(WifiMonitorState::default()));
+static STATE: once_cell::sync::Lazy<std::sync::Mutex<BetterWifiState>> =
+    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(BetterWifiState::default()));
 
 #[derive(Debug, Clone)]
 pub struct PingHealth {
@@ -230,8 +245,12 @@ pub struct CandidateScore {
     pub preference_bonus: f64,
     pub sticky_bonus: f64,
     pub health_penalty: f64,
+    pub join_failure_penalty: f64,
     pub total_score: f64,
 }
+
+const JOIN_FAILURE_COOLDOWN_SECONDS: i64 = 15 * 60;
+const JOIN_FAILURE_SCORE_PENALTY: f64 = 1_000.0;
 
 #[derive(Debug, Deserialize)]
 struct SwiftScanRecord {
@@ -267,11 +286,31 @@ fn read_state(state_file: &str) -> PersistedWifiState {
             last_switch_at: None,
             health_failure_streak: 0,
             last_health: None,
+            join_failures: HashMap::new(),
         };
     };
 
     let json = serde_json::from_str::<serde_json::Value>(&raw).ok();
     if let Some(value) = json {
+        let join_failures = value
+            .get("joinFailures")
+            .and_then(|entry| entry.as_object())
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|(ssid, entry)| {
+                        let failed_at = entry.get("failedAt")?.as_str()?.to_string();
+                        let message = entry
+                            .get("message")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        Some((ssid.clone(), StoredJoinFailure { failed_at, message }))
+                    })
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default();
+
         return PersistedWifiState {
             last_ssid: value
                 .get("lastSsid")
@@ -297,6 +336,7 @@ fn read_state(state_file: &str) -> PersistedWifiState {
                     .unwrap_or(100.0),
                 avg_latency_ms: entry.get("avgLatencyMs").and_then(|v| v.as_f64()),
             }),
+            join_failures,
         };
     }
 
@@ -306,6 +346,7 @@ fn read_state(state_file: &str) -> PersistedWifiState {
         last_switch_at: None,
         health_failure_streak: 0,
         last_health: None,
+        join_failures: HashMap::new(),
     }
 }
 
@@ -357,10 +398,63 @@ fn write_state(path: &str, state: &PersistedWifiState) {
             serde_json::Value::Object(health_value),
         );
     }
+    if !state.join_failures.is_empty() {
+        let mut failures = serde_json::Map::new();
+        for (ssid, failure) in &state.join_failures {
+            let mut failure_value = serde_json::Map::new();
+            failure_value.insert(
+                "failedAt".to_string(),
+                serde_json::Value::String(failure.failed_at.clone()),
+            );
+            failure_value.insert(
+                "message".to_string(),
+                serde_json::Value::String(failure.message.clone()),
+            );
+            failures.insert(ssid.clone(), serde_json::Value::Object(failure_value));
+        }
+        data.insert(
+            "joinFailures".to_string(),
+            serde_json::Value::Object(failures),
+        );
+    }
     let _ = fs::write(
         path,
         serde_json::to_string_pretty(&serde_json::Value::Object(data)).unwrap_or_default(),
     );
+}
+
+fn prune_join_failures(
+    failures: &HashMap<String, StoredJoinFailure>,
+    now: DateTime<Utc>,
+) -> HashMap<String, StoredJoinFailure> {
+    failures
+        .iter()
+        .filter_map(|(ssid, failure)| {
+            let failed_at = DateTime::parse_from_rfc3339(&failure.failed_at)
+                .ok()?
+                .with_timezone(&Utc);
+            ((now - failed_at).num_seconds() < JOIN_FAILURE_COOLDOWN_SECONDS)
+                .then_some((ssid.clone(), failure.clone()))
+        })
+        .collect()
+}
+
+fn join_failure_penalty(
+    ssid: &str,
+    failures: &HashMap<String, StoredJoinFailure>,
+    now: DateTime<Utc>,
+) -> f64 {
+    let Some(failure) = failures.get(ssid) else {
+        return 0.0;
+    };
+    let Ok(failed_at) = DateTime::parse_from_rfc3339(&failure.failed_at) else {
+        return 0.0;
+    };
+    if (now - failed_at.with_timezone(&Utc)).num_seconds() < JOIN_FAILURE_COOLDOWN_SECONDS {
+        JOIN_FAILURE_SCORE_PENALTY
+    } else {
+        0.0
+    }
 }
 
 fn parse_wifi_device() -> anyhow::Result<String> {
@@ -405,21 +499,86 @@ if let iface = CWWiFiClient.shared().interface(), let name = iface.interfaceName
     anyhow::bail!("Could not detect wifi device")
 }
 
+fn parse_networksetup_current_ssid(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let trimmed = line.trim();
+        ["Current Wi-Fi Network:", "Current AirPort Network:"]
+            .iter()
+            .find_map(|prefix| {
+                trimmed
+                    .strip_prefix(prefix)
+                    .map(str::trim)
+                    .filter(|value| is_usable_current_ssid(value))
+                    .map(str::to_string)
+            })
+    })
+}
+
+fn is_usable_current_ssid(value: &str) -> bool {
+    let normalized = value.trim();
+    !normalized.is_empty()
+        && !matches!(
+            normalized.to_ascii_lowercase().as_str(),
+            "<redacted>" | "redacted" | "unknown"
+        )
+}
+
+fn parse_ipconfig_current_ssid(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("SSID :")
+            .map(str::trim)
+            .filter(|value| is_usable_current_ssid(value))
+            .map(str::to_string)
+    })
+}
+
+fn parse_wifi_signal_output(output: &str) -> Option<WifiSignal> {
+    output.lines().find_map(|line| {
+        let mut parts = line.split_whitespace();
+        let channel = parts.next()?.parse::<i64>().ok()?;
+        let rssi = parts.next()?.parse::<i64>().ok()?;
+        Some(WifiSignal { channel, rssi })
+    })
+}
+
+fn current_wifi_signal() -> anyhow::Result<Option<WifiSignal>> {
+    if !command_exists("swift") {
+        return Ok(None);
+    }
+
+    let output = run_swift(
+        r#"
+import Foundation
+import CoreWLAN
+
+if let iface = CWWiFiClient.shared().interface(), let channel = iface.wlanChannel() {
+    print("\(channel.channelNumber)\t\(iface.rssiValue())")
+}
+"#,
+    )?;
+    Ok(parse_wifi_signal_output(&output))
+}
+
 fn current_ssid(device: &str) -> anyhow::Result<String> {
     let output = Command::new("networksetup")
         .args(["-getairportnetwork", device])
         .output()?;
-    if !output.status.success() {
-        return Ok(String::new());
+    if output.status.success() {
+        let text = String::from_utf8_lossy(&output.stdout);
+        if let Some(current) = parse_networksetup_current_ssid(&text) {
+            return Ok(current);
+        }
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let prefix = "Current Wi-Fi Network: ";
-    let current = text
-        .lines()
-        .find_map(|line| line.strip_prefix(prefix).map(str::trim).map(str::to_string))
-        .unwrap_or_default();
-    if !current.is_empty() {
-        return Ok(current);
+
+    let output = Command::new("ipconfig")
+        .args(["getsummary", device])
+        .output()?;
+    if output.status.success() {
+        let text = String::from_utf8_lossy(&output.stdout);
+        if let Some(current) = parse_ipconfig_current_ssid(&text) {
+            return Ok(current);
+        }
     }
 
     if command_exists("swift") {
@@ -439,6 +598,32 @@ if let iface = CWWiFiClient.shared().interface(), let ssid = iface.ssid() {
     }
 
     Ok(String::new())
+}
+
+fn parse_primary_channel(channel: &str) -> Option<i64> {
+    let digits = channel
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    digits.parse::<i64>().ok()
+}
+
+fn infer_current_ssid_from_signal(networks: &[Network], signal: WifiSignal) -> Option<String> {
+    let mut matches = networks
+        .iter()
+        .filter(|network| parse_primary_channel(&network.channel) == Some(signal.channel))
+        .filter_map(|network| {
+            let diff = (network.rssi - signal.rssi).abs();
+            (diff <= 12).then_some((network.ssid.clone(), diff))
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by_key(|(_, diff)| *diff);
+
+    match matches.as_slice() {
+        [(ssid, _)] => Some(ssid.clone()),
+        [(ssid, best_diff), (_, next_diff), ..] if best_diff < next_diff => Some(ssid.clone()),
+        _ => None,
+    }
 }
 
 fn parse_airport_output(output: &str, allowed: &[String]) -> Vec<Network> {
@@ -666,7 +851,7 @@ fn scan_corewlan_networks(_allowed: &[String]) -> Vec<Network> {
 }
 
 fn scan_networks(allowed: &[String]) -> Vec<Network> {
-    if let Ok(output) = std::env::var("SCRIPTD_WIFI_SCAN_OUTPUT") {
+    if let Ok(output) = std::env::var("SCRIPTD_BETTER_WIFI_SCAN_OUTPUT") {
         return parse_airport_output(&output, allowed);
     }
 
@@ -689,7 +874,7 @@ fn scan_networks(allowed: &[String]) -> Vec<Network> {
         }
     })
     .or_else(|| {
-        std::env::var("SCRIPTD_WIFI_SCAN_FALLBACK")
+        std::env::var("SCRIPTD_BETTER_WIFI_SCAN_FALLBACK")
             .ok()
             .map(|_| String::new())
     });
@@ -763,7 +948,7 @@ fn parse_ping_health_output(
     }
 }
 
-pub fn ping_health(target: &str, config: &WifiMonitorConfig, prior_streak: u64) -> PingHealth {
+pub fn ping_health(target: &str, config: &BetterWifiConfig, prior_streak: u64) -> PingHealth {
     let args = [
         "-c".to_string(),
         format!("{}", config.ping_count),
@@ -792,7 +977,7 @@ pub fn priority_for(ssid: &str, preference: &[String]) -> usize {
         .unwrap_or(usize::MAX)
 }
 
-fn score_band(network: &Network, config: &WifiMonitorConfig) -> f64 {
+fn score_band(network: &Network, config: &BetterWifiConfig) -> f64 {
     if network.band == "6g" {
         config.band_bonus_6g
     } else if network.band == "5g" {
@@ -802,7 +987,7 @@ fn score_band(network: &Network, config: &WifiMonitorConfig) -> f64 {
     }
 }
 
-fn preference_bonus(rank: usize, config: &WifiMonitorConfig) -> f64 {
+fn preference_bonus(rank: usize, config: &BetterWifiConfig) -> f64 {
     if rank == usize::MAX {
         0.0
     } else {
@@ -812,7 +997,7 @@ fn preference_bonus(rank: usize, config: &WifiMonitorConfig) -> f64 {
 
 pub fn build_candidate_score(
     network: &Network,
-    config: &WifiMonitorConfig,
+    config: &BetterWifiConfig,
     priority: &[String],
     current_ssid: &str,
     current_health_penalty: f64,
@@ -832,6 +1017,28 @@ pub fn build_candidate_score(
         0.0
     };
 
+    build_candidate_score_with_join_failure_penalty(
+        network,
+        rank,
+        rssi_score,
+        band_bonus,
+        preference,
+        sticky,
+        health_penalty,
+        0.0,
+    )
+}
+
+fn build_candidate_score_with_join_failure_penalty(
+    network: &Network,
+    rank: usize,
+    rssi_score: f64,
+    band_bonus: f64,
+    preference: f64,
+    sticky: f64,
+    health_penalty: f64,
+    join_failure_penalty: f64,
+) -> CandidateScore {
     CandidateScore {
         network: network.clone(),
         rank,
@@ -840,13 +1047,16 @@ pub fn build_candidate_score(
         preference_bonus: preference,
         sticky_bonus: sticky,
         health_penalty,
-        total_score: rssi_score + band_bonus + preference + sticky - health_penalty,
+        join_failure_penalty,
+        total_score: rssi_score + band_bonus + preference + sticky
+            - health_penalty
+            - join_failure_penalty,
     }
 }
 
 fn dedupe_networks(
     networks: &[Network],
-    config: &WifiMonitorConfig,
+    config: &BetterWifiConfig,
     priority: &[String],
 ) -> Vec<Network> {
     let mut best = HashMap::<String, CandidateScore>::new();
@@ -860,7 +1070,7 @@ fn dedupe_networks(
     best.into_values().map(|entry| entry.network).collect()
 }
 
-fn score_network(network: &Network, config: &WifiMonitorConfig) -> f64 {
+fn score_network(network: &Network, config: &BetterWifiConfig) -> f64 {
     score_band(network, config) + (network.rssi as f64 + config.rssi_offset).clamp(0.0, 100.0)
 }
 
@@ -870,16 +1080,15 @@ pub fn describe_candidates(candidates: &[CandidateScore]) -> String {
     }
     let mut ranked = candidates.to_vec();
     ranked.sort_by(|left, right| {
-        right
-            .total_score
-            .total_cmp(&left.total_score)
+        switch_score(right)
+            .total_cmp(&switch_score(left))
             .then(left.rank.cmp(&right.rank))
     });
     ranked
         .iter()
         .map(|candidate| {
             format!(
-                "{}(band={}, rssi={}, pref={}, bandBonus={}, sticky={}, healthPenalty={}, total={})",
+                "{}(band={}, rssi={}, pref={}, bandBonus={}, sticky={}, healthPenalty={}, joinPenalty={}, total={}, switchScore={})",
                 candidate.network.ssid,
                 candidate.network.band,
                 candidate.network.rssi,
@@ -887,19 +1096,22 @@ pub fn describe_candidates(candidates: &[CandidateScore]) -> String {
                 format_metric(candidate.band_bonus),
                 format_metric(candidate.sticky_bonus),
                 format_metric(candidate.health_penalty),
-                format_metric(candidate.total_score)
+                format_metric(candidate.join_failure_penalty),
+                format_metric(candidate.total_score),
+                format_metric(switch_score(candidate))
             )
         })
         .collect::<Vec<_>>()
         .join("; ")
 }
 
-pub fn effective_current_ssid(current: &str, persisted: &str, networks: &[Network]) -> String {
+fn switch_score(candidate: &CandidateScore) -> f64 {
+    candidate.total_score - candidate.sticky_bonus
+}
+
+pub fn effective_current_ssid(current: &str, _persisted: &str, _networks: &[Network]) -> String {
     if !current.is_empty() {
         return current.to_string();
-    }
-    if !persisted.is_empty() && networks.iter().any(|network| network.ssid == persisted) {
-        return persisted.to_string();
     }
     String::new()
 }
@@ -907,16 +1119,15 @@ pub fn effective_current_ssid(current: &str, persisted: &str, networks: &[Networ
 pub fn decide_wifi_switch(
     current: &str,
     candidates: &[CandidateScore],
-    config: &WifiMonitorConfig,
+    config: &BetterWifiConfig,
     dwell_satisfied: bool,
     health_failure_streak: u64,
 ) -> String {
     let ranked = {
         let mut ranked = candidates.to_vec();
         ranked.sort_by(|left, right| {
-            right
-                .total_score
-                .total_cmp(&left.total_score)
+            switch_score(right)
+                .total_cmp(&switch_score(left))
                 .then(right.rank.cmp(&left.rank))
         });
         ranked
@@ -924,6 +1135,9 @@ pub fn decide_wifi_switch(
     let best = ranked.first();
     if best.is_none() {
         return format!("stay:{current}");
+    }
+    if current.is_empty() {
+        return "stay:".to_string();
     }
     let best = best.expect("candidate exists");
     let current_candidate = ranked
@@ -933,7 +1147,7 @@ pub fn decide_wifi_switch(
     let current = current_candidate
         .expect("current candidate should exist")
         .clone();
-    let delta = best.total_score - current.total_score;
+    let delta = switch_score(best) - switch_score(&current);
     if best.network.ssid == current.network.ssid {
         return format!("stay:{}", current.network.ssid);
     }
@@ -964,14 +1178,13 @@ fn build_decision_reason(
     decision: &str,
     current_ssid: &str,
     candidates: &[CandidateScore],
-    config: &WifiMonitorConfig,
+    config: &BetterWifiConfig,
     health_failure_streak: u64,
 ) -> String {
     let mut ranked = candidates.to_vec();
     ranked.sort_by(|left, right| {
-        right
-            .total_score
-            .total_cmp(&left.total_score)
+        switch_score(right)
+            .total_cmp(&switch_score(left))
             .then(left.rank.cmp(&right.rank))
     });
 
@@ -987,7 +1200,7 @@ fn build_decision_reason(
         .iter()
         .find(|candidate| candidate.network.ssid == current_ssid);
     let delta = current
-        .map(|candidate| best.total_score - candidate.total_score)
+        .map(|candidate| switch_score(best) - switch_score(candidate))
         .unwrap_or(0.0);
 
     if let Some(ssid) = decision.strip_prefix("hold:") {
@@ -1012,41 +1225,258 @@ fn build_decision_reason(
         );
     }
 
+    if current_ssid.is_empty() {
+        return "staying on current network; current SSID unavailable".to_string();
+    }
+
     if best.network.ssid == current_ssid || current.is_none() {
         return format!("staying on {current_label}");
     }
 
     format!(
-        "staying on {current_label}; best score delta {} is below required threshold",
+        "staying on {current_label}; best switch score delta {} is below required threshold",
         format_metric(delta)
     )
 }
 
 fn connect_network(device: &str, ssid: &str) -> anyhow::Result<()> {
-    let status = Command::new("networksetup")
-        .args(["-setairportnetwork", device, ssid])
-        .status()?;
-    if !status.success() {
-        anyhow::bail!("Could not switch Wi-Fi to {ssid}");
+    match run_networksetup_join(device, ssid, None)? {
+        JoinAttempt::Succeeded => return Ok(()),
+        JoinAttempt::Failed(message) => {
+            if let Some(password) = find_wifi_password(ssid) {
+                match run_networksetup_join(device, ssid, Some(&password))? {
+                    JoinAttempt::Succeeded => return Ok(()),
+                    JoinAttempt::Failed(password_message) => {
+                        anyhow::bail!(
+                            "Could not switch Wi-Fi to {ssid}: passwordless join failed: {}; password-backed join failed: {}",
+                            password_message_for_error(&message),
+                            password_message_for_error(&password_message)
+                        );
+                    }
+                }
+            }
+
+            anyhow::bail!("Could not switch Wi-Fi to {ssid}: {message}");
+        }
     }
-    Ok(())
 }
 
-fn load_config(context: &ModuleContext) -> WifiMonitorConfig {
+enum JoinAttempt {
+    Succeeded,
+    Failed(String),
+}
+
+fn run_networksetup_join(
+    device: &str,
+    ssid: &str,
+    password: Option<&str>,
+) -> anyhow::Result<JoinAttempt> {
+    let mut command = Command::new("networksetup");
+    command.args(["-setairportnetwork", device, ssid]);
+    if let Some(password) = password {
+        command.arg(password);
+    }
+    let output = command.output()?;
+    let message = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if !output.status.success() {
+        let details = message.trim();
+        if details.is_empty() {
+            return Ok(JoinAttempt::Failed("networksetup failed".to_string()));
+        }
+        return Ok(JoinAttempt::Failed(details.to_string()));
+    }
+    Ok(JoinAttempt::Succeeded)
+}
+
+fn find_wifi_password(ssid: &str) -> Option<String> {
+    password_from_env(ssid)
+        .or_else(|| password_from_scriptd_keychain(ssid))
+        .or_else(|| import_system_airport_password(ssid))
+}
+
+fn run_password_networksetup_join(device: &str, ssid: &str) -> Option<Result<(), String>> {
+    let password = find_wifi_password(ssid)?;
+    Some(
+        run_networksetup_join(device, ssid, Some(&password))
+            .map_err(|error| error.to_string())
+            .and_then(|attempt| match attempt {
+                JoinAttempt::Succeeded => Ok(()),
+                JoinAttempt::Failed(message) => Err(password_message_for_error(&message)),
+            }),
+    )
+}
+
+fn run_sudo_networksetup_join(device: &str, ssid: &str) -> anyhow::Result<JoinAttempt> {
+    let admin_password = scriptd_admin_password()
+        .map_err(|error| anyhow::anyhow!("scriptd admin password is unavailable: {error}"))?;
+
+    let mut command = Command::new("sudo");
+    command
+        .args([
+            "-S",
+            "-p",
+            "",
+            "networksetup",
+            "-setairportnetwork",
+            device,
+            ssid,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(format!("{admin_password}\n").as_bytes())?;
+        let _ = stdin.flush();
+    }
+    let output = child.wait_with_output()?;
+    let message = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if !output.status.success() {
+        let details = message.trim();
+        if details.is_empty() {
+            return Ok(JoinAttempt::Failed("sudo networksetup failed".to_string()));
+        }
+        return Ok(JoinAttempt::Failed(details.to_string()));
+    }
+    Ok(JoinAttempt::Succeeded)
+}
+
+fn scriptd_admin_password() -> anyhow::Result<String> {
+    credentials::admin_password_or_prompt(Some(credentials::LEGACY_BREW_ADMIN_SERVICE))
+}
+
+fn password_message_for_error(message: &str) -> String {
+    message.replace('\n', " ")
+}
+
+fn scriptd_better_wifi_keychain_service(ssid: &str) -> String {
+    credentials::scriptd_service("better-wifi", ssid)
+}
+
+fn legacy_scriptd_wifi_keychain_service(ssid: &str) -> String {
+    credentials::scriptd_service("wifi", ssid)
+}
+
+fn password_from_env(ssid: &str) -> Option<String> {
+    let specific_key = format!("BETTER_WIFI_PASSWORD_{}", env_key_suffix(ssid));
+    std::env::var(&specific_key)
+        .ok()
+        .or_else(|| std::env::var("BETTER_WIFI_PASSWORD").ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn password_from_scriptd_keychain(ssid: &str) -> Option<String> {
+    let service = scriptd_better_wifi_keychain_service(ssid);
+    if let Some(password) = credentials::find_generic_password(&service, ssid)
+        .ok()
+        .flatten()
+    {
+        return Some(password);
+    }
+
+    let legacy_service = legacy_scriptd_wifi_keychain_service(ssid);
+    let password = credentials::find_generic_password(&legacy_service, ssid)
+        .ok()
+        .flatten()?;
+    let _ = store_scriptd_wifi_password(ssid, &password);
+    Some(password)
+}
+
+fn password_from_system_airport_keychain(ssid: &str) -> anyhow::Result<Option<String>> {
+    let output = Command::new("security")
+        .args([
+            "find-generic-password",
+            "-w",
+            "-a",
+            ssid,
+            "/Library/Keychains/System.keychain",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let password = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok((!password.is_empty()).then_some(password))
+}
+
+fn import_system_airport_password(ssid: &str) -> Option<String> {
+    let password = password_from_system_airport_keychain(ssid).ok().flatten()?;
+    if store_scriptd_wifi_password(ssid, &password).is_err() {
+        return None;
+    }
+    Some(password)
+}
+
+fn store_scriptd_wifi_password(ssid: &str, password: &str) -> anyhow::Result<()> {
+    let service = scriptd_better_wifi_keychain_service(ssid);
+    credentials::store_generic_password(&service, ssid, password)
+}
+
+fn env_key_suffix(ssid: &str) -> String {
+    ssid.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn join_output_indicates_failure(output: &str) -> bool {
+    let normalized = output.to_ascii_lowercase();
+    normalized.contains("failed to join network") || normalized.contains("error:")
+}
+
+fn observed_current_ssid(device: &str, networks: &[Network]) -> String {
+    let current = current_ssid(device).unwrap_or_default();
+    if !current.is_empty() {
+        return current;
+    }
+    current_wifi_signal()
+        .ok()
+        .flatten()
+        .and_then(|signal| infer_current_ssid_from_signal(networks, signal))
+        .unwrap_or_default()
+}
+
+fn wait_for_connected_ssid(device: &str, target: &str, networks: &[Network]) -> bool {
+    for attempt in 0..12 {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        if observed_current_ssid(device, networks) == target {
+            return true;
+        }
+    }
+    false
+}
+
+fn load_config(context: &ModuleContext) -> BetterWifiConfig {
     let path = context.module_dir.join("module.yaml");
     let mut config = match fs::read_to_string(&path)
-        .map(|text| serde_yaml::from_str::<WifiMonitorConfig>(&text))
+        .map(|text| serde_yaml::from_str::<BetterWifiConfig>(&text))
     {
         Ok(Ok(value)) => value,
-        _ => WifiMonitorConfig::default(),
+        _ => BetterWifiConfig::default(),
     };
 
     let env = EnvMap::default();
-    config = resolve_wifi_monitor_config(&config, &env);
+    config = resolve_better_wifi_config(&config, &env);
 
     let home_dir = crate::paths::home_dir().to_string_lossy().to_string();
     config.state_file = if config.state_file.is_empty() {
-        format!("{home_dir}/.local/share/wifi-monitor/state.txt")
+        format!("{home_dir}/.local/share/better-wifi/state.txt")
     } else {
         config.state_file
     };
@@ -1058,13 +1488,60 @@ fn load_config(context: &ModuleContext) -> WifiMonitorConfig {
     config
 }
 
+fn preferred_ssids(device: &str) -> anyhow::Result<Vec<String>> {
+    let output = Command::new("networksetup")
+        .args(["-listpreferredwirelessnetworks", device])
+        .output()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    Ok(text
+        .lines()
+        .skip(1)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>())
+}
+
+fn setup_candidate_ssids(config: &BetterWifiConfig, device: &str) -> anyhow::Result<Vec<String>> {
+    let preferences = preferred_ssids(device)?;
+    let mut ssids = Vec::new();
+
+    for ssid in config.ssids.iter().chain(preferences.iter()) {
+        if !ssids.contains(ssid) {
+            ssids.push(ssid.clone());
+        }
+    }
+
+    if ssids.is_empty() {
+        let scanned = parse_networks(&[]);
+        for network in dedupe_networks(&scanned, config, &[]) {
+            if !ssids.contains(&network.ssid) {
+                ssids.push(network.ssid);
+            }
+        }
+    }
+
+    Ok(ssids)
+}
+
+#[cfg(test)]
+fn setup_candidate_ssids_from_lists(configured: &[String], preferences: &[String]) -> Vec<String> {
+    let mut ssids = Vec::new();
+    for ssid in configured.iter().chain(preferences.iter()) {
+        if !ssids.contains(ssid) {
+            ssids.push(ssid.clone());
+        }
+    }
+    ssids
+}
+
 fn parse_networks(allowed: &[String]) -> Vec<Network> {
     scan_networks(allowed)
 }
 
 fn build_candidate(
     network: &Network,
-    config: &WifiMonitorConfig,
+    config: &BetterWifiConfig,
     priority_order: &[String],
     current_ssid: &str,
     current_health_penalty: f64,
@@ -1078,24 +1555,25 @@ fn build_candidate(
     )
 }
 
+fn with_join_failure_penalty(
+    mut candidate: CandidateScore,
+    join_failure_penalty: f64,
+) -> CandidateScore {
+    if join_failure_penalty <= 0.0 {
+        return candidate;
+    }
+    candidate.join_failure_penalty = join_failure_penalty;
+    candidate.total_score -= join_failure_penalty;
+    candidate
+}
+
 pub fn run_once(context: &mut ModuleContext) -> anyhow::Result<Option<ModuleStatus>> {
     let config = load_config(context);
     let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
     let device = parse_wifi_device()?;
     let now = Utc::now();
     let current = current_ssid(&device)?;
-    let preferences = {
-        let output = Command::new("networksetup")
-            .args(["-listpreferredwirelessnetworks", &device])
-            .output()?;
-        let text = String::from_utf8_lossy(&output.stdout);
-        text.lines()
-            .skip(1)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-            .collect::<Vec<_>>()
-    };
+    let preferences = preferred_ssids(&device)?;
     let allowed = if config.ssids.is_empty() {
         preferences
     } else {
@@ -1104,7 +1582,18 @@ pub fn run_once(context: &mut ModuleContext) -> anyhow::Result<Option<ModuleStat
     let scanned = parse_networks(&allowed);
     let persisted = read_state(&config.state_file);
     let networks = dedupe_networks(&scanned, &config, &allowed);
+    let current = if current.is_empty() {
+        current_wifi_signal()?
+            .and_then(|signal| infer_current_ssid_from_signal(&networks, signal))
+            .unwrap_or_default()
+    } else {
+        current
+    };
     let effective = effective_current_ssid(&current, &persisted.last_ssid, &networks);
+    let mut join_failures = prune_join_failures(&persisted.join_failures, now);
+    if !effective.is_empty() {
+        join_failures.remove(&effective);
+    }
     let current_health = ping_health(
         &config.ping_target,
         &config,
@@ -1127,12 +1616,19 @@ pub fn run_once(context: &mut ModuleContext) -> anyhow::Result<Option<ModuleStat
     let candidates = networks
         .iter()
         .map(|network| {
-            build_candidate(
-                network,
-                &config,
-                &allowed,
-                &effective,
-                current_health.penalty,
+            with_join_failure_penalty(
+                build_candidate(
+                    network,
+                    &config,
+                    &allowed,
+                    &effective,
+                    current_health.penalty,
+                ),
+                if network.ssid == effective {
+                    0.0
+                } else {
+                    join_failure_penalty(&network.ssid, &join_failures, now)
+                },
             )
         })
         .collect::<Vec<_>>();
@@ -1203,8 +1699,243 @@ pub fn run_once(context: &mut ModuleContext) -> anyhow::Result<Option<ModuleStat
                         ])),
                     }));
                 }
-                connect_network(&device, to)?;
+                if let Err(error) = connect_network(&device, to) {
+                    let failed_at = Utc::now().to_rfc3339();
+                    let message = error.to_string();
+                    let mut updated_join_failures = join_failures.clone();
+                    updated_join_failures.insert(
+                        to.to_string(),
+                        StoredJoinFailure {
+                            failed_at,
+                            message: message.clone(),
+                        },
+                    );
+                    let detected_current = !effective.is_empty();
+                    let last_ssid = if detected_current {
+                        effective.clone()
+                    } else {
+                        persisted.last_ssid.clone()
+                    };
+                    let last_connected_at = if detected_current && persisted.last_ssid != effective
+                    {
+                        Some(Utc::now().to_rfc3339())
+                    } else {
+                        persisted.last_connected_at
+                    };
+                    write_state(
+                        &config.state_file,
+                        &PersistedWifiState {
+                            last_ssid,
+                            last_connected_at,
+                            last_switch_at: persisted.last_switch_at,
+                            health_failure_streak: next_failure_streak,
+                            last_health: Some(StoredHealth {
+                                packet_loss_percent: current_health.packet_loss_percent,
+                                avg_latency_ms: current_health.avg_latency_ms,
+                            }),
+                            join_failures: updated_join_failures,
+                        },
+                    );
+                    let warning = format!(
+                        "{message}; suppressing {to} for {} minutes",
+                        JOIN_FAILURE_COOLDOWN_SECONDS / 60
+                    );
+                    state.last_decision = Some(warning.clone());
+                    state.last_error = None;
+                    context.logger.warn(&warning);
+                    return Ok(Some(ModuleStatus {
+                        state: "running".to_string(),
+                        message: state.last_decision.clone(),
+                        started_at: None,
+                        last_run_at: state.last_run_at.clone(),
+                        next_run_at: None,
+                        metrics: Some(HashMap::from([
+                            (
+                                "loops".to_string(),
+                                serde_json::Value::from(state.loop_count),
+                            ),
+                            (
+                                "connected".to_string(),
+                                serde_json::Value::String(state.current_ssid.clone()),
+                            ),
+                        ])),
+                    }));
+                }
+                if !wait_for_connected_ssid(&device, to, &networks) {
+                    let password_retry = run_password_networksetup_join(&device, to);
+                    if matches!(password_retry, Some(Ok(())))
+                        && wait_for_connected_ssid(&device, to, &networks)
+                    {
+                        let switched_at = Utc::now().to_rfc3339();
+                        let mut updated_join_failures = join_failures.clone();
+                        updated_join_failures.remove(to);
+                        write_state(
+                            &config.state_file,
+                            &PersistedWifiState {
+                                last_ssid: to.to_string(),
+                                last_connected_at: Some(switched_at.clone()),
+                                last_switch_at: Some(switched_at.clone()),
+                                health_failure_streak: 0,
+                                last_health: Some(StoredHealth {
+                                    packet_loss_percent: current_health.packet_loss_percent,
+                                    avg_latency_ms: current_health.avg_latency_ms,
+                                }),
+                                join_failures: updated_join_failures,
+                            },
+                        );
+                        state.last_error = None;
+                        state.current_ssid = to.to_string();
+                        state.last_switch_at = Some(switched_at);
+                        context.logger.info(&format!(
+                            "{decision_reason}; verified after password-backed networksetup retry"
+                        ));
+                        return Ok(Some(ModuleStatus {
+                            state: "running".to_string(),
+                            message: state.last_decision.clone(),
+                            started_at: None,
+                            last_run_at: state.last_run_at.clone(),
+                            next_run_at: None,
+                            metrics: Some(HashMap::from([
+                                (
+                                    "loops".to_string(),
+                                    serde_json::Value::from(state.loop_count),
+                                ),
+                                (
+                                    "connected".to_string(),
+                                    serde_json::Value::String(state.current_ssid.clone()),
+                                ),
+                            ])),
+                        }));
+                    }
+                    let elevated = run_sudo_networksetup_join(&device, to)
+                        .map_err(|error| error.to_string())
+                        .and_then(|attempt| match attempt {
+                            JoinAttempt::Succeeded => Ok(()),
+                            JoinAttempt::Failed(message) => Err(message),
+                        });
+                    if elevated.is_ok() && wait_for_connected_ssid(&device, to, &networks) {
+                        let switched_at = Utc::now().to_rfc3339();
+                        let mut updated_join_failures = join_failures.clone();
+                        updated_join_failures.remove(to);
+                        write_state(
+                            &config.state_file,
+                            &PersistedWifiState {
+                                last_ssid: to.to_string(),
+                                last_connected_at: Some(switched_at.clone()),
+                                last_switch_at: Some(switched_at.clone()),
+                                health_failure_streak: 0,
+                                last_health: Some(StoredHealth {
+                                    packet_loss_percent: current_health.packet_loss_percent,
+                                    avg_latency_ms: current_health.avg_latency_ms,
+                                }),
+                                join_failures: updated_join_failures,
+                            },
+                        );
+                        state.last_error = None;
+                        state.current_ssid = to.to_string();
+                        state.last_switch_at = Some(switched_at);
+                        context.logger.info(&format!(
+                            "{decision_reason}; verified after elevated networksetup retry"
+                        ));
+                        return Ok(Some(ModuleStatus {
+                            state: "running".to_string(),
+                            message: state.last_decision.clone(),
+                            started_at: None,
+                            last_run_at: state.last_run_at.clone(),
+                            next_run_at: None,
+                            metrics: Some(HashMap::from([
+                                (
+                                    "loops".to_string(),
+                                    serde_json::Value::from(state.loop_count),
+                                ),
+                                (
+                                    "connected".to_string(),
+                                    serde_json::Value::String(state.current_ssid.clone()),
+                                ),
+                            ])),
+                        }));
+                    }
+                    let failed_at = Utc::now().to_rfc3339();
+                    let password_retry_message = match password_retry {
+                        Some(Ok(())) => {
+                            "password-backed networksetup completed but target was not observed"
+                                .to_string()
+                        }
+                        Some(Err(error)) => {
+                            format!("password-backed retry failed: {error}")
+                        }
+                        None => "no provisioned Wi-Fi password available".to_string(),
+                    };
+                    let elevated_message = match elevated {
+                        Ok(()) => "elevated networksetup completed but target was not observed"
+                            .to_string(),
+                        Err(error) => format!("elevated retry failed: {error}"),
+                    };
+                    let message = format!(
+                        "networksetup completed but {to} was not observed as current; {password_retry_message}; {elevated_message}"
+                    );
+                    let mut updated_join_failures = join_failures.clone();
+                    updated_join_failures.insert(
+                        to.to_string(),
+                        StoredJoinFailure {
+                            failed_at,
+                            message: message.clone(),
+                        },
+                    );
+                    let detected_current = !effective.is_empty();
+                    let last_ssid = if detected_current {
+                        effective.clone()
+                    } else {
+                        persisted.last_ssid.clone()
+                    };
+                    let last_connected_at = if detected_current && persisted.last_ssid != effective
+                    {
+                        Some(Utc::now().to_rfc3339())
+                    } else {
+                        persisted.last_connected_at
+                    };
+                    write_state(
+                        &config.state_file,
+                        &PersistedWifiState {
+                            last_ssid,
+                            last_connected_at,
+                            last_switch_at: persisted.last_switch_at,
+                            health_failure_streak: next_failure_streak,
+                            last_health: Some(StoredHealth {
+                                packet_loss_percent: current_health.packet_loss_percent,
+                                avg_latency_ms: current_health.avg_latency_ms,
+                            }),
+                            join_failures: updated_join_failures,
+                        },
+                    );
+                    let warning = format!(
+                        "{message}; suppressing {to} for {} minutes",
+                        JOIN_FAILURE_COOLDOWN_SECONDS / 60
+                    );
+                    state.last_decision = Some(warning.clone());
+                    state.last_error = None;
+                    context.logger.warn(&warning);
+                    return Ok(Some(ModuleStatus {
+                        state: "running".to_string(),
+                        message: state.last_decision.clone(),
+                        started_at: None,
+                        last_run_at: state.last_run_at.clone(),
+                        next_run_at: None,
+                        metrics: Some(HashMap::from([
+                            (
+                                "loops".to_string(),
+                                serde_json::Value::from(state.loop_count),
+                            ),
+                            (
+                                "connected".to_string(),
+                                serde_json::Value::String(state.current_ssid.clone()),
+                            ),
+                        ])),
+                    }));
+                }
                 let switched_at = Utc::now().to_rfc3339();
+                let mut updated_join_failures = join_failures.clone();
+                updated_join_failures.remove(to);
                 write_state(
                     &config.state_file,
                     &PersistedWifiState {
@@ -1216,6 +1947,7 @@ pub fn run_once(context: &mut ModuleContext) -> anyhow::Result<Option<ModuleStat
                             packet_loss_percent: current_health.packet_loss_percent,
                             avg_latency_ms: current_health.avg_latency_ms,
                         }),
+                        join_failures: updated_join_failures,
                     },
                 );
                 state.last_error = None;
@@ -1230,23 +1962,39 @@ pub fn run_once(context: &mut ModuleContext) -> anyhow::Result<Option<ModuleStat
             } else {
                 context.logger.info(&decision_reason);
             }
+            let detected_current = !effective.is_empty();
+            let persisted_matches_current = detected_current && persisted.last_ssid == effective;
+            let last_ssid = if detected_current {
+                effective.clone()
+            } else {
+                persisted.last_ssid.clone()
+            };
+            let last_connected_at = if persisted_matches_current {
+                persisted.last_connected_at
+            } else {
+                Some(Utc::now().to_rfc3339())
+            };
+            let last_switch_at = if detected_current && !persisted_matches_current {
+                None
+            } else {
+                persisted.last_switch_at
+            };
+            let mut updated_join_failures = join_failures.clone();
+            if detected_current {
+                updated_join_failures.remove(&effective);
+            }
             write_state(
                 &config.state_file,
                 &PersistedWifiState {
-                    last_ssid: if effective.is_empty() {
-                        persisted.last_ssid
-                    } else {
-                        effective
-                    },
-                    last_connected_at: persisted
-                        .last_connected_at
-                        .or(Some(Utc::now().to_rfc3339())),
-                    last_switch_at: persisted.last_switch_at,
+                    last_ssid,
+                    last_connected_at,
+                    last_switch_at,
                     health_failure_streak: next_failure_streak,
                     last_health: Some(StoredHealth {
                         packet_loss_percent: current_health.packet_loss_percent,
                         avg_latency_ms: current_health.avg_latency_ms,
                     }),
+                    join_failures: updated_join_failures,
                 },
             );
             state.last_error = None;
@@ -1277,6 +2025,55 @@ pub fn setup(context: &mut ModuleContext) -> anyhow::Result<()> {
     if !path.exists() {
         return Err(anyhow::anyhow!("Missing module yaml: {}", path.display()));
     }
+
+    let config = load_config(context);
+    let device = parse_wifi_device()?;
+    let ssids = setup_candidate_ssids(&config, &device)?;
+
+    if ssids.is_empty() {
+        context
+            .logger
+            .warn("No configured or visible preferred Wi-Fi SSIDs found; no passwords imported");
+        return Ok(());
+    }
+
+    let mut imported = 0usize;
+    let mut existing = 0usize;
+    let mut skipped = 0usize;
+
+    for ssid in ssids {
+        if password_from_scriptd_keychain(&ssid).is_some() {
+            existing += 1;
+            context.logger.info(&format!(
+                "Wi-Fi password for {ssid} is already provisioned in scriptd keychain"
+            ));
+            continue;
+        }
+
+        match password_from_system_airport_keychain(&ssid)? {
+            Some(password) => {
+                store_scriptd_wifi_password(&ssid, &password)?;
+                imported += 1;
+                context.logger.info(&format!(
+                    "Imported Wi-Fi password for {ssid} into scriptd keychain"
+                ));
+            }
+            None => {
+                skipped += 1;
+                context.logger.warn(&format!(
+                    "No readable System keychain Wi-Fi password found for {ssid}; skipped"
+                ));
+            }
+        }
+    }
+
+    if imported == 0 && existing == 0 {
+        anyhow::bail!("No Wi-Fi passwords were provisioned for better-wifi");
+    }
+
+    context.logger.info(&format!(
+        "better-wifi setup complete; imported {imported}, already provisioned {existing}, skipped {skipped}"
+    ));
     Ok(())
 }
 
@@ -1328,7 +2125,7 @@ pub fn status() -> Option<(ModuleStatus, ModuleHealth)> {
         },
         ModuleHealth {
             ok: true,
-            message: Some("wifi monitor healthy".to_string()),
+            message: Some("better wifi healthy".to_string()),
         },
     ))
 }
@@ -1339,7 +2136,7 @@ mod tests {
 
     #[test]
     fn wifi_scoring_prefers_preference_order() {
-        let config = WifiMonitorConfig {
+        let config = BetterWifiConfig {
             ssids: vec!["Office".to_string(), "Home".to_string()],
             ..Default::default()
         };
@@ -1368,7 +2165,7 @@ mod tests {
 
     #[test]
     fn decision_switches_when_gap_big_enough() {
-        let config = WifiMonitorConfig {
+        let config = BetterWifiConfig {
             min_switch_score_delta: 10.0,
             ..Default::default()
         };
@@ -1475,7 +2272,7 @@ TestNet              00:99:88:77:66:55 -65 233 WPA3(PSK/AES/AES)\n";
 
         let degraded = ping_health(
             "",
-            &WifiMonitorConfig {
+            &BetterWifiConfig {
                 ping_high_latency_ms: 250,
                 ..Default::default()
             },
@@ -1485,8 +2282,8 @@ TestNet              00:99:88:77:66:55 -65 233 WPA3(PSK/AES/AES)\n";
         assert_eq!(degraded.penalty, 45.0);
     }
 
-    fn default_wifi_config() -> WifiMonitorConfig {
-        WifiMonitorConfig {
+    fn default_wifi_config() -> BetterWifiConfig {
+        BetterWifiConfig {
             min_dwell_seconds: 180,
             ping_target: "1.1.1.1".to_string(),
             ping_count: 3,
@@ -1500,7 +2297,7 @@ TestNet              00:99:88:77:66:55 -65 233 WPA3(PSK/AES/AES)\n";
             preference_rank_decay: 5.0,
             current_sticky_bonus: 25.0,
             rssi_offset: 100.0,
-            min_switch_score_delta: 25.0,
+            min_switch_score_delta: 10.0,
             ssids: Vec::new(),
             state_file: String::new(),
             config_path: String::new(),
@@ -1508,8 +2305,185 @@ TestNet              00:99:88:77:66:55 -65 233 WPA3(PSK/AES/AES)\n";
     }
 
     #[test]
+    fn wifi_parses_current_ssid_from_networksetup() {
+        assert_eq!(
+            parse_networksetup_current_ssid("Current Wi-Fi Network: Yousuf WiFi\n"),
+            Some("Yousuf WiFi".to_string())
+        );
+        assert_eq!(
+            parse_networksetup_current_ssid("Current AirPort Network: Office 5G\n"),
+            Some("Office 5G".to_string())
+        );
+        assert_eq!(
+            parse_networksetup_current_ssid("You are not associated with an AirPort network.\n"),
+            None
+        );
+        assert_eq!(
+            parse_networksetup_current_ssid("Current Wi-Fi Network: <redacted>\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn wifi_parses_current_ssid_from_ipconfig_summary() {
+        let summary = r#"<dictionary> {
+  InterfaceType : WiFi
+  LinkStatusActive : TRUE
+  NetworkID : 0x123
+  SSID : Yousuf WiFi
+  Security : WPA2_PSK
+}"#;
+
+        assert_eq!(
+            parse_ipconfig_current_ssid(summary),
+            Some("Yousuf WiFi".to_string())
+        );
+        assert_eq!(parse_ipconfig_current_ssid("  SSID : <redacted>\n"), None);
+    }
+
+    #[test]
+    fn wifi_infers_current_ssid_from_unique_signal_match() {
+        let networks = vec![
+            Network {
+                ssid: "Yousuf WiFi".to_string(),
+                band: "2g".to_string(),
+                rssi: -61,
+                channel: "10".to_string(),
+                security: "WPA2".to_string(),
+                ping_ms: None,
+            },
+            Network {
+                ssid: "knight_riders_5G".to_string(),
+                band: "5g".to_string(),
+                rssi: -65,
+                channel: "161".to_string(),
+                security: "WPA2".to_string(),
+                ping_ms: None,
+            },
+        ];
+
+        assert_eq!(
+            parse_wifi_signal_output("10\t-67\n"),
+            Some(WifiSignal {
+                channel: 10,
+                rssi: -67,
+            })
+        );
+        assert_eq!(
+            infer_current_ssid_from_signal(
+                &networks,
+                WifiSignal {
+                    channel: 10,
+                    rssi: -67,
+                }
+            ),
+            Some("Yousuf WiFi".to_string())
+        );
+    }
+
+    #[test]
+    fn wifi_does_not_infer_current_ssid_from_ambiguous_signal_match() {
+        let networks = vec![
+            Network {
+                ssid: "first".to_string(),
+                band: "2g".to_string(),
+                rssi: -61,
+                channel: "10".to_string(),
+                security: "WPA2".to_string(),
+                ping_ms: None,
+            },
+            Network {
+                ssid: "second".to_string(),
+                band: "2g".to_string(),
+                rssi: -61,
+                channel: "10".to_string(),
+                security: "WPA2".to_string(),
+                ping_ms: None,
+            },
+        ];
+
+        assert_eq!(
+            infer_current_ssid_from_signal(
+                &networks,
+                WifiSignal {
+                    channel: 10,
+                    rssi: -64,
+                }
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn wifi_join_output_detects_networksetup_failure_with_zero_exit_style_output() {
+        assert!(join_output_indicates_failure(
+            "Failed to join network knight_riders_5G.\nError: -3900  The operation couldn't be completed."
+        ));
+        assert!(!join_output_indicates_failure(""));
+    }
+
+    #[test]
+    fn wifi_join_failure_penalty_expires_after_cooldown() {
+        let now = Utc::now();
+        let mut failures = HashMap::new();
+        failures.insert(
+            "blocked".to_string(),
+            StoredJoinFailure {
+                failed_at: now.to_rfc3339(),
+                message: "failed".to_string(),
+            },
+        );
+        failures.insert(
+            "old".to_string(),
+            StoredJoinFailure {
+                failed_at: (now - chrono::Duration::minutes(20)).to_rfc3339(),
+                message: "old failure".to_string(),
+            },
+        );
+
+        let pruned = prune_join_failures(&failures, now);
+        assert!(pruned.contains_key("blocked"));
+        assert!(!pruned.contains_key("old"));
+        assert_eq!(
+            join_failure_penalty("blocked", &pruned, now),
+            JOIN_FAILURE_SCORE_PENALTY
+        );
+        assert_eq!(join_failure_penalty("old", &pruned, now), 0.0);
+    }
+
+    #[test]
+    fn wifi_password_env_key_suffix_is_shell_safe() {
+        assert_eq!(env_key_suffix("knight_riders_5G"), "KNIGHT_RIDERS_5G");
+        assert_eq!(env_key_suffix("Yousuf WiFi"), "YOUSUF_WIFI");
+        assert_eq!(
+            scriptd_better_wifi_keychain_service("knight_riders_5G"),
+            "scriptd-better-wifi:knight_riders_5G"
+        );
+    }
+
+    #[test]
+    fn wifi_setup_imports_configured_and_all_preferred_ssids() {
+        let configured = vec!["knight_riders_5G".to_string(), "Yousuf WiFi".to_string()];
+        let preferences = vec![
+            "Yousuf WiFi".to_string(),
+            "Cafe".to_string(),
+            "knight_riders".to_string(),
+        ];
+
+        assert_eq!(
+            setup_candidate_ssids_from_lists(&configured, &preferences),
+            vec![
+                "knight_riders_5G".to_string(),
+                "Yousuf WiFi".to_string(),
+                "Cafe".to_string(),
+                "knight_riders".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn wifi_decision_prefers_current_network_when_below_threshold() {
-        let config = WifiMonitorConfig {
+        let config = BetterWifiConfig {
             min_switch_score_delta: 25.0,
             ..Default::default()
         };
@@ -1549,8 +2523,56 @@ TestNet              00:99:88:77:66:55 -65 233 WPA3(PSK/AES/AES)\n";
     }
 
     #[test]
+    fn wifi_decision_switches_when_non_sticky_score_clears_threshold() {
+        let config = BetterWifiConfig {
+            min_switch_score_delta: 25.0,
+            current_sticky_bonus: 25.0,
+            ..Default::default()
+        };
+        let candidates = vec![
+            build_candidate_score(
+                &Network {
+                    ssid: "Yousuf WiFi".to_string(),
+                    band: "2g".to_string(),
+                    rssi: -67,
+                    channel: "10".to_string(),
+                    security: "WPA2".to_string(),
+                    ping_ms: None,
+                },
+                &config,
+                &["Yousuf WiFi".to_string(), "knight_riders_5G".to_string()],
+                "Yousuf WiFi",
+                0.0,
+            ),
+            build_candidate_score(
+                &Network {
+                    ssid: "knight_riders_5G".to_string(),
+                    band: "5g".to_string(),
+                    rssi: -70,
+                    channel: "161".to_string(),
+                    security: "WPA2".to_string(),
+                    ping_ms: None,
+                },
+                &config,
+                &["Yousuf WiFi".to_string(), "knight_riders_5G".to_string()],
+                "Yousuf WiFi",
+                0.0,
+            ),
+        ];
+
+        assert_eq!(
+            switch_score(&candidates[1]) - switch_score(&candidates[0]),
+            27.0
+        );
+        assert_eq!(
+            decide_wifi_switch("Yousuf WiFi", &candidates, &config, true, 0),
+            "switch:Yousuf WiFi:knight_riders_5G"
+        );
+    }
+
+    #[test]
     fn wifi_decision_switches_after_health_failure_streak() {
-        let config = WifiMonitorConfig {
+        let config = BetterWifiConfig {
             min_switch_score_delta: 1_000.0,
             health_failure_switch_runs: 2,
             ..Default::default()
@@ -1594,7 +2616,7 @@ TestNet              00:99:88:77:66:55 -65 233 WPA3(PSK/AES/AES)\n";
     }
 
     #[test]
-    fn wifi_effective_current_ssid_prefers_last_known_when_undetected() {
+    fn wifi_effective_current_ssid_does_not_use_last_known_when_undetected() {
         let known = vec![
             Network {
                 ssid: "stored".to_string(),
@@ -1614,7 +2636,7 @@ TestNet              00:99:88:77:66:55 -65 233 WPA3(PSK/AES/AES)\n";
             },
         ];
 
-        assert_eq!(effective_current_ssid("", "stored", &known), "stored");
+        assert_eq!(effective_current_ssid("", "stored", &known), "");
         assert_eq!(effective_current_ssid("", "missing", &known), "");
         assert_eq!(
             effective_current_ssid("visible", "stored", &known),
@@ -1629,22 +2651,19 @@ TestNet              00:99:88:77:66:55 -65 233 WPA3(PSK/AES/AES)\n";
 
         let env = EnvMap {
             values: vec![
-                ("WIFI_MONITOR_SSIDS".to_string(), "Office,Lab".to_string()),
+                ("BETTER_WIFI_SSIDS".to_string(), "Office,Lab".to_string()),
+                ("BETTER_WIFI_PING_TARGET".to_string(), "8.8.8.8".to_string()),
                 (
-                    "WIFI_MONITOR_PING_TARGET".to_string(),
-                    "8.8.8.8".to_string(),
-                ),
-                (
-                    "WIFI_MONITOR_MIN_SWITCH_SCORE_DELTA".to_string(),
+                    "BETTER_WIFI_MIN_SWITCH_SCORE_DELTA".to_string(),
                     "41.5".to_string(),
                 ),
-                ("WIFI_MONITOR_PING_COUNT".to_string(), "7".to_string()),
+                ("BETTER_WIFI_PING_COUNT".to_string(), "7".to_string()),
             ]
             .into_iter()
             .collect(),
         };
 
-        let resolved = resolve_wifi_monitor_config(&raw, &env);
+        let resolved = resolve_better_wifi_config(&raw, &env);
         assert_eq!(resolved.ping_target, "8.8.8.8");
         assert_eq!(resolved.min_switch_score_delta, 41.5);
         assert_eq!(resolved.ping_count, 7);
@@ -1657,16 +2676,16 @@ TestNet              00:99:88:77:66:55 -65 233 WPA3(PSK/AES/AES)\n";
     #[test]
     fn wifi_resolves_module_yaml_state_file_when_env_absent() {
         let mut raw = default_wifi_config();
-        raw.state_file = "/tmp/scriptd-wifi-state.json".to_string();
+        raw.state_file = "/tmp/scriptd-better-wifi-state.json".to_string();
 
-        let resolved = resolve_wifi_monitor_config(
+        let resolved = resolve_better_wifi_config(
             &raw,
             &EnvMap {
                 values: std::collections::HashMap::new(),
             },
         );
 
-        assert_eq!(resolved.state_file, "/tmp/scriptd-wifi-state.json");
+        assert_eq!(resolved.state_file, "/tmp/scriptd-better-wifi-state.json");
     }
 
     #[test]

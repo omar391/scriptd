@@ -46,7 +46,7 @@ Repo layout:
     │   ├── status.rs
     │   └── modules.rs
 └── modules/
-    ├── wifi-monitor/
+    ├── better-wifi/
     ├── cpu-monitor/
     └── brew-manager/
 ```
@@ -61,7 +61,7 @@ Repo layout:
 
 Module-specific tools:
 
-- `wifi-monitor`: `networksetup`, `ping`, and `airport` CLI fallback path
+- `better-wifi`: `networksetup`, `ping`, and `airport` CLI fallback path
 - `cpu-monitor`: sysinfo process inspection plus command-level signal support when needed
 - `brew-manager`: Homebrew, `security`, and `sudo`
 
@@ -116,7 +116,7 @@ label: com.omar.scriptd
 log_dir: ~/Library/Logs/scriptd
 watch: true
 modules:
-  wifi-monitor:
+  better-wifi:
     enabled: false
     schedule:
       every_minutes: 5
@@ -168,7 +168,7 @@ Module-specific algorithm settings still live in each module's `module.yaml`.
 Update module enablement and schedules with `setup <module>`:
 
 ```bash
-./scriptd.sh setup wifi-monitor --enable --every-minutes 5
+./scriptd.sh setup better-wifi --enable --every-minutes 5
 ./scriptd.sh setup cpu-monitor --disable
 ./scriptd.sh setup brew-manager --enable --daily-at 09:30 --weekday mon --weekday wed --weekday fri
 ./scriptd.sh setup brew-manager --cron "0 0 */12 * * *"
@@ -178,16 +178,16 @@ Run `./scriptd.sh start root` after changing setup flags to install/update the L
 
 ## Bundled Modules
 
-### `wifi-monitor`
+### `better-wifi`
 
 - Mode: `interval`
 - Default: disabled
 - Default schedule: every 5 minutes
 - Purpose: scans nearby Wi-Fi networks, scores candidates, and switches to the best allowed SSID
-- Inputs: preferred network list or `ssids` configured in `modules/wifi-monitor/module.yaml`
+- Inputs: preferred network list or `ssids` configured in `modules/better-wifi/module.yaml`
 - Tuning: dwell time, ping target, manual SSID priority, band bonuses, RSSI offset, switch threshold
 
-See [`modules/wifi-monitor/README.md`](./modules/wifi-monitor/README.md).
+See [`modules/better-wifi/README.md`](./modules/better-wifi/README.md).
 
 ### `cpu-monitor`
 

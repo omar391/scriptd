@@ -5,9 +5,9 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use anyhow::{bail, Context};
-use rpassword::read_password;
 use serde::{Deserialize, Serialize};
 
+use crate::credentials;
 use crate::modules::{ModuleContext, ModuleHealth, ModuleLogger, ModuleStatus};
 use crate::paths::expand_home;
 
@@ -105,34 +105,7 @@ fn run_command(
 }
 
 fn keychain_password(config: &BrewManagerConfig) -> anyhow::Result<String> {
-    let (stdout, _stderr, code) = run_command(
-        "security",
-        &[
-            "find-generic-password",
-            "-s",
-            &config.keychain_service,
-            "-a",
-            &std::env::var("USER").unwrap_or_default(),
-            "-w",
-        ],
-        None,
-        None,
-    )?;
-    if code != 0 {
-        return Ok(String::new());
-    }
-    Ok(stdout.trim().to_string())
-}
-
-fn verify_password(password: &str) -> bool {
-    let (_stdout, _stderr, code) = run_command(
-        "sudo",
-        &["-S", "-k", "-v"],
-        Some(&format!("{password}\n")),
-        None,
-    )
-    .unwrap_or_default();
-    code == 0
+    Ok(credentials::admin_password(Some(&config.keychain_service))?.unwrap_or_default())
 }
 
 fn cleanup_legacy_logs(config: &BrewManagerConfig, logger: &ModuleLogger) {
@@ -182,11 +155,9 @@ fn write_askpass(config: &BrewManagerConfig, logger: &ModuleLogger) -> anyhow::R
     }
     fs::create_dir_all(path.parent().expect("path has parent"))?;
     let mut file = fs::File::create(&path)?;
-    let script = format!(
-        "#!/bin/bash\nsecurity find-generic-password -s \"{}\" -a \"{}\" -w\n",
-        config.keychain_service,
-        std::env::var("USER").unwrap_or_default()
-    );
+    let script = "#!/bin/bash\n\
+echo \"scriptd brew-manager sudoers setup is required\" >&2\n\
+exit 1\n";
     file.write_all(script.as_bytes())?;
     let _ = Command::new("chmod")
         .args(["+x", &path.to_string_lossy()])
@@ -377,61 +348,12 @@ fn brew_maintenance(
 
 pub fn setup(context: &mut ModuleContext) -> anyhow::Result<()> {
     let config = update_from_config(&context.module_dir);
-    let existing = keychain_password(&config).unwrap_or_default();
-    if !existing.is_empty() && verify_password(&existing) {
-        context
-            .logger
-            .info("brew-manager setup already provisioned");
-        return Ok(());
-    }
-
-    if !existing.is_empty() {
-        let _ = run_command(
-            "security",
-            &[
-                "delete-generic-password",
-                "-s",
-                &config.keychain_service,
-                "-a",
-                &std::env::var("USER").unwrap_or_default(),
-            ],
-            None,
-            None,
-        );
-    }
-
-    for _ in 0..3 {
-        context.logger.warn("Enter your sudo password:");
-        let password =
-            read_password().map_err(|error| anyhow::anyhow!("failed to read password: {error}"))?;
-        if !verify_password(&password) {
-            context.logger.warn("Password verification failed");
-            continue;
-        }
-
-        run_command(
-            "security",
-            &[
-                "add-generic-password",
-                "-U",
-                "-s",
-                &config.keychain_service,
-                "-a",
-                &std::env::var("USER").unwrap_or_default(),
-                "-w",
-                &password,
-            ],
-            None,
-            None,
-        )?;
-        write_askpass(&config, &context.logger)?;
-        configure_sudo(&config, &password, &context.logger)?;
-        context.logger.info("brew-manager setup complete");
-        println!("brew-manager setup complete.");
-        return Ok(());
-    }
-
-    bail!("could not verify password after 3 attempts");
+    let password = credentials::admin_password_or_prompt(Some(&config.keychain_service))?;
+    write_askpass(&config, &context.logger)?;
+    configure_sudo(&config, &password, &context.logger)?;
+    context.logger.info("brew-manager setup complete");
+    println!("brew-manager setup complete.");
+    Ok(())
 }
 
 pub fn run_once(context: &mut ModuleContext) -> anyhow::Result<Option<ModuleStatus>> {
@@ -634,6 +556,7 @@ exit 1
             "#!/bin/sh\nif [ \"$1\" = \"find-generic-password\" ]; then\necho super-secret\nexit 0\nfi\nexit 0\n",
         )?;
         let config = default_config(root.path(), &brew, &root.path().join("askpass.sh"));
+        crate::credentials::store_admin_password("super-secret", Some(&config.keychain_service))?;
 
         let previous_log = std::env::var("BREW_TEST_LOG").ok();
         std::env::set_var("BREW_TEST_LOG", &brew_log);
@@ -665,6 +588,7 @@ exit 1
             "#!/bin/sh\nif [ \"$1\" = \"find-generic-password\" ]; then\necho super-secret\nexit 0\nfi\nexit 0\n",
         )?;
         let config = default_config(root.path(), &root.path().join("brew"), &askpass);
+        crate::credentials::store_admin_password("super-secret", Some(&config.keychain_service))?;
 
         with_path_scope(&fake_bin, || {
             assert!(!askpass.exists());
@@ -676,7 +600,7 @@ exit 1
             assert!(askpass.exists());
         });
         let content = fs::read_to_string(&askpass)?;
-        assert!(content.contains("security find-generic-password"));
+        assert!(content.contains("sudoers setup is required"));
         Ok(())
     }
 
@@ -696,6 +620,7 @@ exit 1
             &root.path().join("brew"),
             &root.path().join("askpass.sh"),
         );
+        crate::credentials::delete_admin_password(Some(&config.keychain_service))?;
 
         let result = with_path_scope(&fake_bin, || {
             ensure_askpass(

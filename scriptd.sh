@@ -41,15 +41,18 @@ resolve_stable_toolchain_bin_dir() {
 run_cargo() {
   local toolchain_bin
   if toolchain_bin="$(resolve_stable_toolchain_bin_dir)"; then
-    PATH="${toolchain_bin}:${PATH}" \
-      CARGO="${toolchain_bin}/cargo" \
-      RUSTC="${toolchain_bin}/rustc" \
-      "${toolchain_bin}/cargo" "$@"
+    (
+      cd "${ROOT_DIR}"
+      PATH="${toolchain_bin}:${PATH}" \
+        CARGO="${toolchain_bin}/cargo" \
+        RUSTC="${toolchain_bin}/rustc" \
+        "${toolchain_bin}/cargo" "$@"
+    )
     return
   fi
 
   if command -v cargo >/dev/null 2>&1; then
-    cargo "$@"
+    (cd "${ROOT_DIR}" && cargo "$@")
     return
   fi
 
