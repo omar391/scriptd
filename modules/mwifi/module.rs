@@ -65,7 +65,7 @@ struct WifiSignal {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BetterWifiConfig {
+pub struct MwifiConfig {
     #[serde(rename = "min_dwell")]
     pub min_dwell_seconds: u64,
     pub ping_target: String,
@@ -98,7 +98,7 @@ pub struct BetterWifiConfig {
     pub config_path: String,
 }
 
-impl Default for BetterWifiConfig {
+impl Default for MwifiConfig {
     fn default() -> Self {
         Self {
             min_dwell_seconds: 180,
@@ -123,9 +123,9 @@ impl Default for BetterWifiConfig {
 }
 
 #[allow(dead_code)]
-pub fn resolve_better_wifi_config(raw: &BetterWifiConfig, env: &EnvMap) -> BetterWifiConfig {
+pub fn resolve_mwifi_config(raw: &MwifiConfig, env: &EnvMap) -> MwifiConfig {
     let env_ssids = env
-        .get("BETTER_WIFI_SSIDS")
+        .get("MWIFI_SSIDS")
         .unwrap_or_default()
         .split(',')
         .map(str::trim)
@@ -134,12 +134,12 @@ pub fn resolve_better_wifi_config(raw: &BetterWifiConfig, env: &EnvMap) -> Bette
         .collect::<Vec<_>>();
 
     let state_file = env
-        .get("BETTER_WIFI_STATE_FILE")
+        .get("MWIFI_STATE_FILE")
         .map(ToString::to_string)
         .unwrap_or_else(|| {
             if raw.state_file.is_empty() {
                 let home = crate::paths::home_dir();
-                home.join(".local/share/better-wifi/state.txt")
+                home.join(".local/share/mwifi/state.txt")
                     .to_string_lossy()
                     .to_string()
             } else {
@@ -148,27 +148,27 @@ pub fn resolve_better_wifi_config(raw: &BetterWifiConfig, env: &EnvMap) -> Bette
         });
 
     let config_path = env
-        .get("BETTER_WIFI_CONFIG_PATH")
+        .get("MWIFI_CONFIG_PATH")
         .map(ToString::to_string)
         .unwrap_or_else(|| raw.config_path.clone());
 
-    BetterWifiConfig {
-        min_dwell_seconds: parse_env_u64(env.get("BETTER_WIFI_MIN_DWELL"), raw.min_dwell_seconds),
+    MwifiConfig {
+        min_dwell_seconds: parse_env_u64(env.get("MWIFI_MIN_DWELL"), raw.min_dwell_seconds),
         ping_target: env
-            .get("BETTER_WIFI_PING_TARGET")
+            .get("MWIFI_PING_TARGET")
             .unwrap_or(raw.ping_target.as_str())
             .to_string(),
-        ping_count: parse_env_u64(env.get("BETTER_WIFI_PING_COUNT"), raw.ping_count),
+        ping_count: parse_env_u64(env.get("MWIFI_PING_COUNT"), raw.ping_count),
         ping_timeout_seconds: parse_env_u64(
-            env.get("BETTER_WIFI_PING_TIMEOUT"),
+            env.get("MWIFI_PING_TIMEOUT"),
             raw.ping_timeout_seconds,
         ),
         ping_high_latency_ms: parse_env_u64(
-            env.get("BETTER_WIFI_PING_HIGH_LATENCY_MS"),
+            env.get("MWIFI_PING_HIGH_LATENCY_MS"),
             raw.ping_high_latency_ms,
         ),
         health_failure_switch_runs: parse_env_u64(
-            env.get("BETTER_WIFI_HEALTH_FAILURE_SWITCH_RUNS"),
+            env.get("MWIFI_HEALTH_FAILURE_SWITCH_RUNS"),
             raw.health_failure_switch_runs,
         ),
         band_bonus_2g: raw.band_bonus_2g,
@@ -179,7 +179,7 @@ pub fn resolve_better_wifi_config(raw: &BetterWifiConfig, env: &EnvMap) -> Bette
         current_sticky_bonus: raw.current_sticky_bonus,
         rssi_offset: raw.rssi_offset,
         min_switch_score_delta: parse_env_f64(
-            env.get("BETTER_WIFI_MIN_SWITCH_SCORE_DELTA"),
+            env.get("MWIFI_MIN_SWITCH_SCORE_DELTA"),
             raw.min_switch_score_delta,
         ),
         ssids: if env_ssids.is_empty() {
@@ -215,7 +215,7 @@ struct StoredJoinFailure {
 }
 
 #[derive(Debug, Default)]
-struct BetterWifiState {
+struct MwifiState {
     current_ssid: String,
     last_switch_at: Option<String>,
     last_decision: Option<String>,
@@ -224,8 +224,8 @@ struct BetterWifiState {
     last_error: Option<String>,
 }
 
-static STATE: once_cell::sync::Lazy<std::sync::Mutex<BetterWifiState>> =
-    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(BetterWifiState::default()));
+static STATE: once_cell::sync::Lazy<std::sync::Mutex<MwifiState>> =
+    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(MwifiState::default()));
 
 #[derive(Debug, Clone)]
 pub struct PingHealth {
@@ -851,7 +851,7 @@ fn scan_corewlan_networks(_allowed: &[String]) -> Vec<Network> {
 }
 
 fn scan_networks(allowed: &[String]) -> Vec<Network> {
-    if let Ok(output) = std::env::var("SCRIPTD_BETTER_WIFI_SCAN_OUTPUT") {
+    if let Ok(output) = std::env::var("SCRIPTD_MWIFI_SCAN_OUTPUT") {
         return parse_airport_output(&output, allowed);
     }
 
@@ -874,7 +874,7 @@ fn scan_networks(allowed: &[String]) -> Vec<Network> {
         }
     })
     .or_else(|| {
-        std::env::var("SCRIPTD_BETTER_WIFI_SCAN_FALLBACK")
+        std::env::var("SCRIPTD_MWIFI_SCAN_FALLBACK")
             .ok()
             .map(|_| String::new())
     });
@@ -948,7 +948,7 @@ fn parse_ping_health_output(
     }
 }
 
-pub fn ping_health(target: &str, config: &BetterWifiConfig, prior_streak: u64) -> PingHealth {
+pub fn ping_health(target: &str, config: &MwifiConfig, prior_streak: u64) -> PingHealth {
     let args = [
         "-c".to_string(),
         format!("{}", config.ping_count),
@@ -977,7 +977,7 @@ pub fn priority_for(ssid: &str, preference: &[String]) -> usize {
         .unwrap_or(usize::MAX)
 }
 
-fn score_band(network: &Network, config: &BetterWifiConfig) -> f64 {
+fn score_band(network: &Network, config: &MwifiConfig) -> f64 {
     if network.band == "6g" {
         config.band_bonus_6g
     } else if network.band == "5g" {
@@ -987,7 +987,7 @@ fn score_band(network: &Network, config: &BetterWifiConfig) -> f64 {
     }
 }
 
-fn preference_bonus(rank: usize, config: &BetterWifiConfig) -> f64 {
+fn preference_bonus(rank: usize, config: &MwifiConfig) -> f64 {
     if rank == usize::MAX {
         0.0
     } else {
@@ -997,7 +997,7 @@ fn preference_bonus(rank: usize, config: &BetterWifiConfig) -> f64 {
 
 pub fn build_candidate_score(
     network: &Network,
-    config: &BetterWifiConfig,
+    config: &MwifiConfig,
     priority: &[String],
     current_ssid: &str,
     current_health_penalty: f64,
@@ -1056,7 +1056,7 @@ fn build_candidate_score_with_join_failure_penalty(
 
 fn dedupe_networks(
     networks: &[Network],
-    config: &BetterWifiConfig,
+    config: &MwifiConfig,
     priority: &[String],
 ) -> Vec<Network> {
     let mut best = HashMap::<String, CandidateScore>::new();
@@ -1070,7 +1070,7 @@ fn dedupe_networks(
     best.into_values().map(|entry| entry.network).collect()
 }
 
-fn score_network(network: &Network, config: &BetterWifiConfig) -> f64 {
+fn score_network(network: &Network, config: &MwifiConfig) -> f64 {
     score_band(network, config) + (network.rssi as f64 + config.rssi_offset).clamp(0.0, 100.0)
 }
 
@@ -1119,7 +1119,7 @@ pub fn effective_current_ssid(current: &str, _persisted: &str, _networks: &[Netw
 pub fn decide_wifi_switch(
     current: &str,
     candidates: &[CandidateScore],
-    config: &BetterWifiConfig,
+    config: &MwifiConfig,
     dwell_satisfied: bool,
     health_failure_streak: u64,
 ) -> String {
@@ -1178,7 +1178,7 @@ fn build_decision_reason(
     decision: &str,
     current_ssid: &str,
     candidates: &[CandidateScore],
-    config: &BetterWifiConfig,
+    config: &MwifiConfig,
     health_failure_streak: u64,
 ) -> String {
     let mut ranked = candidates.to_vec();
@@ -1357,25 +1357,28 @@ fn password_message_for_error(message: &str) -> String {
     message.replace('\n', " ")
 }
 
-fn scriptd_better_wifi_keychain_service(ssid: &str) -> String {
-    credentials::scriptd_service("better-wifi", ssid)
+fn scriptd_mwifi_keychain_service(ssid: &str) -> String {
+    credentials::scriptd_service("mwifi", ssid)
 }
 
-fn legacy_scriptd_wifi_keychain_service(ssid: &str) -> String {
-    credentials::scriptd_service("wifi", ssid)
+fn legacy_scriptd_wifi_keychain_services(ssid: &str) -> [String; 2] {
+    [
+        credentials::scriptd_service("better-wifi", ssid),
+        credentials::scriptd_service("wifi", ssid),
+    ]
 }
 
 fn password_from_env(ssid: &str) -> Option<String> {
-    let specific_key = format!("BETTER_WIFI_PASSWORD_{}", env_key_suffix(ssid));
+    let specific_key = format!("MWIFI_PASSWORD_{}", env_key_suffix(ssid));
     std::env::var(&specific_key)
         .ok()
-        .or_else(|| std::env::var("BETTER_WIFI_PASSWORD").ok())
+        .or_else(|| std::env::var("MWIFI_PASSWORD").ok())
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
 }
 
 fn password_from_scriptd_keychain(ssid: &str) -> Option<String> {
-    let service = scriptd_better_wifi_keychain_service(ssid);
+    let service = scriptd_mwifi_keychain_service(ssid);
     if let Some(password) = credentials::find_generic_password(&service, ssid)
         .ok()
         .flatten()
@@ -1383,12 +1386,17 @@ fn password_from_scriptd_keychain(ssid: &str) -> Option<String> {
         return Some(password);
     }
 
-    let legacy_service = legacy_scriptd_wifi_keychain_service(ssid);
-    let password = credentials::find_generic_password(&legacy_service, ssid)
-        .ok()
-        .flatten()?;
-    let _ = store_scriptd_wifi_password(ssid, &password);
-    Some(password)
+    for legacy_service in legacy_scriptd_wifi_keychain_services(ssid) {
+        if let Some(password) = credentials::find_generic_password(&legacy_service, ssid)
+            .ok()
+            .flatten()
+        {
+            let _ = store_scriptd_wifi_password(ssid, &password);
+            return Some(password);
+        }
+    }
+
+    None
 }
 
 fn password_from_system_airport_keychain(ssid: &str) -> anyhow::Result<Option<String>> {
@@ -1417,7 +1425,7 @@ fn import_system_airport_password(ssid: &str) -> Option<String> {
 }
 
 fn store_scriptd_wifi_password(ssid: &str, password: &str) -> anyhow::Result<()> {
-    let service = scriptd_better_wifi_keychain_service(ssid);
+    let service = scriptd_mwifi_keychain_service(ssid);
     credentials::store_generic_password(&service, ssid, password)
 }
 
@@ -1462,21 +1470,20 @@ fn wait_for_connected_ssid(device: &str, target: &str, networks: &[Network]) -> 
     false
 }
 
-fn load_config(context: &ModuleContext) -> BetterWifiConfig {
+fn load_config(context: &ModuleContext) -> MwifiConfig {
     let path = context.module_dir.join("module.yaml");
-    let mut config = match fs::read_to_string(&path)
-        .map(|text| serde_yaml::from_str::<BetterWifiConfig>(&text))
-    {
-        Ok(Ok(value)) => value,
-        _ => BetterWifiConfig::default(),
-    };
+    let mut config =
+        match fs::read_to_string(&path).map(|text| serde_yaml::from_str::<MwifiConfig>(&text)) {
+            Ok(Ok(value)) => value,
+            _ => MwifiConfig::default(),
+        };
 
     let env = EnvMap::default();
-    config = resolve_better_wifi_config(&config, &env);
+    config = resolve_mwifi_config(&config, &env);
 
     let home_dir = crate::paths::home_dir().to_string_lossy().to_string();
     config.state_file = if config.state_file.is_empty() {
-        format!("{home_dir}/.local/share/better-wifi/state.txt")
+        format!("{home_dir}/.local/share/mwifi/state.txt")
     } else {
         config.state_file
     };
@@ -1502,7 +1509,7 @@ fn preferred_ssids(device: &str) -> anyhow::Result<Vec<String>> {
         .collect::<Vec<_>>())
 }
 
-fn setup_candidate_ssids(config: &BetterWifiConfig, device: &str) -> anyhow::Result<Vec<String>> {
+fn setup_candidate_ssids(config: &MwifiConfig, device: &str) -> anyhow::Result<Vec<String>> {
     let preferences = preferred_ssids(device)?;
     let mut ssids = Vec::new();
 
@@ -1541,7 +1548,7 @@ fn parse_networks(allowed: &[String]) -> Vec<Network> {
 
 fn build_candidate(
     network: &Network,
-    config: &BetterWifiConfig,
+    config: &MwifiConfig,
     priority_order: &[String],
     current_ssid: &str,
     current_health_penalty: f64,
@@ -2068,11 +2075,11 @@ pub fn setup(context: &mut ModuleContext) -> anyhow::Result<()> {
     }
 
     if imported == 0 && existing == 0 {
-        anyhow::bail!("No Wi-Fi passwords were provisioned for better-wifi");
+        anyhow::bail!("No Wi-Fi passwords were provisioned for mwifi");
     }
 
     context.logger.info(&format!(
-        "better-wifi setup complete; imported {imported}, already provisioned {existing}, skipped {skipped}"
+        "mwifi setup complete; imported {imported}, already provisioned {existing}, skipped {skipped}"
     ));
     Ok(())
 }
@@ -2136,7 +2143,7 @@ mod tests {
 
     #[test]
     fn wifi_scoring_prefers_preference_order() {
-        let config = BetterWifiConfig {
+        let config = MwifiConfig {
             ssids: vec!["Office".to_string(), "Home".to_string()],
             ..Default::default()
         };
@@ -2165,7 +2172,7 @@ mod tests {
 
     #[test]
     fn decision_switches_when_gap_big_enough() {
-        let config = BetterWifiConfig {
+        let config = MwifiConfig {
             min_switch_score_delta: 10.0,
             ..Default::default()
         };
@@ -2272,7 +2279,7 @@ TestNet              00:99:88:77:66:55 -65 233 WPA3(PSK/AES/AES)\n";
 
         let degraded = ping_health(
             "",
-            &BetterWifiConfig {
+            &MwifiConfig {
                 ping_high_latency_ms: 250,
                 ..Default::default()
             },
@@ -2282,8 +2289,8 @@ TestNet              00:99:88:77:66:55 -65 233 WPA3(PSK/AES/AES)\n";
         assert_eq!(degraded.penalty, 45.0);
     }
 
-    fn default_wifi_config() -> BetterWifiConfig {
-        BetterWifiConfig {
+    fn default_wifi_config() -> MwifiConfig {
+        MwifiConfig {
             min_dwell_seconds: 180,
             ping_target: "1.1.1.1".to_string(),
             ping_count: 3,
@@ -2456,8 +2463,8 @@ TestNet              00:99:88:77:66:55 -65 233 WPA3(PSK/AES/AES)\n";
         assert_eq!(env_key_suffix("knight_riders_5G"), "KNIGHT_RIDERS_5G");
         assert_eq!(env_key_suffix("Yousuf WiFi"), "YOUSUF_WIFI");
         assert_eq!(
-            scriptd_better_wifi_keychain_service("knight_riders_5G"),
-            "scriptd-better-wifi:knight_riders_5G"
+            scriptd_mwifi_keychain_service("knight_riders_5G"),
+            "scriptd-mwifi:knight_riders_5G"
         );
     }
 
@@ -2483,7 +2490,7 @@ TestNet              00:99:88:77:66:55 -65 233 WPA3(PSK/AES/AES)\n";
 
     #[test]
     fn wifi_decision_prefers_current_network_when_below_threshold() {
-        let config = BetterWifiConfig {
+        let config = MwifiConfig {
             min_switch_score_delta: 25.0,
             ..Default::default()
         };
@@ -2524,7 +2531,7 @@ TestNet              00:99:88:77:66:55 -65 233 WPA3(PSK/AES/AES)\n";
 
     #[test]
     fn wifi_decision_switches_when_non_sticky_score_clears_threshold() {
-        let config = BetterWifiConfig {
+        let config = MwifiConfig {
             min_switch_score_delta: 25.0,
             current_sticky_bonus: 25.0,
             ..Default::default()
@@ -2572,7 +2579,7 @@ TestNet              00:99:88:77:66:55 -65 233 WPA3(PSK/AES/AES)\n";
 
     #[test]
     fn wifi_decision_switches_after_health_failure_streak() {
-        let config = BetterWifiConfig {
+        let config = MwifiConfig {
             min_switch_score_delta: 1_000.0,
             health_failure_switch_runs: 2,
             ..Default::default()
@@ -2651,19 +2658,19 @@ TestNet              00:99:88:77:66:55 -65 233 WPA3(PSK/AES/AES)\n";
 
         let env = EnvMap {
             values: vec![
-                ("BETTER_WIFI_SSIDS".to_string(), "Office,Lab".to_string()),
-                ("BETTER_WIFI_PING_TARGET".to_string(), "8.8.8.8".to_string()),
+                ("MWIFI_SSIDS".to_string(), "Office,Lab".to_string()),
+                ("MWIFI_PING_TARGET".to_string(), "8.8.8.8".to_string()),
                 (
-                    "BETTER_WIFI_MIN_SWITCH_SCORE_DELTA".to_string(),
+                    "MWIFI_MIN_SWITCH_SCORE_DELTA".to_string(),
                     "41.5".to_string(),
                 ),
-                ("BETTER_WIFI_PING_COUNT".to_string(), "7".to_string()),
+                ("MWIFI_PING_COUNT".to_string(), "7".to_string()),
             ]
             .into_iter()
             .collect(),
         };
 
-        let resolved = resolve_better_wifi_config(&raw, &env);
+        let resolved = resolve_mwifi_config(&raw, &env);
         assert_eq!(resolved.ping_target, "8.8.8.8");
         assert_eq!(resolved.min_switch_score_delta, 41.5);
         assert_eq!(resolved.ping_count, 7);
@@ -2676,16 +2683,16 @@ TestNet              00:99:88:77:66:55 -65 233 WPA3(PSK/AES/AES)\n";
     #[test]
     fn wifi_resolves_module_yaml_state_file_when_env_absent() {
         let mut raw = default_wifi_config();
-        raw.state_file = "/tmp/scriptd-better-wifi-state.json".to_string();
+        raw.state_file = "/tmp/scriptd-mwifi-state.json".to_string();
 
-        let resolved = resolve_better_wifi_config(
+        let resolved = resolve_mwifi_config(
             &raw,
             &EnvMap {
                 values: std::collections::HashMap::new(),
             },
         );
 
-        assert_eq!(resolved.state_file, "/tmp/scriptd-better-wifi-state.json");
+        assert_eq!(resolved.state_file, "/tmp/scriptd-mwifi-state.json");
     }
 
     #[test]

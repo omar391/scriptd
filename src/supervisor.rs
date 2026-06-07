@@ -64,7 +64,7 @@ struct ModuleRuntime {
 
 impl ModuleRuntime {
     fn from_definition(definition: ModuleDefinition) -> Self {
-        let kind = BuiltInModule::kind_from_id(&definition.id).unwrap_or(BuiltInModule::CpuMonitor);
+        let kind = BuiltInModule::kind_from_id(&definition.id).unwrap_or(BuiltInModule::Mcpu);
         Self {
             id: definition.id.clone(),
             mode: definition.manifest.mode.clone(),

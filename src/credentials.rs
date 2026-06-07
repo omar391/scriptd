@@ -224,9 +224,6 @@ mod tests {
     #[test]
     fn scriptd_service_names_are_stable() {
         assert_eq!(scriptd_service("wifi", "Office"), "scriptd-wifi:Office");
-        assert_eq!(
-            scriptd_service("better-wifi", "Office"),
-            "scriptd-better-wifi:Office"
-        );
+        assert_eq!(scriptd_service("mwifi", "Office"), "scriptd-mwifi:Office");
     }
 }

@@ -1,4 +1,4 @@
-id: better-wifi
+id: mwifi
 display_name: Wi-Fi Monitor
 mode: interval
 interval_seconds: 30

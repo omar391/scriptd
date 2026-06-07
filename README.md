@@ -46,9 +46,9 @@ Repo layout:
     │   ├── status.rs
     │   └── modules.rs
 └── modules/
-    ├── better-wifi/
-    ├── cpu-monitor/
-    └── brew-manager/
+    ├── mwifi/
+    ├── mcpu/
+    └── mbrew/
 ```
 
 ## Requirements
@@ -61,9 +61,9 @@ Repo layout:
 
 Module-specific tools:
 
-- `better-wifi`: `networksetup`, `ping`, and `airport` CLI fallback path
-- `cpu-monitor`: sysinfo process inspection plus command-level signal support when needed
-- `brew-manager`: Homebrew, `security`, and `sudo`
+- `mwifi`: `networksetup`, `ping`, and `airport` CLI fallback path
+- `mcpu`: sysinfo process inspection plus command-level signal support when needed
+- `mbrew`: Homebrew, `security`, and `sudo`
 
 ## Quick Start
 
@@ -73,7 +73,7 @@ Module-specific tools:
 4. Run one-time module setup when needed:
 
 ```bash
-./scriptd.sh setup brew-manager
+./scriptd.sh setup mbrew
 ```
 
 5. Install the supervisor LaunchAgent:
@@ -116,15 +116,15 @@ label: com.omar.scriptd
 log_dir: ~/Library/Logs/scriptd
 watch: true
 modules:
-  better-wifi:
+  mwifi:
     enabled: false
     schedule:
       every_minutes: 5
-  cpu-monitor:
+  mcpu:
     enabled: false
     schedule:
       every_minutes: 1
-  brew-manager:
+  mbrew:
     enabled: true
     schedule:
       every_hours: 12
@@ -168,28 +168,28 @@ Module-specific algorithm settings still live in each module's `module.yaml`.
 Update module enablement and schedules with `setup <module>`:
 
 ```bash
-./scriptd.sh setup better-wifi --enable --every-minutes 5
-./scriptd.sh setup cpu-monitor --disable
-./scriptd.sh setup brew-manager --enable --daily-at 09:30 --weekday mon --weekday wed --weekday fri
-./scriptd.sh setup brew-manager --cron "0 0 */12 * * *"
+./scriptd.sh setup mwifi --enable --every-minutes 5
+./scriptd.sh setup mcpu --disable
+./scriptd.sh setup mbrew --enable --daily-at 09:30 --weekday mon --weekday wed --weekday fri
+./scriptd.sh setup mbrew --cron "0 0 */12 * * *"
 ```
 
 Run `./scriptd.sh start root` after changing setup flags to install/update the LaunchAgent and restart it if it is already running. When `watch: true`, a running supervisor also picks up `service.yaml` edits automatically.
 
 ## Bundled Modules
 
-### `better-wifi`
+### `mwifi`
 
 - Mode: `interval`
 - Default: disabled
 - Default schedule: every 5 minutes
 - Purpose: scans nearby Wi-Fi networks, scores candidates, and switches to the best allowed SSID
-- Inputs: preferred network list or `ssids` configured in `modules/better-wifi/module.yaml`
+- Inputs: preferred network list or `ssids` configured in `modules/mwifi/module.yaml`
 - Tuning: dwell time, ping target, manual SSID priority, band bonuses, RSSI offset, switch threshold
 
-See [`modules/better-wifi/README.md`](./modules/better-wifi/README.md).
+See [`modules/mwifi/README.md`](./modules/mwifi/README.md).
 
-### `cpu-monitor`
+### `mcpu`
 
 - Mode: `interval`
 - Default: disabled
@@ -197,9 +197,9 @@ See [`modules/better-wifi/README.md`](./modules/better-wifi/README.md).
 - Purpose: tracks processes that stay above a CPU threshold and kills them after a sustained time limit
 - Tuning: CPU threshold, time limit, excluded app names
 
-See [`modules/cpu-monitor/README.md`](./modules/cpu-monitor/README.md).
+See [`modules/mcpu/README.md`](./modules/mcpu/README.md).
 
-### `brew-manager`
+### `mbrew`
 
 - Mode: `interval`
 - Default: enabled
@@ -207,7 +207,7 @@ See [`modules/cpu-monitor/README.md`](./modules/cpu-monitor/README.md).
 - Purpose: runs `brew update`, formula upgrades, cask upgrades, repair fallback flow, and `brew cleanup`
 - Setup: stores a sudo password in Keychain, writes an askpass helper, and installs sudoers rules
 
-See [`modules/brew-manager/README.md`](./modules/brew-manager/README.md).
+See [`modules/mbrew/README.md`](./modules/mbrew/README.md).
 
 ## Logs And State
 

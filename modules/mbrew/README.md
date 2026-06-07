@@ -1,4 +1,4 @@
-brew-manager
+mbrew
 ============
 
 This module runs Homebrew maintenance under `scriptd`.
@@ -8,8 +8,8 @@ Files
 - `module.yaml` — the single module manifest/config file.
 
 Usage
-- `./scriptd.sh setup brew-manager`
-- `./scriptd.sh run brew-manager`
+- `./scriptd.sh setup mbrew`
+- `./scriptd.sh run mbrew`
 - enable or disable it from `service.yaml`
 
 Security

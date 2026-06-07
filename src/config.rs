@@ -619,7 +619,7 @@ mod tests {
         let temp = tempdir().expect("temp dir");
         let repo = temp.path();
         let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"));
-        let service_yaml = "label: com.omar.scriptd\nlog_dir: ~/Library/Logs/scriptd\nwatch: true\nself_update_check_hours: 12\nmodules:\n  brew-manager:\n    enabled: true\n    schedule:\n      every_hours: 12\n";
+        let service_yaml = "label: com.omar.scriptd\nlog_dir: ~/Library/Logs/scriptd\nwatch: true\nself_update_check_hours: 12\nmodules:\n  mbrew:\n    enabled: true\n    schedule:\n      every_hours: 12\n";
         fs::write(repo.join("service.yaml"), service_yaml).expect("write service config");
 
         let config = read_service_config(repo).expect("read config");
@@ -631,11 +631,11 @@ mod tests {
             config.expanded_log_dir().to_string_lossy(),
             format!("{}/Library/Logs/scriptd", home.to_string_lossy())
         );
-        assert!(config.modules.get("brew-manager").expect("module").enabled);
+        assert!(config.modules.get("mbrew").expect("module").enabled);
         assert_eq!(
             config
                 .modules
-                .get("brew-manager")
+                .get("mbrew")
                 .expect("module")
                 .schedule
                 .as_ref()
@@ -647,7 +647,7 @@ mod tests {
     #[test]
     fn read_module_manifest_rejects_id_mismatch() {
         let temp = tempdir().expect("temp dir");
-        let module_dir = temp.path().join("modules").join("better-wifi");
+        let module_dir = temp.path().join("modules").join("mwifi");
         std::fs::create_dir_all(&module_dir).expect("create module dir");
         std::fs::write(
             module_dir.join("module.yaml"),
@@ -655,20 +655,20 @@ mod tests {
         )
         .expect("write manifest");
 
-        let result = read_module_manifest("better-wifi", temp.path());
+        let result = read_module_manifest("mwifi", temp.path());
         assert!(result.is_err());
     }
 
     #[test]
     fn read_service_config_rejects_invalid_schedule() {
         let temp = tempdir().expect("temp dir");
-        let service_yaml = "label: com.omar.scriptd\nlog_dir: ~/Library/Logs/scriptd\nwatch: true\nself_update_check_hours: 12\nmodules:\n  brew-manager:\n    enabled: true\n    schedule:\n      every_hours: 12\n      daily_at:\n        - \"09:00\"\n";
+        let service_yaml = "label: com.omar.scriptd\nlog_dir: ~/Library/Logs/scriptd\nwatch: true\nself_update_check_hours: 12\nmodules:\n  mbrew:\n    enabled: true\n    schedule:\n      every_hours: 12\n      daily_at:\n        - \"09:00\"\n";
         fs::write(temp.path().join("service.yaml"), service_yaml).expect("write service config");
 
         let error = read_service_config(temp.path()).expect_err("invalid schedule should fail");
         assert!(error
             .to_string()
-            .contains("invalid schedule for module brew-manager"));
+            .contains("invalid schedule for module mbrew"));
     }
 
     #[test]
@@ -710,14 +710,14 @@ mod tests {
     fn compare_enable_flags() {
         let mut previous = HashMap::new();
         previous.insert(
-            "brew-manager".to_string(),
+            "mbrew".to_string(),
             ServiceModuleConfig {
                 enabled: true,
                 schedule: None,
             },
         );
         previous.insert(
-            "cpu-monitor".to_string(),
+            "mcpu".to_string(),
             ServiceModuleConfig {
                 enabled: false,
                 schedule: None,
@@ -726,14 +726,14 @@ mod tests {
 
         let mut next = HashMap::new();
         next.insert(
-            "brew-manager".to_string(),
+            "mbrew".to_string(),
             ServiceModuleConfig {
                 enabled: false,
                 schedule: None,
             },
         );
         next.insert(
-            "cpu-monitor".to_string(),
+            "mcpu".to_string(),
             ServiceModuleConfig {
                 enabled: true,
                 schedule: None,
@@ -741,8 +741,8 @@ mod tests {
         );
 
         let diff = compare_enabled(&previous, &next);
-        assert_eq!(diff.to_start, vec!["cpu-monitor".to_string()]);
-        assert_eq!(diff.to_stop, vec!["brew-manager".to_string()]);
+        assert_eq!(diff.to_start, vec!["mcpu".to_string()]);
+        assert_eq!(diff.to_stop, vec!["mbrew".to_string()]);
     }
 
     #[test]

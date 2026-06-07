@@ -3,15 +3,15 @@ log_dir: ~/Library/Logs/scriptd
 watch: true
 self_update_check_hours: 12
 modules:
-  brew-manager:
+  mbrew:
     enabled: true
     schedule:
       every_hours: 12
-  cpu-monitor:
+  mcpu:
     enabled: false
     schedule:
       every_minutes: 1
-  better-wifi:
+  mwifi:
     enabled: true
     schedule:
       every_minutes: 5

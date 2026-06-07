@@ -1,4 +1,4 @@
-cpu-monitor
+mcpu
 ===========
 
 This is a small macOS CPU monitor that checks running processes, tracks ones that stay above a CPU threshold, and kills them if they remain above that threshold for too long.
@@ -19,9 +19,9 @@ Configuration
 - `EXCLUDE_APPS` — Array of process names that are never killed.
 
 Usage
-- `./scriptd.sh run cpu-monitor`
+- `./scriptd.sh run mcpu`
 - Enable or disable it from `service.yaml`
-- Ongoing cadence is configured in `service.yaml` under `modules.cpu-monitor.schedule`.
+- Ongoing cadence is configured in `service.yaml` under `modules.mcpu.schedule`.
 
 Logging
 - Managed by `scriptd` under the shared log directory from `service.yaml`.

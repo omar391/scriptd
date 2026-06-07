@@ -12,7 +12,7 @@ use crate::modules::{ModuleContext, ModuleHealth, ModuleLogger, ModuleStatus};
 use crate::paths::expand_home;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct BrewManagerConfig {
+struct MbrewConfig {
     #[serde(rename = "keychain_service")]
     keychain_service: String,
     #[serde(rename = "askpass_path")]
@@ -35,12 +35,11 @@ struct BrewManagerConfig {
     sudo_timeout_hours: u64,
 }
 
-impl Default for BrewManagerConfig {
+impl Default for MbrewConfig {
     fn default() -> Self {
         Self {
             keychain_service: "BrewAutoUpdate".to_string(),
-            askpass_path: "~/Library/Application Support/scriptd/brew-manager/brew_askpass.sh"
-                .to_string(),
+            askpass_path: "~/Library/Application Support/scriptd/mbrew/brew_askpass.sh".to_string(),
             legacy_log_dir: "~/Library/Logs/Homebrew".to_string(),
             max_log_size_mb: 50,
             max_log_age_days: 30,
@@ -54,15 +53,15 @@ impl Default for BrewManagerConfig {
 }
 
 #[derive(Debug, Default)]
-struct BrewState {
+struct MbrewState {
     last_run_at: Option<String>,
     last_error: Option<String>,
     last_message: Option<String>,
     repaired_casks: Vec<String>,
 }
 
-static STATE: once_cell::sync::Lazy<std::sync::Mutex<BrewState>> =
-    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(BrewState::default()));
+static STATE: once_cell::sync::Lazy<std::sync::Mutex<MbrewState>> =
+    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(MbrewState::default()));
 
 fn run_command(
     program: &str,
@@ -104,11 +103,11 @@ fn run_command(
     }
 }
 
-fn keychain_password(config: &BrewManagerConfig) -> anyhow::Result<String> {
+fn keychain_password(config: &MbrewConfig) -> anyhow::Result<String> {
     Ok(credentials::admin_password(Some(&config.keychain_service))?.unwrap_or_default())
 }
 
-fn cleanup_legacy_logs(config: &BrewManagerConfig, logger: &ModuleLogger) {
+fn cleanup_legacy_logs(config: &MbrewConfig, logger: &ModuleLogger) {
     let base = expand_home(&config.legacy_log_dir);
     if !base.exists() {
         return;
@@ -148,7 +147,7 @@ fn rotate_log(path: &std::path::Path, max_size_mb: u64, max_rotated: u64, logger
     let _ = logger;
 }
 
-fn write_askpass(config: &BrewManagerConfig, logger: &ModuleLogger) -> anyhow::Result<()> {
+fn write_askpass(config: &MbrewConfig, logger: &ModuleLogger) -> anyhow::Result<()> {
     let path = expand_home(&config.askpass_path);
     if path.exists() {
         return Ok(());
@@ -156,7 +155,7 @@ fn write_askpass(config: &BrewManagerConfig, logger: &ModuleLogger) -> anyhow::R
     fs::create_dir_all(path.parent().expect("path has parent"))?;
     let mut file = fs::File::create(&path)?;
     let script = "#!/bin/bash\n\
-echo \"scriptd brew-manager sudoers setup is required\" >&2\n\
+echo \"scriptd mbrew sudoers setup is required\" >&2\n\
 exit 1\n";
     file.write_all(script.as_bytes())?;
     let _ = Command::new("chmod")
@@ -166,20 +165,20 @@ exit 1\n";
     Ok(())
 }
 
-fn ensure_askpass(config: &BrewManagerConfig, logger: &ModuleLogger) -> anyhow::Result<()> {
+fn ensure_askpass(config: &MbrewConfig, logger: &ModuleLogger) -> anyhow::Result<()> {
     let path = expand_home(&config.askpass_path);
     if path.exists() {
         return Ok(());
     }
     let existing = keychain_password(config)?;
     if existing.is_empty() {
-        bail!("brew-manager setup required. run './scriptd.sh setup brew-manager'");
+        bail!("mbrew setup required. run './scriptd.sh setup mbrew'");
     }
     write_askpass(config, logger)
 }
 
 fn configure_sudo(
-    config: &BrewManagerConfig,
+    config: &MbrewConfig,
     password: &str,
     logger: &ModuleLogger,
 ) -> anyhow::Result<()> {
@@ -195,14 +194,8 @@ fn configure_sudo(
         config.sudo_timeout_hours.saturating_mul(60)
     );
 
-    let rules_path = PathBuf::from(format!(
-        "/tmp/brew-manager-rules-{}.tmp",
-        std::process::id()
-    ));
-    let timeout_path = PathBuf::from(format!(
-        "/tmp/brew-manager-timeout-{}.tmp",
-        std::process::id()
-    ));
+    let rules_path = PathBuf::from(format!("/tmp/mbrew-rules-{}.tmp", std::process::id()));
+    let timeout_path = PathBuf::from(format!("/tmp/mbrew-timeout-{}.tmp", std::process::id()));
     fs::write(&rules_path, rules)?;
     fs::write(&timeout_path, timeout)?;
     run_command(
@@ -245,10 +238,7 @@ fn configure_sudo(
     Ok(())
 }
 
-fn command_for_brew(
-    config: &BrewManagerConfig,
-    args: &[&str],
-) -> anyhow::Result<(String, String, i32)> {
+fn command_for_brew(config: &MbrewConfig, args: &[&str]) -> anyhow::Result<(String, String, i32)> {
     let askpass_path = expand_home(&config.askpass_path);
     let askpass = askpass_path.to_string_lossy().to_string();
     let env = [("SUDO_ASKPASS", askpass.as_str())];
@@ -257,18 +247,15 @@ fn command_for_brew(
     Ok(command)
 }
 
-fn update_from_config(module_dir: &std::path::Path) -> BrewManagerConfig {
+fn update_from_config(module_dir: &std::path::Path) -> MbrewConfig {
     let path = module_dir.join("module.yaml");
     fs::read_to_string(path)
         .ok()
-        .and_then(|text| serde_yaml::from_str::<BrewManagerConfig>(&text).ok())
+        .and_then(|text| serde_yaml::from_str::<MbrewConfig>(&text).ok())
         .unwrap_or_default()
 }
 
-fn brew_maintenance(
-    config: &BrewManagerConfig,
-    logger: &ModuleLogger,
-) -> anyhow::Result<Vec<String>> {
+fn brew_maintenance(config: &MbrewConfig, logger: &ModuleLogger) -> anyhow::Result<Vec<String>> {
     cleanup_legacy_logs(config, logger);
     ensure_askpass(config, logger)?;
     let (update_out, update_err, status) = command_for_brew(config, &["update"])?;
@@ -351,8 +338,8 @@ pub fn setup(context: &mut ModuleContext) -> anyhow::Result<()> {
     let password = credentials::admin_password_or_prompt(Some(&config.keychain_service))?;
     write_askpass(&config, &context.logger)?;
     configure_sudo(&config, &password, &context.logger)?;
-    context.logger.info("brew-manager setup complete");
-    println!("brew-manager setup complete.");
+    context.logger.info("mbrew setup complete");
+    println!("mbrew setup complete.");
     Ok(())
 }
 
@@ -486,12 +473,12 @@ mod tests {
         result
     }
 
-    fn default_config(home: &Path, homebrew_bin: &Path, askpass: &Path) -> BrewManagerConfig {
-        BrewManagerConfig {
+    fn default_config(home: &Path, homebrew_bin: &Path, askpass: &Path) -> MbrewConfig {
+        MbrewConfig {
             homebrew_bin: homebrew_bin.to_string_lossy().to_string(),
             askpass_path: askpass.to_string_lossy().to_string(),
             legacy_log_dir: format!("{}/legacy", home.to_string_lossy()),
-            ..BrewManagerConfig::default()
+            ..MbrewConfig::default()
         }
     }
 
@@ -561,7 +548,7 @@ exit 1
         let previous_log = std::env::var("BREW_TEST_LOG").ok();
         std::env::set_var("BREW_TEST_LOG", &brew_log);
         with_path_scope(&fake_bin, || {
-            let logger = ModuleLogger::new(root.path().to_path_buf(), "brew-manager", false);
+            let logger = ModuleLogger::new(root.path().to_path_buf(), "mbrew", false);
             let repaired = brew_maintenance(&config, &logger).expect("maintenance");
             assert_eq!(repaired, vec!["brew-offending-cask".to_string()]);
         });
@@ -594,7 +581,7 @@ exit 1
             assert!(!askpass.exists());
             ensure_askpass(
                 &config,
-                &ModuleLogger::new(root.path().to_path_buf(), "brew-manager", false),
+                &ModuleLogger::new(root.path().to_path_buf(), "mbrew", false),
             )
             .expect("askpass written");
             assert!(askpass.exists());
@@ -625,14 +612,14 @@ exit 1
         let result = with_path_scope(&fake_bin, || {
             ensure_askpass(
                 &config,
-                &ModuleLogger::new(root.path().to_path_buf(), "brew-manager", false),
+                &ModuleLogger::new(root.path().to_path_buf(), "mbrew", false),
             )
         });
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
             .to_string()
-            .contains("brew-manager setup required"));
+            .contains("mbrew setup required"));
         Ok(())
     }
 

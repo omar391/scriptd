@@ -202,7 +202,7 @@ exit 1
 }
 
 fn write_modules(root: &Path) {
-    for module in ["brew-manager", "cpu-monitor", "better-wifi"] {
+    for module in ["mbrew", "mcpu", "mwifi"] {
         let module_dir = root.join("modules").join(module);
         fs::create_dir_all(&module_dir).expect("create module dir");
         fs::write(
@@ -214,12 +214,12 @@ fn write_modules(root: &Path) {
 }
 
 fn write_brew_module(root: &Path, homebrew_bin: &Path, askpass_path: &Path) {
-    let module_dir = root.join("modules").join("brew-manager");
+    let module_dir = root.join("modules").join("mbrew");
     fs::create_dir_all(&module_dir).expect("create brew module dir");
     fs::write(
         module_dir.join("module.yaml"),
         format!(
-            "id: brew-manager\nmode: interval\ninterval_seconds: 30\nkeychain_service: BrewAutoUpdate\naskpass_path: {}\nlegacy_log_dir: {}/legacy\nmax_log_size_mb: 50\nmax_log_age_days: 30\nmax_rotated_logs: 5\nhomebrew_bin: {}\nsudoers_path: {}/sudoers-homebrew\nsudoers_timeout_path: {}/sudoers-timeout\nsudo_timeout_hours: 2\n",
+            "id: mbrew\nmode: interval\ninterval_seconds: 30\nkeychain_service: BrewAutoUpdate\naskpass_path: {}\nlegacy_log_dir: {}/legacy\nmax_log_size_mb: 50\nmax_log_age_days: 30\nmax_rotated_logs: 5\nhomebrew_bin: {}\nsudoers_path: {}/sudoers-homebrew\nsudoers_timeout_path: {}/sudoers-timeout\nsudo_timeout_hours: 2\n",
             askpass_path.to_string_lossy(),
             root.to_string_lossy(),
             homebrew_bin.to_string_lossy(),
@@ -231,12 +231,12 @@ fn write_brew_module(root: &Path, homebrew_bin: &Path, askpass_path: &Path) {
 }
 
 fn write_wifi_module(root: &Path, state_file: &Path) {
-    let module_dir = root.join("modules").join("better-wifi");
+    let module_dir = root.join("modules").join("mwifi");
     fs::create_dir_all(&module_dir).expect("create wifi module dir");
     fs::write(
         module_dir.join("module.yaml"),
         format!(
-            "id: better-wifi\nmode: interval\ninterval_seconds: 30\nmin_dwell: 1\nping_target: 1.1.1.1\nping_count: 3\nping_timeout: 1\nping_high_latency_ms: 250\nhealth_failure_switch_runs: 2\nband_bonus_2g: 0\nband_bonus_5g: 35\nband_bonus_6g: 50\npreference_top_bonus: 30\npreference_rank_decay: 5\ncurrent_sticky_bonus: 25\nrssi_offset: 100\nmin_switch_score_delta: 10\nssids:\n  - Home\n  - Office\nstate_file: {}\nconfig_path: {}\n",
+            "id: mwifi\nmode: interval\ninterval_seconds: 30\nmin_dwell: 1\nping_target: 1.1.1.1\nping_count: 3\nping_timeout: 1\nping_high_latency_ms: 250\nhealth_failure_switch_runs: 2\nband_bonus_2g: 0\nband_bonus_5g: 35\nband_bonus_6g: 50\npreference_top_bonus: 30\npreference_rank_decay: 5\ncurrent_sticky_bonus: 25\nrssi_offset: 100\nmin_switch_score_delta: 10\nssids:\n  - Home\n  - Office\nstate_file: {}\nconfig_path: {}\n",
             state_file.to_string_lossy(),
             module_dir.join("module.yaml").to_string_lossy()
         ),
@@ -255,7 +255,7 @@ fn write_service_yaml(
     fs::write(
         root.join("service.yaml"),
         format!(
-            "label: com.omar.scriptd\nlog_dir: ~/Library/Logs/scriptd\nwatch: {}\nmodules:\n  brew-manager:\n    enabled: {}\n  cpu-monitor:\n    enabled: {}\n  better-wifi:\n    enabled: {}\n",
+            "label: com.omar.scriptd\nlog_dir: ~/Library/Logs/scriptd\nwatch: {}\nmodules:\n  mbrew:\n    enabled: {}\n  mcpu:\n    enabled: {}\n  mwifi:\n    enabled: {}\n",
             watch,
             brew_enabled,
             cpu_enabled,
@@ -447,7 +447,7 @@ fn integration_run_root_rejects_invalid_module() {
 
 #[test]
 #[serial]
-fn integration_run_brew_manager_uses_fake_brew_security_and_sudo_boundary() {
+fn integration_run_mbrew_uses_fake_brew_security_and_sudo_boundary() {
     let root = tempdir().unwrap();
     let home = tempdir().unwrap();
     let fake_bin = root.path().join("fake_bin");
@@ -465,7 +465,7 @@ fn integration_run_brew_manager_uses_fake_brew_security_and_sudo_boundary() {
 
     let output = run_scriptd(root.path(), home.path(), &fake_bin)
         .arg("run")
-        .arg("brew-manager")
+        .arg("mbrew")
         .output()
         .unwrap();
     assert!(
@@ -484,13 +484,13 @@ fn integration_run_brew_manager_uses_fake_brew_security_and_sudo_boundary() {
 
 #[test]
 #[serial]
-fn integration_run_better_wifi_uses_fake_networksetup_and_ping_boundary() {
+fn integration_run_mwifi_uses_fake_networksetup_and_ping_boundary() {
     let root = tempdir().unwrap();
     let home = tempdir().unwrap();
     let fake_bin = root.path().join("fake_bin");
     fs::create_dir_all(&fake_bin).unwrap();
     let wifi_log = root.path().join("wifi.log");
-    let wifi_state = root.path().join("better-wifi-state.json");
+    let wifi_state = root.path().join("mwifi-state.json");
     create_fake_wifi_stack(&fake_bin, &wifi_log).unwrap();
     write_modules(root.path());
     write_wifi_module(root.path(), &wifi_state);
@@ -498,9 +498,9 @@ fn integration_run_better_wifi_uses_fake_networksetup_and_ping_boundary() {
 
     let scan_output = "SSID BSSID RSSI CHANNEL SECURITY\nHome 00:11:22:33:44:55 -90 1 WPA2\nOffice 00:11:22:33:44:66 -20 233 WPA3\n";
     let output = run_scriptd(root.path(), home.path(), &fake_bin)
-        .env("SCRIPTD_BETTER_WIFI_SCAN_OUTPUT", scan_output)
+        .env("SCRIPTD_MWIFI_SCAN_OUTPUT", scan_output)
         .arg("run")
-        .arg("better-wifi")
+        .arg("mwifi")
         .output()
         .unwrap();
     assert!(
@@ -525,13 +525,13 @@ fn integration_run_better_wifi_uses_fake_networksetup_and_ping_boundary() {
 
 #[test]
 #[serial]
-fn integration_run_better_wifi_retries_with_password_after_unobserved_zero_exit_join() {
+fn integration_run_mwifi_retries_with_password_after_unobserved_zero_exit_join() {
     let root = tempdir().unwrap();
     let home = tempdir().unwrap();
     let fake_bin = root.path().join("fake_bin");
     fs::create_dir_all(&fake_bin).unwrap();
-    let wifi_log = root.path().join("better-wifi-password.log");
-    let wifi_state = root.path().join("better-wifi-password-state.json");
+    let wifi_log = root.path().join("mwifi-password.log");
+    let wifi_state = root.path().join("mwifi-password-state.json");
     create_fake_wifi_stack_requiring_password(&fake_bin, &wifi_log).unwrap();
     write_modules(root.path());
     write_wifi_module(root.path(), &wifi_state);
@@ -539,10 +539,10 @@ fn integration_run_better_wifi_retries_with_password_after_unobserved_zero_exit_
 
     let scan_output = "SSID BSSID RSSI CHANNEL SECURITY\nHome 00:11:22:33:44:55 -90 1 WPA2\nOffice 00:11:22:33:44:66 -20 233 WPA3\n";
     let output = run_scriptd(root.path(), home.path(), &fake_bin)
-        .env("SCRIPTD_BETTER_WIFI_SCAN_OUTPUT", scan_output)
-        .env("BETTER_WIFI_PASSWORD_OFFICE", "office-password")
+        .env("SCRIPTD_MWIFI_SCAN_OUTPUT", scan_output)
+        .env("MWIFI_PASSWORD_OFFICE", "office-password")
         .arg("run")
-        .arg("better-wifi")
+        .arg("mwifi")
         .output()
         .unwrap();
     assert!(
@@ -612,10 +612,7 @@ fn integration_run_root_preserves_desired_state_on_shutdown() {
     let state_text = fs::read_to_string(&state_file).expect("state file");
     let parsed: Value = serde_json::from_str(&state_text).unwrap();
     let modules = parsed.get("modules").and_then(Value::as_object).unwrap();
-    let brew = modules
-        .get("brew-manager")
-        .and_then(Value::as_object)
-        .unwrap();
+    let brew = modules.get("mbrew").and_then(Value::as_object).unwrap();
     assert_eq!(
         brew.get("desiredEnabled").and_then(Value::as_bool),
         Some(true)
@@ -648,7 +645,7 @@ fn integration_run_root_reloads_service_yaml_changes() {
         if let Ok(state_text) = fs::read_to_string(&state_file) {
             if let Ok(parsed) = serde_json::from_str::<Value>(&state_text) {
                 if let Some(modules) = parsed.get("modules").and_then(Value::as_object) {
-                    if let Some(entry) = modules.get("brew-manager").and_then(Value::as_object) {
+                    if let Some(entry) = modules.get("mbrew").and_then(Value::as_object) {
                         if entry.get("desiredEnabled").and_then(Value::as_bool) == Some(true) {
                             observed = true;
                             break;

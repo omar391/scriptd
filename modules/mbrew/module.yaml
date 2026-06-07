@@ -1,9 +1,9 @@
-id: brew-manager
+id: mbrew
 display_name: Brew Manager
 mode: interval
 interval_seconds: 43200
 keychain_service: BrewAutoUpdate
-askpass_path: ~/Library/Application Support/scriptd/brew-manager/brew_askpass.sh
+askpass_path: ~/Library/Application Support/scriptd/mbrew/brew_askpass.sh
 legacy_log_dir: ~/Library/Logs/Homebrew
 max_log_size_mb: 50
 max_log_age_days: 30

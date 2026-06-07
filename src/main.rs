@@ -359,13 +359,13 @@ mod tests {
 
     fn write_service_yaml(root: &Path, body: &str) {
         fs::write(root.join("service.yaml"), body).expect("write service yaml");
-        for builtin in ["better-wifi", "cpu-monitor", "brew-manager"] {
+        for builtin in ["mwifi", "mcpu", "mbrew"] {
             let dir = root.join("modules").join(builtin);
             fs::create_dir_all(&dir).expect("module dir");
             let manifest = match builtin {
-                "better-wifi" => "id: better-wifi\nmode: interval\ninterval_seconds: 30\n",
-                "cpu-monitor" => "id: cpu-monitor\nmode: interval\ninterval_seconds: 30\n",
-                "brew-manager" => "id: brew-manager\nmode: interval\ninterval_seconds: 30\n",
+                "mwifi" => "id: mwifi\nmode: interval\ninterval_seconds: 30\n",
+                "mcpu" => "id: mcpu\nmode: interval\ninterval_seconds: 30\n",
+                "mbrew" => "id: mbrew\nmode: interval\ninterval_seconds: 30\n",
                 _ => "",
             };
             fs::write(dir.join("module.yaml"), manifest).expect("module manifest");
@@ -377,12 +377,12 @@ mod tests {
         let temp = tempdir().expect("temp dir");
         write_service_yaml(
             temp.path(),
-            "label: com.omar.scriptd\nlog_dir: ~/Library/Logs/scriptd\nwatch: true\nmodules:\n  better-wifi:\n    enabled: true\n",
+            "label: com.omar.scriptd\nlog_dir: ~/Library/Logs/scriptd\nwatch: true\nmodules:\n  mwifi:\n    enabled: true\n",
         );
 
         let err = parse_and_update_module_config(
             &[
-                "better-wifi".to_string(),
+                "mwifi".to_string(),
                 "--enable".to_string(),
                 "--disable".to_string(),
             ],
@@ -400,12 +400,12 @@ mod tests {
         let temp = tempdir().expect("temp dir");
         write_service_yaml(
             temp.path(),
-            "label: com.omar.scriptd\nlog_dir: ~/Library/Logs/scriptd\nwatch: true\nmodules:\n  better-wifi:\n    enabled: true\n",
+            "label: com.omar.scriptd\nlog_dir: ~/Library/Logs/scriptd\nwatch: true\nmodules:\n  mwifi:\n    enabled: true\n",
         );
 
         let err = parse_and_update_module_config(
             &[
-                "better-wifi".to_string(),
+                "mwifi".to_string(),
                 "--every-minutes".to_string(),
                 "10".to_string(),
                 "--every-hours".to_string(),
@@ -425,12 +425,12 @@ mod tests {
         let temp = tempdir().expect("temp dir");
         write_service_yaml(
             temp.path(),
-            "label: com.omar.scriptd\nlog_dir: ~/Library/Logs/scriptd\nwatch: true\nmodules:\n  better-wifi:\n    enabled: true\n",
+            "label: com.omar.scriptd\nlog_dir: ~/Library/Logs/scriptd\nwatch: true\nmodules:\n  mwifi:\n    enabled: true\n",
         );
 
         parse_and_update_module_config(
             &[
-                "better-wifi".to_string(),
+                "mwifi".to_string(),
                 "--enable".to_string(),
                 "--every-minutes".to_string(),
                 "15".to_string(),
@@ -458,12 +458,12 @@ mod tests {
         let temp = tempdir().expect("temp dir");
         write_service_yaml(
             temp.path(),
-            "label: com.omar.scriptd\nlog_dir: ~/Library/Logs/scriptd\nwatch: true\nmodules:\n  better-wifi:\n    enabled: true\n",
+            "label: com.omar.scriptd\nlog_dir: ~/Library/Logs/scriptd\nwatch: true\nmodules:\n  mwifi:\n    enabled: true\n",
         );
 
         let err = parse_and_update_module_config(
             &[
-                "better-wifi".to_string(),
+                "mwifi".to_string(),
                 "--weekday".to_string(),
                 "funday".to_string(),
             ],
@@ -499,7 +499,7 @@ mod tests {
             );
         }
 
-        for module_id in ["brew-manager", "cpu-monitor", "better-wifi"] {
+        for module_id in ["mbrew", "mcpu", "mwifi"] {
             assert!(
                 !root
                     .join(format!("modules/{module_id}/package.json"))

@@ -115,8 +115,10 @@ pub fn render_status(config: &ServiceConfig, _config_path: PathBuf) -> anyhow::R
         for id in config.modules.keys() {
             names.insert(id.clone(), ());
         }
-        for id in state.modules.keys() {
-            names.insert(id.clone(), ());
+        if let Some(registry) = &registry {
+            for definition in registry.modules() {
+                names.insert(definition.id.clone(), ());
+            }
         }
 
         println!("Modules:");

@@ -3,12 +3,12 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-#[path = "../modules/better-wifi/module.rs"]
-mod better_wifi;
-#[path = "../modules/brew-manager/module.rs"]
-mod brew_manager;
-#[path = "../modules/cpu-monitor/module.rs"]
-mod cpu_monitor;
+#[path = "../modules/mbrew/module.rs"]
+mod mbrew;
+#[path = "../modules/mcpu/module.rs"]
+mod mcpu;
+#[path = "../modules/mwifi/module.rs"]
+mod mwifi;
 
 use crate::config::{ModuleManifest, ModuleSchedule, ServiceConfig};
 
@@ -20,37 +20,37 @@ pub enum ModuleMode {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum BuiltInModule {
-    BrewManager,
-    CpuMonitor,
-    BetterWifi,
+    Mbrew,
+    Mcpu,
+    Mwifi,
 }
 
 impl BuiltInModule {
     pub fn id(&self) -> &'static str {
         match self {
-            Self::BrewManager => "brew-manager",
-            Self::CpuMonitor => "cpu-monitor",
-            Self::BetterWifi => "better-wifi",
+            Self::Mbrew => "mbrew",
+            Self::Mcpu => "mcpu",
+            Self::Mwifi => "mwifi",
         }
     }
 
     pub fn mode(&self) -> ModuleMode {
         match self {
-            Self::BrewManager => ModuleMode::Interval,
-            Self::CpuMonitor => ModuleMode::Interval,
-            Self::BetterWifi => ModuleMode::Interval,
+            Self::Mbrew => ModuleMode::Interval,
+            Self::Mcpu => ModuleMode::Interval,
+            Self::Mwifi => ModuleMode::Interval,
         }
     }
 
     pub fn all() -> &'static [Self; 3] {
-        &[Self::BrewManager, Self::CpuMonitor, Self::BetterWifi]
+        &[Self::Mbrew, Self::Mcpu, Self::Mwifi]
     }
 
     pub fn kind_from_id(id: &str) -> anyhow::Result<Self> {
         match id {
-            "brew-manager" => Ok(Self::BrewManager),
-            "cpu-monitor" => Ok(Self::CpuMonitor),
-            "better-wifi" => Ok(Self::BetterWifi),
+            "mbrew" => Ok(Self::Mbrew),
+            "mcpu" => Ok(Self::Mcpu),
+            "mwifi" => Ok(Self::Mwifi),
             other => anyhow::bail!("module \"{other}\" not compiled into this build"),
         }
     }
@@ -148,20 +148,16 @@ mod tests {
     fn modules_registry_loads_interval_modules_with_interval_metadata() {
         let temp = tempdir().expect("temp dir");
         let root = temp.path();
-        write_manifest(root, "brew-manager", "interval", Some(30));
-        write_manifest(root, "cpu-monitor", "interval", Some(30));
-        write_manifest(root, "better-wifi", "interval", Some(10));
+        write_manifest(root, "mbrew", "interval", Some(30));
+        write_manifest(root, "mcpu", "interval", Some(30));
+        write_manifest(root, "mwifi", "interval", Some(10));
 
         let config = service_config(root);
         let registry = ModulesRegistry::load_from_disk(&config).expect("load built-ins");
         assert_eq!(registry.modules.len(), 3);
-        assert!(registry.get("better-wifi").is_some());
+        assert!(registry.get("mwifi").is_some());
         assert_eq!(
-            registry
-                .get("cpu-monitor")
-                .expect("cpu")
-                .manifest
-                .interval_ms(),
+            registry.get("mcpu").expect("cpu").manifest.interval_ms(),
             Some(30_000)
         );
     }
@@ -170,9 +166,9 @@ mod tests {
     fn modules_registry_rejects_interval_manifest_without_interval_seconds() {
         let temp = tempdir().expect("temp dir");
         let root = temp.path();
-        write_manifest(root, "brew-manager", "interval", Some(30));
-        write_manifest(root, "cpu-monitor", "interval", Some(30));
-        write_manifest(root, "better-wifi", "interval", None);
+        write_manifest(root, "mbrew", "interval", Some(30));
+        write_manifest(root, "mcpu", "interval", Some(30));
+        write_manifest(root, "mwifi", "interval", None);
 
         let config = service_config(root);
         let error =
@@ -186,9 +182,9 @@ mod tests {
     fn modules_registry_rejects_unknown_mode() {
         let temp = tempdir().expect("temp dir");
         let root = temp.path();
-        write_manifest(root, "brew-manager", "interval", Some(30));
-        write_manifest(root, "cpu-monitor", "daemon", Some(30));
-        write_manifest(root, "better-wifi", "stream", Some(30));
+        write_manifest(root, "mbrew", "interval", Some(30));
+        write_manifest(root, "mcpu", "daemon", Some(30));
+        write_manifest(root, "mwifi", "stream", Some(30));
 
         let config = service_config(root);
         let error = ModulesRegistry::load_from_disk(&config).expect_err("unknown mode");
@@ -313,24 +309,24 @@ pub fn run_once(
     _schedule: &Option<ModuleSchedule>,
 ) -> anyhow::Result<Option<ModuleStatus>> {
     match kind {
-        BuiltInModule::BrewManager => brew_manager::run_once(context),
-        BuiltInModule::CpuMonitor => cpu_monitor::run_once(context),
-        BuiltInModule::BetterWifi => better_wifi::run_once(context),
+        BuiltInModule::Mbrew => mbrew::run_once(context),
+        BuiltInModule::Mcpu => mcpu::run_once(context),
+        BuiltInModule::Mwifi => mwifi::run_once(context),
     }
 }
 
 pub fn setup_module(kind: &BuiltInModule, context: &mut ModuleContext) -> anyhow::Result<()> {
     match kind {
-        BuiltInModule::BrewManager => brew_manager::setup(context),
-        BuiltInModule::CpuMonitor => cpu_monitor::setup(context),
-        BuiltInModule::BetterWifi => better_wifi::setup(context),
+        BuiltInModule::Mbrew => mbrew::setup(context),
+        BuiltInModule::Mcpu => mcpu::setup(context),
+        BuiltInModule::Mwifi => mwifi::setup(context),
     }
 }
 
 pub fn module_status(kind: &BuiltInModule) -> Option<(ModuleStatus, ModuleHealth)> {
     match kind {
-        BuiltInModule::BrewManager => brew_manager::status(),
-        BuiltInModule::CpuMonitor => cpu_monitor::status(),
-        BuiltInModule::BetterWifi => better_wifi::status(),
+        BuiltInModule::Mbrew => mbrew::status(),
+        BuiltInModule::Mcpu => mcpu::status(),
+        BuiltInModule::Mwifi => mwifi::status(),
     }
 }

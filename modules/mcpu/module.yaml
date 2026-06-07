@@ -1,4 +1,4 @@
-id: cpu-monitor
+id: mcpu
 display_name: CPU Monitor
 mode: interval
 interval_seconds: 30

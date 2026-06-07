@@ -10,7 +10,7 @@ use sysinfo::{ProcessesToUpdate, System};
 use crate::modules::{ModuleContext, ModuleHealth, ModuleLogger, ModuleStatus};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct CpuMonitorConfig {
+struct McpuConfig {
     #[serde(rename = "cpu_threshold")]
     cpu_threshold: u64,
     #[serde(rename = "time_limit_seconds")]
@@ -19,7 +19,7 @@ struct CpuMonitorConfig {
     exclude_apps: Vec<String>,
 }
 
-impl Default for CpuMonitorConfig {
+impl Default for McpuConfig {
     fn default() -> Self {
         Self {
             cpu_threshold: 50,
@@ -44,7 +44,7 @@ struct TrackedProcess {
 }
 
 #[derive(Default)]
-struct CpuMonitorState {
+struct McpuState {
     tracked: HashMap<u32, TrackedProcess>,
     last_run_at: Option<String>,
     last_killed_pid: Option<u32>,
@@ -52,8 +52,8 @@ struct CpuMonitorState {
     last_error: Option<String>,
 }
 
-static STATE: once_cell::sync::Lazy<std::sync::Mutex<CpuMonitorState>> =
-    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(CpuMonitorState::default()));
+static STATE: once_cell::sync::Lazy<std::sync::Mutex<McpuState>> =
+    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(McpuState::default()));
 
 fn now_secs() -> u64 {
     SystemTime::now()
@@ -61,20 +61,15 @@ fn now_secs() -> u64 {
         .map_or(0, |value| value.as_secs())
 }
 
-fn read_cpu_config(module_dir: &Path) -> CpuMonitorConfig {
+fn read_cpu_config(module_dir: &Path) -> McpuConfig {
     let path = module_dir.join("module.yaml");
     match std::fs::read_to_string(&path) {
-        Ok(contents) => {
-            serde_yaml::from_str(&contents).unwrap_or_else(|_| CpuMonitorConfig::default())
-        }
-        Err(_) => CpuMonitorConfig::default(),
+        Ok(contents) => serde_yaml::from_str(&contents).unwrap_or_else(|_| McpuConfig::default()),
+        Err(_) => McpuConfig::default(),
     }
 }
 
-fn parse_cpu_snapshot(
-    config: &CpuMonitorConfig,
-    _logger: &ModuleLogger,
-) -> Vec<(u32, TrackedProcess)> {
+fn parse_cpu_snapshot(config: &McpuConfig, _logger: &ModuleLogger) -> Vec<(u32, TrackedProcess)> {
     let mut system = System::new_all();
     system.refresh_processes(ProcessesToUpdate::All, true);
     let mut out = Vec::new();
