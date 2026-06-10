@@ -7,6 +7,9 @@ modules:
     enabled: true
     schedule:
       every_hours: 12
+      window:
+        start: 00:00
+        end: 06:00
   mcpu:
     enabled: false
     schedule:
