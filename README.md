@@ -73,7 +73,7 @@ Module-specific tools:
 4. Run one-time module setup when needed:
 
 ```bash
-./scriptd.sh setup mbrew
+./scriptd.sh config mbrew
 ```
 
 5. Install the supervisor LaunchAgent:
@@ -100,7 +100,8 @@ Notes:
 ./scriptd.sh stop root         # stop the LaunchAgent but keep it installed
 ./scriptd.sh uninstall root    # remove the LaunchAgent
 ./scriptd.sh run <module>      # run one module directly
-./scriptd.sh setup <module>    # run setup, or update enablement/schedule with flags
+./scriptd.sh config <module>   # run setup, or update enablement/schedule with flags
+./scriptd.sh config <module> show # print the module's service.yaml config
 ./scriptd.sh status            # print launchd + module status
 ./scriptd.sh test              # run unit and integration tests
 ```
@@ -165,16 +166,17 @@ schedule:
 
 Module-specific algorithm settings still live in each module's `module.yaml`.
 
-Update module enablement and schedules with `setup <module>`:
+Update module enablement and schedules with `config <module>`:
 
 ```bash
-./scriptd.sh setup mwifi --enable --every-minutes 5
-./scriptd.sh setup mcpu --disable
-./scriptd.sh setup mbrew --enable --daily-at 09:30 --weekday mon --weekday wed --weekday fri
-./scriptd.sh setup mbrew --cron "0 0 */12 * * *"
+./scriptd.sh config mwifi --enable --every-minutes 5
+./scriptd.sh config mcpu --disable
+./scriptd.sh config mbrew --enable --daily-at 09:30 --weekday mon --weekday wed --weekday fri
+./scriptd.sh config mbrew --cron "0 0 */12 * * *"
+./scriptd.sh config mwifi show
 ```
 
-Run `./scriptd.sh start root` after changing setup flags to install/update the LaunchAgent and restart it if it is already running. When `watch: true`, a running supervisor also picks up `service.yaml` edits automatically.
+Run `./scriptd.sh start root` after changing config flags to install/update the LaunchAgent and restart it if it is already running. When `watch: true`, a running supervisor also picks up `service.yaml` edits automatically.
 
 ## Bundled Modules
 

@@ -8,7 +8,7 @@ Files
 - `module.yaml` — the single module manifest/config file.
 
 Usage
-- `./scriptd.sh setup mbrew`
+- `./scriptd.sh config mbrew`
 - `./scriptd.sh run mbrew`
 - enable or disable it from `service.yaml`
 

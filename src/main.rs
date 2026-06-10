@@ -19,9 +19,49 @@ fn usage() {
     println!("  scriptd.sh uninstall root");
     println!("  scriptd.sh run root");
     println!("  scriptd.sh run <module>");
-    println!("  scriptd.sh setup <module> [--enable|--disable] [--every-seconds n|--every-minutes n|--every-hours n|--daily-at HH:MM|--cron expr]");
+    println!("  scriptd.sh config <module> show");
+    println!(
+        "  scriptd.sh config <module> [--enable|--disable] [--every-seconds n|--every-minutes n|--every-hours n|--daily-at HH:MM|--cron expr]"
+    );
     println!("  scriptd.sh status");
     println!("  scriptd.sh test");
+}
+
+fn show_module_config(args: &[String], repo_root: PathBuf) -> anyhow::Result<()> {
+    use crate::modules::BuiltInModule;
+
+    if args.len() != 1 {
+        anyhow::bail!("config show requires exactly one module name");
+    }
+
+    let module_name = args[0].as_str();
+    let cfg = read_service_config_with_setup(&repo_root)?;
+    if BuiltInModule::kind_from_id(module_name).is_err() {
+        anyhow::bail!("module \"{module_name}\" not compiled into this build");
+    }
+
+    let entry = cfg.modules.get(module_name).cloned().unwrap_or_default();
+    let mut value = serde_yaml::to_value(entry)?;
+    strip_null_yaml_values(&mut value);
+    print!("{}", serde_yaml::to_string(&value)?);
+    Ok(())
+}
+
+fn strip_null_yaml_values(value: &mut serde_yaml::Value) {
+    match value {
+        serde_yaml::Value::Mapping(mapping) => {
+            mapping.retain(|_, child| {
+                strip_null_yaml_values(child);
+                !matches!(child, serde_yaml::Value::Null)
+            });
+        }
+        serde_yaml::Value::Sequence(sequence) => {
+            for child in sequence {
+                strip_null_yaml_values(child);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn parse_and_update_module_config(args: &[String], repo_root: PathBuf) -> anyhow::Result<()> {
@@ -158,7 +198,7 @@ fn parse_and_update_module_config(args: &[String], repo_root: PathBuf) -> anyhow
                 has_schedule = true;
                 i += 1;
             }
-            other => anyhow::bail!("unknown setup flag: {other}"),
+            other => anyhow::bail!("unknown config flag: {other}"),
         }
         i += 1;
     }
@@ -175,7 +215,7 @@ fn parse_and_update_module_config(args: &[String], repo_root: PathBuf) -> anyhow
         trigger_count += schedule.every_hours.is_some() as usize;
         trigger_count += schedule.daily_at.is_some() as usize;
         if trigger_count > 1 {
-            anyhow::bail!("Use only one schedule trigger per setup command");
+            anyhow::bail!("Use only one schedule trigger per config command");
         }
     }
 
@@ -291,6 +331,17 @@ fn cmd_status(root: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn cmd_config(args: &[String], root: PathBuf) -> anyhow::Result<()> {
+    if args.get(1).map(String::as_str) == Some("show") {
+        if args.len() != 2 {
+            anyhow::bail!("config <module> show does not accept extra arguments");
+        }
+        return show_module_config(&[args[0].clone()], root);
+    }
+
+    parse_and_update_module_config(args, root)
+}
+
 fn cmd_test() -> anyhow::Result<()> {
     let use_rustup = std::process::Command::new("rustup")
         .arg("--version")
@@ -329,7 +380,7 @@ fn main() -> ExitCode {
         "stop" => cmd_stop(&args, root),
         "uninstall" => cmd_uninstall(&args, root),
         "run" => cmd_run(&args, root),
-        "setup" => parse_and_update_module_config(&args, root),
+        "config" => cmd_config(&args, root),
         "test" => cmd_test(),
         "help" => {
             usage();
@@ -373,7 +424,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_setup_rejects_enable_and_disable_together() {
+    fn parse_config_rejects_enable_and_disable_together() {
         let temp = tempdir().expect("temp dir");
         write_service_yaml(
             temp.path(),
@@ -390,13 +441,14 @@ mod tests {
         )
         .expect_err("expected conflict");
 
-        assert!(err
-            .to_string()
-            .contains("Use only one of --enable or --disable"));
+        assert!(
+            err.to_string()
+                .contains("Use only one of --enable or --disable")
+        );
     }
 
     #[test]
-    fn parse_setup_rejects_conflicting_schedule_triggers() {
+    fn parse_config_rejects_conflicting_schedule_triggers() {
         let temp = tempdir().expect("temp dir");
         write_service_yaml(
             temp.path(),
@@ -415,13 +467,14 @@ mod tests {
         )
         .expect_err("expected conflict");
 
-        assert!(err
-            .to_string()
-            .contains("Use only one schedule trigger per setup command"));
+        assert!(
+            err.to_string()
+                .contains("Use only one schedule trigger per config command")
+        );
     }
 
     #[test]
-    fn parse_setup_parses_window_and_weekday_flags() {
+    fn parse_config_parses_window_and_weekday_flags() {
         let temp = tempdir().expect("temp dir");
         write_service_yaml(
             temp.path(),
@@ -443,7 +496,7 @@ mod tests {
             ],
             temp.path().to_path_buf(),
         )
-        .expect("setup parses");
+        .expect("config parses");
 
         let updated = fs::read_to_string(temp.path().join("service.yaml")).expect("read service");
         assert!(updated.contains("enabled: true"));
@@ -454,7 +507,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_setup_rejects_invalid_weekday() {
+    fn parse_config_rejects_invalid_weekday() {
         let temp = tempdir().expect("temp dir");
         write_service_yaml(
             temp.path(),
@@ -471,9 +524,21 @@ mod tests {
         )
         .expect_err("expected invalid weekday");
 
-        assert!(err
-            .to_string()
-            .contains("--weekday expects sun, mon, tue, wed, thu, fri, sat"));
+        assert!(
+            err.to_string()
+                .contains("--weekday expects sun, mon, tue, wed, thu, fri, sat")
+        );
+    }
+
+    #[test]
+    fn show_config_prints_module_service_yaml() {
+        let temp = tempdir().expect("temp dir");
+        write_service_yaml(
+            temp.path(),
+            "label: com.omar.scriptd\nlog_dir: ~/Library/Logs/scriptd\nwatch: true\nmodules:\n  mwifi:\n    enabled: true\n    schedule:\n      every_minutes: 5\n",
+        );
+
+        show_module_config(&["mwifi".to_string()], temp.path().to_path_buf()).expect("show config");
     }
 
     #[test]

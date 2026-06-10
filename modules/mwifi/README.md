@@ -20,7 +20,7 @@ How ranking works
 - If the target SSID is saved in the macOS System keychain but has not been provisioned into scriptd yet, the monitor tries to import it on demand. macOS may show a fingerprint/password prompt once; after approval, future runs use the scriptd-owned Keychain item.
 
 Setup
-- `./scriptd.sh setup mwifi` imports saved Wi-Fi passwords for configured SSIDs and all currently preferred Wi-Fi networks from macOS.
+- `./scriptd.sh config mwifi` imports saved Wi-Fi passwords for configured SSIDs and all currently preferred Wi-Fi networks from macOS.
 - Setup may request administrator approval for the System keychain once. It copies each readable AirPort password into a scriptd-owned Keychain item named `scriptd-mwifi:<SSID>`.
 - Normal `./scriptd.sh run mwifi` runs use the provisioned scriptd Keychain item or the optional environment password fallback. They only touch the System keychain for an unprovisioned SSID that needs a password-backed join.
 

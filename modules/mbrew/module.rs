@@ -4,7 +4,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::credentials;
@@ -172,7 +172,7 @@ fn ensure_askpass(config: &MbrewConfig, logger: &ModuleLogger) -> anyhow::Result
     }
     let existing = keychain_password(config)?;
     if existing.is_empty() {
-        bail!("mbrew setup required. run './scriptd.sh setup mbrew'");
+        bail!("mbrew setup required. run './scriptd.sh config mbrew'");
     }
     write_askpass(config, logger)
 }
@@ -616,10 +616,12 @@ exit 1
             )
         });
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("mbrew setup required"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("mbrew setup required")
+        );
         Ok(())
     }
 
