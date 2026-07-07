@@ -164,6 +164,8 @@ schedule:
     end: "17:00"
 ```
 
+For `every_*` schedules, `window` is a hard start-time gate and the interval is a minimum spacing. If the next interval due time falls outside the window, the run is moved to the next allowed window start. If the interval is larger than the window duration, the module will run at most once per matching window.
+
 Module-specific algorithm settings still live in each module's `module.yaml`.
 
 Update module enablement and schedules with `config <module>`:

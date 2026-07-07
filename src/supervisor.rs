@@ -528,6 +528,21 @@ impl RunningSupervisor {
                 continue;
             }
 
+            if let Some(next_run_at) = runtime.next_run_at {
+                if next_run_at <= now {
+                    runtime.status = RuntimeStatus::Running;
+                    due.push(id.clone());
+                    changed = true;
+                    continue;
+                }
+
+                if runtime.status != RuntimeStatus::Scheduled {
+                    runtime.status = RuntimeStatus::Scheduled;
+                    changed = true;
+                }
+                continue;
+            }
+
             let plan = runtime.plan_next(now).unwrap_or_else(|| {
                 config::build_interval_plan(false, false, &runtime.schedule, now)
             });
@@ -704,79 +719,13 @@ pub fn run_one_module(root: PathBuf, module: &str) -> Result<()> {
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("module \"{module}\" not found"))?;
     let module_schedule = module_definition_schedule(&definition, config.modules.get(module));
-    let root_for_context = root.clone();
     let log_dir = config.expanded_log_dir();
     let module_dir = definition.dir.clone();
-    let label = config.label.clone();
-    let root_dir = config.root_dir.to_string_lossy().to_string();
-    let config_path = config.path.to_string_lossy().to_string();
-    let log_dir_path = log_dir.to_string_lossy().to_string();
-    let watch = config.watch;
 
-    let mut context =
-        modules::module_context_with_console(module, root_for_context, module_dir, log_dir, true);
-    let mut runtime = ModuleRuntime::from_definition(definition.clone());
-    runtime.schedule = module_schedule;
+    let mut context = modules::module_context_with_console(module, root, module_dir, log_dir, true);
     println!("Running {module}...");
-    let status = modules::run_once(&kind, &mut context, &runtime.schedule)?;
+    modules::run_once(&kind, &mut context, &module_schedule)?;
     println!("Completed {module}.");
-
-    let mut module_states = BTreeMap::new();
-    let health = status
-        .as_ref()
-        .and_then(|_value| {
-            modules::module_status(&kind).and_then(|(_, health)| serde_json::to_value(health).ok())
-        })
-        .or_else(|| Some(serde_json::json!({ "ok": true })));
-
-    let message = status
-        .as_ref()
-        .and_then(|value| value.message.clone())
-        .unwrap_or_else(|| "ok".to_string());
-    module_states.insert(
-        kind.id().to_string(),
-        PersistedModuleState {
-            desired_enabled: true,
-            status: "running".to_string(),
-            mode: definition.manifest.mode.clone(),
-            last_started_at: Some(Local::now().to_rfc3339()),
-            last_run_at: Some(Local::now().to_rfc3339()),
-            last_exit_at: None,
-            next_run_at: runtime.next_run_at.map(|value| value.to_rfc3339()),
-            runs: 1,
-            restarts: 0,
-            message,
-            health,
-            module_status: status
-                .as_ref()
-                .and_then(|value| serde_json::to_value(value.clone()).ok()),
-            last_error: None,
-        },
-    );
-
-    let state = PersistedState {
-        label,
-        root_dir,
-        config_path,
-        log_dir: log_dir_path,
-        updated_at: Local::now().to_rfc3339(),
-        supervisor: PersistedSupervisorState {
-            pid: std::process::id() as i32,
-            started_at: Local::now().to_rfc3339(),
-            watch,
-        },
-        modules: module_states,
-    };
-
-    if let Some(parent) = config.state_file.parent() {
-        std::fs::create_dir_all(parent).context("ensure state directory")?;
-    }
-    let json = serde_json::to_string_pretty(&state)?;
-    let tmp = config
-        .state_file
-        .with_extension(format!("{}.tmp", std::process::id()));
-    std::fs::write(&tmp, json).context("write temporary state")?;
-    std::fs::rename(tmp, &config.state_file).context("install state file")?;
     Ok(())
 }
 
@@ -816,4 +765,115 @@ async fn run_supervisor_async(root: PathBuf) -> Result<()> {
 
     supervisor.persist_if_changed()?;
     supervisor.run_event_loop().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+    use tempfile::tempdir;
+
+    use crate::config::ModuleManifest;
+    use crate::modules::ModuleMode;
+
+    fn test_definition(root: &Path) -> ModuleDefinition {
+        let module_dir = root.join("modules").join("mcpu");
+        std::fs::create_dir_all(&module_dir).expect("create module dir");
+        std::fs::write(
+            module_dir.join("module.yaml"),
+            "id: mcpu\nmode: interval\ninterval_seconds: 30\n",
+        )
+        .expect("write module manifest");
+
+        ModuleDefinition {
+            id: "mcpu".to_string(),
+            manifest: ModuleManifest {
+                id: "mcpu".to_string(),
+                display_name: None,
+                mode: "interval".to_string(),
+                interval_seconds: Some(30),
+            },
+            dir: module_dir,
+            mode: ModuleMode::Interval,
+        }
+    }
+
+    fn test_supervisor(root: &Path, runtime: ModuleRuntime) -> RunningSupervisor {
+        let mut modules = BTreeMap::new();
+        modules.insert(runtime.id.clone(), runtime);
+
+        RunningSupervisor {
+            _singleton_lock: SingletonLock {
+                path: root.join("scriptd.lock"),
+            },
+            root: root.to_path_buf(),
+            state_file: root.join("state.json"),
+            config_path: root.join("service.yaml"),
+            log_dir: root.join("logs"),
+            label: "com.test.scriptd".to_string(),
+            started_at: Local::now().to_rfc3339(),
+            watch: false,
+            modules,
+            watcher: None,
+            reload_receiver: None,
+            last_state_fingerprint: None,
+        }
+    }
+
+    #[test]
+    fn due_interval_run_uses_existing_next_run_at() {
+        let temp = tempdir().expect("temp dir");
+        let now = Local
+            .with_ymd_and_hms(2026, 6, 9, 9, 53, 4)
+            .single()
+            .expect("valid datetime");
+
+        let mut runtime = ModuleRuntime::from_definition(test_definition(temp.path()));
+        runtime.desired_enabled = true;
+        runtime.status = RuntimeStatus::Scheduled;
+        runtime.schedule = Some(ModuleSchedule {
+            every_seconds: Some(10),
+            ..ModuleSchedule::default()
+        });
+        runtime.next_run_at = Some(now - chrono::Duration::seconds(10));
+
+        let mut supervisor = test_supervisor(temp.path(), runtime);
+        let changed = supervisor
+            .schedule_and_run_due_modules(now)
+            .expect("schedule due modules");
+        let runtime = supervisor.modules.get("mcpu").expect("mcpu runtime");
+
+        assert!(changed);
+        assert_eq!(runtime.runs, 1);
+        assert!(runtime.next_run_at.expect("next run") > now);
+    }
+
+    #[test]
+    fn future_interval_run_does_not_slide_forward() {
+        let temp = tempdir().expect("temp dir");
+        let now = Local
+            .with_ymd_and_hms(2026, 6, 9, 9, 53, 4)
+            .single()
+            .expect("valid datetime");
+        let next_run_at = now + chrono::Duration::seconds(10);
+
+        let mut runtime = ModuleRuntime::from_definition(test_definition(temp.path()));
+        runtime.desired_enabled = true;
+        runtime.status = RuntimeStatus::Scheduled;
+        runtime.schedule = Some(ModuleSchedule {
+            every_seconds: Some(10),
+            ..ModuleSchedule::default()
+        });
+        runtime.next_run_at = Some(next_run_at);
+
+        let mut supervisor = test_supervisor(temp.path(), runtime);
+        let changed = supervisor
+            .schedule_and_run_due_modules(now)
+            .expect("schedule due modules");
+        let runtime = supervisor.modules.get("mcpu").expect("mcpu runtime");
+
+        assert!(!changed);
+        assert_eq!(runtime.runs, 0);
+        assert_eq!(runtime.next_run_at, Some(next_run_at));
+    }
 }

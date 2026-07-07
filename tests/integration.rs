@@ -525,6 +525,65 @@ fn integration_run_mwifi_uses_fake_networksetup_and_ping_boundary() {
 
 #[test]
 #[serial]
+fn integration_run_one_module_does_not_overwrite_supervisor_state() {
+    let root = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    let fake_bin = root.path().join("fake_bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    let wifi_log = root.path().join("wifi.log");
+    let wifi_state = root.path().join("mwifi-state.json");
+    create_fake_wifi_stack(&fake_bin, &wifi_log).unwrap();
+    write_modules(root.path());
+    write_wifi_module(root.path(), &wifi_state);
+    write_service_yaml(root.path(), false, true, false, true);
+
+    let state_file = home
+        .path()
+        .join("Library/Application Support/scriptd/state.json");
+    fs::create_dir_all(state_file.parent().unwrap()).unwrap();
+    fs::write(
+        &state_file,
+        format!(
+            r#"{{
+  "label":"com.omar.scriptd",
+  "rootDir":"{}",
+  "configPath":"{}",
+  "logDir":"/tmp/scriptd-logs",
+  "updatedAt":"2026-06-08T00:00:00Z",
+  "supervisor":{{"pid":111,"startedAt":"2026-06-08T00:00:00Z","watch":true}},
+  "modules":{{
+    "mbrew":{{"desiredEnabled":true,"status":"scheduled","mode":"interval","lastStartedAt":null,"lastRunAt":null,"lastExitAt":null,"nextRunAt":"2026-06-08T12:00:00Z","runs":7,"restarts":0,"message":"next run at 2026-06-08T12:00:00Z","health":null,"moduleStatus":null,"lastError":null}},
+    "mwifi":{{"desiredEnabled":true,"status":"scheduled","mode":"interval","lastStartedAt":null,"lastRunAt":null,"lastExitAt":null,"nextRunAt":"2026-06-08T00:05:00Z","runs":3,"restarts":0,"message":"next run at 2026-06-08T00:05:00Z","health":null,"moduleStatus":null,"lastError":null}}
+  }}
+}}
+"#,
+            root.path().to_string_lossy(),
+            root.path().join("service.yaml").to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let before = fs::read_to_string(&state_file).unwrap();
+
+    let scan_output =
+        "SSID BSSID RSSI CHANNEL SECURITY\nHome 00:11:22:33:44:55 -90 1 WPA2\nOffice 00:11:22:33:44:66 -20 233 WPA3\n";
+    let output = run_scriptd(root.path(), home.path(), &fake_bin)
+        .env("SCRIPTD_MWIFI_SCAN_OUTPUT", scan_output)
+        .arg("run")
+        .arg("mwifi")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let after = fs::read_to_string(&state_file).unwrap();
+    assert_eq!(after, before);
+}
+
+#[test]
+#[serial]
 fn integration_run_mwifi_retries_with_password_after_unobserved_zero_exit_join() {
     let root = tempdir().unwrap();
     let home = tempdir().unwrap();

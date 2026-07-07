@@ -277,6 +277,10 @@ fn next_interval_candidate_in_window(
     now: DateTime<Local>,
 ) -> Option<DateTime<Local>> {
     let mut candidate = next_interval_candidates(interval_seconds, now)?;
+    if schedule.window.is_some() {
+        return next_time_in_window(schedule, candidate);
+    }
+
     let max_checks = 14u64.saturating_mul(24 * 60 * 60) / interval_seconds.max(1) + 1;
 
     for _ in 0..max_checks {
@@ -288,6 +292,65 @@ fn next_interval_candidate_in_window(
     }
 
     None
+}
+
+fn local_datetime_on(date: chrono::NaiveDate, time: NaiveTime) -> Option<DateTime<Local>> {
+    let raw = date.and_time(time);
+    Local
+        .from_local_datetime(&raw)
+        .earliest()
+        .or_else(|| Local.from_local_datetime(&raw).single())
+}
+
+fn next_time_in_window(
+    schedule: &ModuleSchedule,
+    earliest: DateTime<Local>,
+) -> Option<DateTime<Local>> {
+    let window = schedule.window.as_ref()?;
+    let start = parse_time(&window.start).ok()?;
+    let end = parse_time(&window.end).ok()?;
+    let overnight = start.num_seconds_from_midnight() > end.num_seconds_from_midnight();
+    let mut best: Option<DateTime<Local>> = None;
+
+    for day_offset in -1..=14 {
+        let Some(window_date) = earliest
+            .date_naive()
+            .checked_add_signed(Duration::days(day_offset))
+        else {
+            continue;
+        };
+        let Some(window_start) = local_datetime_on(window_date, start) else {
+            continue;
+        };
+        let window_end_date = if overnight {
+            window_date
+                .checked_add_days(chrono::Days::new(1))
+                .unwrap_or(window_date)
+        } else {
+            window_date
+        };
+        let Some(window_end) = local_datetime_on(window_end_date, end) else {
+            continue;
+        };
+
+        if window_end < earliest {
+            continue;
+        }
+
+        let candidate = if window_start < earliest {
+            earliest
+        } else {
+            window_start
+        };
+        if candidate <= window_end
+            && schedule.allow_now(&candidate)
+            && best.is_none_or(|current| candidate < current)
+        {
+            best = Some(candidate);
+        }
+    }
+
+    best
 }
 
 fn next_daily_candidates(
@@ -795,7 +858,7 @@ mod tests {
     }
 
     #[test]
-    fn next_scheduled_run_for_interval_schedule_advances_past_window_edge() {
+    fn next_scheduled_run_for_interval_schedule_clamps_past_window_edge() {
         let schedule = ModuleSchedule {
             every_minutes: Some(5),
             window: Some(ScheduleWindow {
@@ -816,7 +879,54 @@ mod tests {
             now.date_naive().succ_opt().expect("next day")
         );
         assert_eq!(next.hour(), 0);
-        assert_eq!(next.minute(), 3);
+        assert_eq!(next.minute(), 0);
+    }
+
+    #[test]
+    fn next_scheduled_run_for_interval_schedule_clamps_to_next_window() {
+        let schedule = ModuleSchedule {
+            every_hours: Some(12),
+            window: Some(ScheduleWindow {
+                start: "06:00".to_string(),
+                end: "08:00".to_string(),
+            }),
+            ..ModuleSchedule::default()
+        };
+
+        let now = Local
+            .with_ymd_and_hms(2026, 6, 8, 13, 50, 0)
+            .single()
+            .expect("valid datetime");
+        let next = next_scheduled_run(&Some(schedule), now).expect("next schedule");
+
+        assert_eq!(
+            next.date_naive(),
+            now.date_naive().succ_opt().expect("next day")
+        );
+        assert_eq!(next.hour(), 6);
+        assert_eq!(next.minute(), 0);
+    }
+
+    #[test]
+    fn next_scheduled_run_for_interval_schedule_keeps_due_time_inside_window() {
+        let schedule = ModuleSchedule {
+            every_minutes: Some(30),
+            window: Some(ScheduleWindow {
+                start: "06:00".to_string(),
+                end: "08:00".to_string(),
+            }),
+            ..ModuleSchedule::default()
+        };
+
+        let now = Local
+            .with_ymd_and_hms(2026, 6, 8, 6, 15, 0)
+            .single()
+            .expect("valid datetime");
+        let next = next_scheduled_run(&Some(schedule), now).expect("next schedule");
+
+        assert_eq!(next.date_naive(), now.date_naive());
+        assert_eq!(next.hour(), 6);
+        assert_eq!(next.minute(), 45);
     }
 
     #[test]
