@@ -542,7 +542,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_ts_artifacts_removed() {
+    fn old_ts_artifacts_removed() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let expected_missing = [
             "src/config.ts",

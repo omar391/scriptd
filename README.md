@@ -290,6 +290,7 @@ The repo includes tests for:
 ## Operational Notes
 
 - This project is designed around a user LaunchAgent in `~/Library/LaunchAgents`.
+- Install the LaunchAgent from the primary checkout; `start root` rejects linked git worktrees so the service cannot retain a disposable worktree path.
 - The repo is built as a single Rust binary.
 - The bundled modules are macOS-oriented personal automations, but the module interface is generic enough for additional local services and scheduled tasks.
 

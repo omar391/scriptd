@@ -7,6 +7,8 @@ venv/
 env/
 .pytest_cache/
 target/
+worktrees/
+tmp/
 
 # git-land trunk
 .trunk/*

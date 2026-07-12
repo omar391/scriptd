@@ -219,9 +219,8 @@ fn write_brew_module(root: &Path, homebrew_bin: &Path, askpass_path: &Path) {
     fs::write(
         module_dir.join("module.yaml"),
         format!(
-            "id: mbrew\nmode: interval\ninterval_seconds: 30\nkeychain_service: BrewAutoUpdate\naskpass_path: {}\nlegacy_log_dir: {}/legacy\nmax_log_size_mb: 50\nmax_log_age_days: 30\nmax_rotated_logs: 5\nhomebrew_bin: {}\nsudoers_path: {}/sudoers-homebrew\nsudoers_timeout_path: {}/sudoers-timeout\nsudo_timeout_hours: 2\n",
+            "id: mbrew\nmode: interval\ninterval_seconds: 30\naskpass_path: {}\nhomebrew_bin: {}\nsudoers_path: {}/sudoers-homebrew\nsudoers_timeout_path: {}/sudoers-timeout\nsudo_timeout_hours: 2\n",
             askpass_path.to_string_lossy(),
-            root.to_string_lossy(),
             homebrew_bin.to_string_lossy(),
             root.to_string_lossy(),
             root.to_string_lossy()
@@ -274,10 +273,6 @@ fn write_test_admin_credential(home: &Path, password: &str) {
     let mut values = serde_json::Map::new();
     values.insert(
         format!("ScriptdAdmin\n{user}"),
-        Value::String(password.to_string()),
-    );
-    values.insert(
-        format!("BrewAutoUpdate\n{user}"),
         Value::String(password.to_string()),
     );
     fs::write(

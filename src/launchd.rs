@@ -10,6 +10,7 @@ use crate::paths::{resolve_launch_agents_dir, resolve_launchd_plist_path, resolv
 
 fn plist_contents(label: &str, executable: &str) -> String {
     let mut buffer = String::new();
+    let user = crate::credentials::current_user();
     let _ = writeln!(
         buffer,
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -36,6 +37,10 @@ fn plist_contents(label: &str, executable: &str) -> String {
   <string>{err}</string>
   <key>EnvironmentVariables</key>
   <dict>
+    <key>USER</key>
+    <string>{user}</string>
+    <key>LOGNAME</key>
+    <string>{user}</string>
     <key>PATH</key>
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
   </dict>
@@ -43,6 +48,7 @@ fn plist_contents(label: &str, executable: &str) -> String {
 </plist>"#,
         label = label,
         executable = executable,
+        user = user,
         out = resolve_state_dir().join("scriptd.log").to_string_lossy(),
         err = resolve_state_dir().join("scriptd.err").to_string_lossy(),
     );
@@ -81,7 +87,7 @@ fn app_info_plist(label: &str) -> String {
 }
 
 fn launchd_domain_label(label: &str) -> String {
-    let output = Command::new("id").args(["-u"]).output();
+    let output = Command::new("/usr/bin/id").args(["-u"]).output();
     if let Ok(value) = output {
         let uid = String::from_utf8_lossy(&value.stdout).trim().to_string();
         if !uid.is_empty() {
@@ -93,6 +99,15 @@ fn launchd_domain_label(label: &str) -> String {
 
 fn resolve_state_app_root() -> PathBuf {
     resolve_state_dir().join("Scriptd.app")
+}
+
+fn ensure_stable_service_root(root: &Path) -> Result<()> {
+    if root.join(".git").is_file() {
+        anyhow::bail!(
+            "refusing to install scriptd from a linked git worktree; land the change and start it from the primary checkout"
+        );
+    }
+    Ok(())
 }
 
 fn write_scriptd_wrapper(binary_path: &Path, config: &ServiceConfig) -> Result<PathBuf> {
@@ -141,6 +156,7 @@ pub fn write_root_plist(executable: &Path, config: &ServiceConfig) -> Result<Pat
 }
 
 pub fn start_root(config: &ServiceConfig) -> Result<()> {
+    ensure_stable_service_root(&config.root_dir)?;
     let exe = std::env::current_exe()?;
     let plist_path = write_root_plist(&exe, config)?;
     let label = &config.label;
@@ -188,6 +204,29 @@ pub fn status_loaded(label: &str) -> (bool, Option<u32>, Option<i32>) {
         }
     }
     (false, None, None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ensure_stable_service_root, plist_contents};
+    use crate::credentials::current_user;
+    use tempfile::tempdir;
+
+    #[test]
+    fn launch_agent_plist_pins_the_current_user() {
+        let plist = plist_contents("com.example.scriptd", "/tmp/scriptd");
+        let user = current_user();
+        assert!(plist.contains(&format!("<key>USER</key>\n    <string>{user}</string>")));
+        assert!(plist.contains(&format!("<key>LOGNAME</key>\n    <string>{user}</string>")));
+    }
+
+    #[test]
+    fn launch_agent_rejects_linked_worktree_roots() {
+        let root = tempdir().expect("temp root");
+        std::fs::write(root.path().join(".git"), "gitdir: /tmp/example").expect("git marker");
+        let error = ensure_stable_service_root(root.path()).expect_err("linked worktree rejected");
+        assert!(error.to_string().contains("primary checkout"));
+    }
 }
 
 pub fn run_launchctl(args: &[&str], must_succeed: bool) -> Result<()> {

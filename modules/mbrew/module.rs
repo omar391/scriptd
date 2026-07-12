@@ -4,7 +4,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 
-use anyhow::{Context, bail};
+use anyhow::{bail, Context};
 use serde::{Deserialize, Serialize};
 
 use crate::credentials;
@@ -13,18 +13,8 @@ use crate::paths::expand_home;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MbrewConfig {
-    #[serde(rename = "keychain_service")]
-    keychain_service: String,
     #[serde(rename = "askpass_path")]
     askpass_path: String,
-    #[serde(rename = "legacy_log_dir")]
-    legacy_log_dir: String,
-    #[serde(rename = "max_log_size_mb")]
-    max_log_size_mb: u64,
-    #[serde(rename = "max_log_age_days")]
-    max_log_age_days: u64,
-    #[serde(rename = "max_rotated_logs")]
-    max_rotated_logs: u64,
     #[serde(rename = "homebrew_bin")]
     homebrew_bin: String,
     #[serde(rename = "sudoers_path")]
@@ -38,12 +28,7 @@ struct MbrewConfig {
 impl Default for MbrewConfig {
     fn default() -> Self {
         Self {
-            keychain_service: "BrewAutoUpdate".to_string(),
             askpass_path: "~/Library/Application Support/scriptd/mbrew/brew_askpass.sh".to_string(),
-            legacy_log_dir: "~/Library/Logs/Homebrew".to_string(),
-            max_log_size_mb: 50,
-            max_log_age_days: 30,
-            max_rotated_logs: 5,
             homebrew_bin: "/opt/homebrew/bin/brew".to_string(),
             sudoers_path: "/etc/sudoers.d/homebrew".to_string(),
             sudoers_timeout_path: "/etc/sudoers.d/homebrew_timeout".to_string(),
@@ -103,48 +88,8 @@ fn run_command(
     }
 }
 
-fn keychain_password(config: &MbrewConfig) -> anyhow::Result<String> {
-    Ok(credentials::admin_password(Some(&config.keychain_service))?.unwrap_or_default())
-}
-
-fn cleanup_legacy_logs(config: &MbrewConfig, logger: &ModuleLogger) {
-    let base = expand_home(&config.legacy_log_dir);
-    if !base.exists() {
-        return;
-    }
-    logger.info(&format!(
-        "Cleaning up legacy Homebrew logs in {}",
-        base.display()
-    ));
-    rotate_log(
-        base.join("autoupdate.log").as_path(),
-        config.max_log_size_mb,
-        config.max_rotated_logs,
-        logger,
-    );
-    rotate_log(
-        base.join("autoupdate.err").as_path(),
-        config.max_log_size_mb,
-        config.max_rotated_logs,
-        logger,
-    );
-}
-
-fn rotate_log(path: &std::path::Path, max_size_mb: u64, max_rotated: u64, logger: &ModuleLogger) {
-    let metadata = fs::metadata(path).ok();
-    let size = metadata.map_or(0, |value| value.len());
-    let max_bytes = max_size_mb.saturating_mul(1024).saturating_mul(1024);
-    if size <= max_bytes {
-        return;
-    }
-    for index in (1..=max_rotated).rev() {
-        let source = format!("{}.{}", path.display(), index);
-        let target = format!("{}.{}", path.display(), index + 1);
-        let _ = fs::rename(source, target);
-    }
-    let _ = fs::rename(path, format!("{}.1", path.display()));
-    let _ = fs::write(path, "");
-    let _ = logger;
+fn keychain_password() -> anyhow::Result<String> {
+    Ok(credentials::admin_password()?.unwrap_or_default())
 }
 
 fn write_askpass(config: &MbrewConfig, logger: &ModuleLogger) -> anyhow::Result<()> {
@@ -170,7 +115,7 @@ fn ensure_askpass(config: &MbrewConfig, logger: &ModuleLogger) -> anyhow::Result
     if path.exists() {
         return Ok(());
     }
-    let existing = keychain_password(config)?;
+    let existing = keychain_password()?;
     if existing.is_empty() {
         bail!("mbrew setup required. run './scriptd.sh config mbrew'");
     }
@@ -182,15 +127,17 @@ fn configure_sudo(
     password: &str,
     logger: &ModuleLogger,
 ) -> anyhow::Result<()> {
+    let user = credentials::current_user();
+    if user.is_empty() {
+        bail!("could not resolve the current user for sudoers setup");
+    }
     let rules = format!(
         "{} ALL=(ALL) NOPASSWD: {} upgrade*, {} cleanup\n",
-        std::env::var("USER").unwrap_or_default(),
-        config.homebrew_bin,
-        config.homebrew_bin
+        user, config.homebrew_bin, config.homebrew_bin
     );
     let timeout = format!(
         "Defaults:{} timestamp_timeout={}\n",
-        std::env::var("USER").unwrap_or_default(),
+        user,
         config.sudo_timeout_hours.saturating_mul(60)
     );
 
@@ -256,7 +203,6 @@ fn update_from_config(module_dir: &std::path::Path) -> MbrewConfig {
 }
 
 fn brew_maintenance(config: &MbrewConfig, logger: &ModuleLogger) -> anyhow::Result<Vec<String>> {
-    cleanup_legacy_logs(config, logger);
     ensure_askpass(config, logger)?;
     let (update_out, update_err, status) = command_for_brew(config, &["update"])?;
     if status != 0 {
@@ -335,7 +281,7 @@ fn brew_maintenance(config: &MbrewConfig, logger: &ModuleLogger) -> anyhow::Resu
 
 pub fn setup(context: &mut ModuleContext) -> anyhow::Result<()> {
     let config = update_from_config(&context.module_dir);
-    let password = credentials::admin_password_or_prompt(Some(&config.keychain_service))?;
+    let password = credentials::admin_password_or_prompt()?;
     write_askpass(&config, &context.logger)?;
     configure_sudo(&config, &password, &context.logger)?;
     context.logger.info("mbrew setup complete");
@@ -473,11 +419,10 @@ mod tests {
         result
     }
 
-    fn default_config(home: &Path, homebrew_bin: &Path, askpass: &Path) -> MbrewConfig {
+    fn default_config(_home: &Path, homebrew_bin: &Path, askpass: &Path) -> MbrewConfig {
         MbrewConfig {
             homebrew_bin: homebrew_bin.to_string_lossy().to_string(),
             askpass_path: askpass.to_string_lossy().to_string(),
-            legacy_log_dir: format!("{}/legacy", home.to_string_lossy()),
             ..MbrewConfig::default()
         }
     }
@@ -543,7 +488,7 @@ exit 1
             "#!/bin/sh\nif [ \"$1\" = \"find-generic-password\" ]; then\necho super-secret\nexit 0\nfi\nexit 0\n",
         )?;
         let config = default_config(root.path(), &brew, &root.path().join("askpass.sh"));
-        crate::credentials::store_admin_password("super-secret", Some(&config.keychain_service))?;
+        crate::credentials::store_admin_password("super-secret")?;
 
         let previous_log = std::env::var("BREW_TEST_LOG").ok();
         std::env::set_var("BREW_TEST_LOG", &brew_log);
@@ -575,7 +520,7 @@ exit 1
             "#!/bin/sh\nif [ \"$1\" = \"find-generic-password\" ]; then\necho super-secret\nexit 0\nfi\nexit 0\n",
         )?;
         let config = default_config(root.path(), &root.path().join("brew"), &askpass);
-        crate::credentials::store_admin_password("super-secret", Some(&config.keychain_service))?;
+        crate::credentials::store_admin_password("super-secret")?;
 
         with_path_scope(&fake_bin, || {
             assert!(!askpass.exists());
@@ -607,7 +552,7 @@ exit 1
             &root.path().join("brew"),
             &root.path().join("askpass.sh"),
         );
-        crate::credentials::delete_admin_password(Some(&config.keychain_service))?;
+        crate::credentials::delete_admin_password()?;
 
         let result = with_path_scope(&fake_bin, || {
             ensure_askpass(
@@ -616,12 +561,10 @@ exit 1
             )
         });
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("mbrew setup required")
-        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("mbrew setup required"));
         Ok(())
     }
 

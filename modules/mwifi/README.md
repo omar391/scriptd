@@ -3,7 +3,7 @@ mwifi
 
 This is a small macOS better Wi-Fi selector that filters to known SSIDs, scores each candidate, and switches only when a better choice is worth disrupting the current connection.
 
-It prefers the legacy `airport -s` scan output when available and falls back to a lightweight command-based path when needed.
+It prefers the bundled `airport -s` scan output when available and falls back to a lightweight command-based path when needed.
 
 How ranking works
 - If `MWIFI_SSIDS` is set, only those SSIDs are considered.
@@ -14,15 +14,15 @@ How ranking works
 - The current connection is pinged as a health check, not as per-candidate scoring.
 - A challenger can win after dwell when its `switchScore` beats the current network by `min_switch_score_delta` points. The default threshold is 10.
 - It also respects `MWIFI_MIN_DWELL`, so it will not switch again until the dwell window has passed.
-- Joins use the same passwordless `networksetup -setairportnetwork` path as the legacy TypeScript module, then verify that the target SSID became current before writing switch state.
+- Joins use the passwordless `networksetup -setairportnetwork` path, then verify that the target SSID became current before writing switch state.
 - If passwordless join completes but the target is not observed as current, the monitor can retry `sudo networksetup` with the shared scriptd admin credential, then verifies again.
-- If those joins do not actually associate, the monitor can use a Wi-Fi password from `MWIFI_PASSWORD_<SSID>`, `MWIFI_PASSWORD`, or a scriptd-owned Keychain item named `scriptd-mwifi:<SSID>`.
-- If the target SSID is saved in the macOS System keychain but has not been provisioned into scriptd yet, the monitor tries to import it on demand. macOS may show a fingerprint/password prompt once; after approval, future runs use the scriptd-owned Keychain item.
+- If those joins do not actually associate, the monitor can use a Wi-Fi password from `MWIFI_PASSWORD_<SSID>`, `MWIFI_PASSWORD`, or a scriptd-owned login Keychain item named `scriptd:mwifi:<SSID>`.
+- Normal monitor runs never read the System keychain or open authentication UI. Missing Wi-Fi credentials require the explicit setup command.
 
 Setup
 - `./scriptd.sh config mwifi` imports saved Wi-Fi passwords for configured SSIDs and all currently preferred Wi-Fi networks from macOS.
-- Setup may request administrator approval for the System keychain once. It copies each readable AirPort password into a scriptd-owned Keychain item named `scriptd-mwifi:<SSID>`.
-- Normal `./scriptd.sh run mwifi` runs use the provisioned scriptd Keychain item or the optional environment password fallback. They only touch the System keychain for an unprovisioned SSID that needs a password-backed join.
+- Setup may request administrator approval for the System keychain. It copies each readable AirPort password into the current user's scriptd-owned login Keychain namespace.
+- Normal `./scriptd.sh run mwifi` runs use only the provisioned scriptd Keychain item or the optional environment password fallback.
 
 Files
 - `module.rs` — Rust module implementation.

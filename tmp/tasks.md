@@ -1,2 +1,0 @@
-- [x] Update mwifi schedule window to all day
-- [x] Restart the service

@@ -1293,9 +1293,7 @@ fn run_networksetup_join(
 }
 
 fn find_wifi_password(ssid: &str) -> Option<String> {
-    password_from_env(ssid)
-        .or_else(|| password_from_scriptd_keychain(ssid))
-        .or_else(|| import_system_airport_password(ssid))
+    password_from_env(ssid).or_else(|| password_from_scriptd_keychain(ssid))
 }
 
 fn run_password_networksetup_join(device: &str, ssid: &str) -> Option<Result<(), String>> {
@@ -1350,7 +1348,15 @@ fn run_sudo_networksetup_join(device: &str, ssid: &str) -> anyhow::Result<JoinAt
 }
 
 fn scriptd_admin_password() -> anyhow::Result<String> {
-    credentials::admin_password_or_prompt(Some(credentials::LEGACY_BREW_ADMIN_SERVICE))
+    require_admin_password(credentials::admin_password()?)
+}
+
+fn require_admin_password(password: Option<String>) -> anyhow::Result<String> {
+    password.ok_or_else(|| {
+        anyhow::anyhow!(
+            "scriptd admin password is unavailable; run './scriptd.sh config mbrew' first"
+        )
+    })
 }
 
 fn password_message_for_error(message: &str) -> String {
@@ -1359,13 +1365,6 @@ fn password_message_for_error(message: &str) -> String {
 
 fn scriptd_mwifi_keychain_service(ssid: &str) -> String {
     credentials::scriptd_service("mwifi", ssid)
-}
-
-fn legacy_scriptd_wifi_keychain_services(ssid: &str) -> [String; 2] {
-    [
-        credentials::scriptd_service("better-wifi", ssid),
-        credentials::scriptd_service("wifi", ssid),
-    ]
 }
 
 fn password_from_env(ssid: &str) -> Option<String> {
@@ -1386,21 +1385,11 @@ fn password_from_scriptd_keychain(ssid: &str) -> Option<String> {
         return Some(password);
     }
 
-    for legacy_service in legacy_scriptd_wifi_keychain_services(ssid) {
-        if let Some(password) = credentials::find_generic_password(&legacy_service, ssid)
-            .ok()
-            .flatten()
-        {
-            let _ = store_scriptd_wifi_password(ssid, &password);
-            return Some(password);
-        }
-    }
-
     None
 }
 
 fn password_from_system_airport_keychain(ssid: &str) -> anyhow::Result<Option<String>> {
-    let output = Command::new("security")
+    let output = Command::new("/usr/bin/security")
         .args([
             "find-generic-password",
             "-w",
@@ -1414,14 +1403,6 @@ fn password_from_system_airport_keychain(ssid: &str) -> anyhow::Result<Option<St
     }
     let password = String::from_utf8_lossy(&output.stdout).trim().to_string();
     Ok((!password.is_empty()).then_some(password))
-}
-
-fn import_system_airport_password(ssid: &str) -> Option<String> {
-    let password = password_from_system_airport_keychain(ssid).ok().flatten()?;
-    if store_scriptd_wifi_password(ssid, &password).is_err() {
-        return None;
-    }
-    Some(password)
 }
 
 fn store_scriptd_wifi_password(ssid: &str, password: &str) -> anyhow::Result<()> {
@@ -2464,8 +2445,14 @@ TestNet              00:99:88:77:66:55 -65 233 WPA3(PSK/AES/AES)\n";
         assert_eq!(env_key_suffix("Yousuf WiFi"), "YOUSUF_WIFI");
         assert_eq!(
             scriptd_mwifi_keychain_service("knight_riders_5G"),
-            "scriptd-mwifi:knight_riders_5G"
+            "mwifi:knight_riders_5G"
         );
+    }
+
+    #[test]
+    fn runtime_admin_lookup_reports_setup_required_without_prompting() {
+        let error = require_admin_password(None).expect_err("missing admin credential");
+        assert!(error.to_string().contains("config mbrew"));
     }
 
     #[test]
