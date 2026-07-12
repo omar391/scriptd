@@ -20,4 +20,4 @@ modules:
       every_minutes: 5
       window:
         start: 00:00
-        end: 06:00
+        end: 23:59
