@@ -870,6 +870,7 @@ dependencies = [
  "objc2-foundation",
  "once_cell",
  "predicates",
+ "regex",
  "rpassword",
  "security-framework",
  "serde",

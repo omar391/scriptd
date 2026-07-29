@@ -230,12 +230,21 @@ fn write_brew_module(root: &Path, homebrew_bin: &Path, askpass_path: &Path) {
 }
 
 fn write_wifi_module(root: &Path, state_file: &Path) {
+    write_wifi_module_with_repeater_rules(root, state_file, "repeater_rules: []\n");
+}
+
+fn write_wifi_module_with_repeater_rules(
+    root: &Path,
+    state_file: &Path,
+    repeater_rules_yaml: &str,
+) {
     let module_dir = root.join("modules").join("mwifi");
     fs::create_dir_all(&module_dir).expect("create wifi module dir");
     fs::write(
         module_dir.join("module.yaml"),
         format!(
-            "id: mwifi\nmode: interval\ninterval_seconds: 30\nmin_dwell: 1\nping_target: 1.1.1.1\nping_count: 3\nping_timeout: 1\nping_high_latency_ms: 250\nhealth_failure_switch_runs: 2\nband_bonus_2g: 0\nband_bonus_5g: 35\nband_bonus_6g: 50\npreference_top_bonus: 30\npreference_rank_decay: 5\ncurrent_sticky_bonus: 25\nrssi_offset: 100\nmin_switch_score_delta: 10\nssids:\n  - Home\n  - Office\nstate_file: {}\nconfig_path: {}\n",
+            "id: mwifi\nmode: interval\ninterval_seconds: 30\nmin_dwell: 1\nping_target: 1.1.1.1\nping_count: 3\nping_timeout: 1\nping_high_latency_ms: 250\nhealth_failure_switch_runs: 2\nband_bonus_2g: 0\nband_bonus_5g: 35\nband_bonus_6g: 50\npreference_top_bonus: 30\npreference_rank_decay: 5\ncurrent_sticky_bonus: 25\nrssi_offset: 100\nmin_switch_score_delta: 10\nssids:\n  - Home\n  - Office\n{}state_file: {}\nconfig_path: {}\n",
+            repeater_rules_yaml,
             state_file.to_string_lossy(),
             module_dir.join("module.yaml").to_string_lossy()
         ),
@@ -515,6 +524,118 @@ fn integration_run_mwifi_uses_fake_networksetup_and_ping_boundary() {
     assert_eq!(
         state.get("lastSsid").and_then(Value::as_str),
         Some("Office")
+    );
+}
+
+#[test]
+#[serial]
+fn integration_run_mwifi_does_not_attempt_repeater_without_parent() {
+    let root = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    let fake_bin = root.path().join("fake_bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    let wifi_log = root.path().join("wifi.log");
+    let wifi_state = root.path().join("mwifi-state.json");
+    create_fake_wifi_stack(&fake_bin, &wifi_log).unwrap();
+    fs::write(wifi_log.with_extension("current"), "Office\n").unwrap();
+    write_modules(root.path());
+    write_wifi_module_with_repeater_rules(
+        root.path(),
+        &wifi_state,
+        "repeater_rules:\n  - pattern: '^Home-EXT$'\n    parent_ssid: Home\n",
+    );
+    write_service_yaml(root.path(), false, false, false, true);
+
+    let scan_output = "SSID BSSID RSSI CHANNEL SECURITY\nHome-EXT 00:11:22:33:44:55 -20 233 WPA3\nOffice 00:11:22:33:44:66 -90 1 WPA2\n";
+    let output = run_scriptd(root.path(), home.path(), &fake_bin)
+        .env("SCRIPTD_MWIFI_SCAN_OUTPUT", scan_output)
+        .env("MWIFI_SSIDS", "Office,Home-EXT")
+        .arg("run")
+        .arg("mwifi")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = fs::read_to_string(&wifi_log).unwrap();
+    assert!(!log.contains("-setairportnetwork en0 Home-EXT"));
+    assert!(!log.contains("-setairportnetwork en0 Office"));
+}
+
+#[test]
+#[serial]
+fn integration_run_mwifi_scans_parent_outside_candidate_allowlist_and_allows_repeater() {
+    let root = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    let fake_bin = root.path().join("fake_bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    let wifi_log = root.path().join("wifi.log");
+    let wifi_state = root.path().join("mwifi-state.json");
+    create_fake_wifi_stack(&fake_bin, &wifi_log).unwrap();
+    fs::write(wifi_log.with_extension("current"), "Office\n").unwrap();
+    write_modules(root.path());
+    write_wifi_module_with_repeater_rules(
+        root.path(),
+        &wifi_state,
+        "repeater_rules:\n  - pattern: '^Home-EXT$'\n    parent_ssid: Home\n",
+    );
+    write_service_yaml(root.path(), false, false, false, true);
+
+    let scan_output = "SSID BSSID RSSI CHANNEL SECURITY\nHome 00:11:22:33:44:55 -80 1 WPA2\nHome-EXT 00:11:22:33:44:66 -20 233 WPA3\nOffice 00:11:22:33:44:77 -90 1 WPA2\n";
+    let output = run_scriptd(root.path(), home.path(), &fake_bin)
+        .env("SCRIPTD_MWIFI_SCAN_OUTPUT", scan_output)
+        .env("MWIFI_SSIDS", "Office,Home-EXT")
+        .arg("run")
+        .arg("mwifi")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = fs::read_to_string(&wifi_log).unwrap();
+    assert!(log.contains("-setairportnetwork en0 Home-EXT"));
+    let state_text = fs::read_to_string(&wifi_state).unwrap();
+    let state: Value = serde_json::from_str(&state_text).unwrap();
+    assert_eq!(
+        state.get("lastSsid").and_then(Value::as_str),
+        Some("Home-EXT")
+    );
+}
+
+#[test]
+#[serial]
+fn integration_run_mwifi_rejects_invalid_repeater_configuration() {
+    let root = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    let fake_bin = root.path().join("fake_bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    let wifi_log = root.path().join("wifi.log");
+    let wifi_state = root.path().join("mwifi-state.json");
+    create_fake_wifi_stack(&fake_bin, &wifi_log).unwrap();
+    write_modules(root.path());
+    write_wifi_module_with_repeater_rules(
+        root.path(),
+        &wifi_state,
+        "repeater_rules:\n  - pattern: '['\n    parent_ssid: Home\n",
+    );
+    write_service_yaml(root.path(), false, false, false, true);
+
+    let output = run_scriptd(root.path(), home.path(), &fake_bin)
+        .arg("run")
+        .arg("mwifi")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("invalid mwifi repeater_rules[0] pattern"),
+        "{stderr}"
     );
 }
 

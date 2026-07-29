@@ -19,3 +19,6 @@ min_switch_score_delta: 10
 ssids:
   # - HomeWiFi
   # - OfficeNet
+repeater_rules:
+  - pattern: 'knight_riders\b.*'
+    parent_ssid: knight_riders_5G

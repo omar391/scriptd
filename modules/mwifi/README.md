@@ -10,6 +10,7 @@ How ranking works
 - If `MWIFI_SSIDS` is empty, the monitor falls back to the system preferred Wi-Fi network list from `networksetup`.
 - The order of `ssids` is treated as manual priority. If `ssids` is empty, the system preferred network order is used.
 - Each candidate gets a score from band bonus plus RSSI strength (`rssi + 100`, clamped to `0..100`).
+- A configured repeater candidate is eligible only when every matching rule's parent SSID is visible in the same scan.
 - Logs also include `switchScore`, which excludes the current-network sticky bonus and is the score used for switch decisions.
 - The current connection is pinged as a health check, not as per-candidate scoring.
 - A challenger can win after dwell when its `switchScore` beats the current network by `min_switch_score_delta` points. The default threshold is 10.
@@ -47,11 +48,22 @@ Configuration
 Config file
 - `module.yaml` is the single module manifest/config file. Example keys:
   - `ssids`: array of SSID strings (overridden by `MWIFI_SSIDS` env if set)
+  - `repeater_rules`: conditional SSID rules; each rule has a regular-expression `pattern` and exact `parent_ssid`
   - `min_dwell`: minimum seconds to stay on a network after switching
   - `ping_target`, `ping_timeout`
   - `band_bonus_2g`, `band_bonus_5g`, `band_bonus_6g`, `rssi_offset`, `min_switch_score_delta`
 
 The monitor resolves settings in this order: environment variables (if present) → `module.yaml` → built-in defaults.
+
+Repeater rules add their parent SSIDs to the scan-only allowlist. A parent outside `ssids` or `MWIFI_SSIDS` is observed for eligibility but is not itself ranked unless independently allowed. If a matching parent is absent, the repeater is excluded before ranking and no connection attempt is made. Invalid repeater rules stop the module with a configuration error.
+
+Example:
+
+```yaml
+repeater_rules:
+  - pattern: 'knight_riders\b.*'
+    parent_ssid: knight_riders_5G
+```
 
 6 GHz (6g) support
 - The monitor now recognizes 6g networks and gives them a configurable bonus (`band_bonus_6g` in `module.yaml`).

@@ -7,6 +7,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use chrono::{DateTime, Utc};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::credentials;
@@ -65,6 +66,18 @@ struct WifiSignal {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepeaterRule {
+    pub pattern: String,
+    pub parent_ssid: String,
+}
+
+#[derive(Debug, Clone)]
+struct CompiledRepeaterRule {
+    regex: Regex,
+    parent_ssid: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MwifiConfig {
     #[serde(rename = "min_dwell")]
     pub min_dwell_seconds: u64,
@@ -93,6 +106,8 @@ pub struct MwifiConfig {
     #[serde(default)]
     pub ssids: Vec<String>,
     #[serde(default)]
+    pub repeater_rules: Vec<RepeaterRule>,
+    #[serde(default)]
     pub state_file: String,
     #[serde(default)]
     pub config_path: String,
@@ -116,10 +131,38 @@ impl Default for MwifiConfig {
             rssi_offset: 100.0,
             min_switch_score_delta: 10.0,
             ssids: Vec::new(),
+            repeater_rules: Vec::new(),
             state_file: String::new(),
             config_path: String::new(),
         }
     }
+}
+
+fn compile_repeater_rules(rules: &[RepeaterRule]) -> anyhow::Result<Vec<CompiledRepeaterRule>> {
+    rules
+        .iter()
+        .enumerate()
+        .map(|(index, rule)| {
+            if rule.pattern.trim().is_empty() {
+                anyhow::bail!("invalid mwifi repeater_rules[{index}]: pattern must not be empty");
+            }
+            if rule.parent_ssid.trim().is_empty() {
+                anyhow::bail!(
+                    "invalid mwifi repeater_rules[{index}]: parent_ssid must not be empty"
+                );
+            }
+            let regex = Regex::new(&rule.pattern).map_err(|error| {
+                anyhow::anyhow!(
+                    "invalid mwifi repeater_rules[{index}] pattern {:?}: {error}",
+                    rule.pattern
+                )
+            })?;
+            Ok(CompiledRepeaterRule {
+                regex,
+                parent_ssid: rule.parent_ssid.clone(),
+            })
+        })
+        .collect()
 }
 
 #[allow(dead_code)]
@@ -187,6 +230,7 @@ pub fn resolve_mwifi_config(raw: &MwifiConfig, env: &EnvMap) -> MwifiConfig {
         } else {
             env_ssids
         },
+        repeater_rules: raw.repeater_rules.clone(),
         state_file,
         config_path,
     }
@@ -1451,16 +1495,15 @@ fn wait_for_connected_ssid(device: &str, target: &str, networks: &[Network]) -> 
     false
 }
 
-fn load_config(context: &ModuleContext) -> MwifiConfig {
+fn load_config(context: &ModuleContext) -> anyhow::Result<MwifiConfig> {
     let path = context.module_dir.join("module.yaml");
-    let mut config =
-        match fs::read_to_string(&path).map(|text| serde_yaml::from_str::<MwifiConfig>(&text)) {
-            Ok(Ok(value)) => value,
-            _ => MwifiConfig::default(),
-        };
+    let contents = fs::read_to_string(&path)?;
+    let mut config = serde_yaml::from_str::<MwifiConfig>(&contents)
+        .map_err(|error| anyhow::anyhow!("invalid mwifi configuration: {error}"))?;
 
     let env = EnvMap::default();
     config = resolve_mwifi_config(&config, &env);
+    compile_repeater_rules(&config.repeater_rules)?;
 
     let home_dir = crate::paths::home_dir().to_string_lossy().to_string();
     config.state_file = if config.state_file.is_empty() {
@@ -1473,7 +1516,7 @@ fn load_config(context: &ModuleContext) -> MwifiConfig {
         .join("module.yaml")
         .to_string_lossy()
         .to_string();
-    config
+    Ok(config)
 }
 
 fn preferred_ssids(device: &str) -> anyhow::Result<Vec<String>> {
@@ -1527,6 +1570,69 @@ fn parse_networks(allowed: &[String]) -> Vec<Network> {
     scan_networks(allowed)
 }
 
+fn scan_allowlist(
+    candidate_allowlist: &[String],
+    repeater_rules: &[CompiledRepeaterRule],
+) -> Vec<String> {
+    if candidate_allowlist.is_empty() {
+        return Vec::new();
+    }
+
+    let mut scan_allowlist = candidate_allowlist.to_vec();
+    for rule in repeater_rules {
+        if !scan_allowlist.iter().any(|ssid| ssid == &rule.parent_ssid) {
+            scan_allowlist.push(rule.parent_ssid.clone());
+        }
+    }
+    scan_allowlist
+}
+
+fn missing_repeater_parents(
+    ssid: &str,
+    repeater_rules: &[CompiledRepeaterRule],
+    scanned: &[Network],
+) -> Vec<String> {
+    repeater_rules
+        .iter()
+        .filter(|rule| rule.regex.is_match(ssid))
+        .filter(|rule| {
+            !scanned
+                .iter()
+                .any(|network| network.ssid == rule.parent_ssid)
+        })
+        .map(|rule| rule.parent_ssid.clone())
+        .collect()
+}
+
+fn filter_candidate_networks(
+    scanned: &[Network],
+    candidate_allowlist: &[String],
+    repeater_rules: &[CompiledRepeaterRule],
+) -> (Vec<Network>, Vec<(String, Vec<String>)>) {
+    let mut eligible = Vec::new();
+    let mut excluded = Vec::new();
+
+    for network in scanned {
+        if !candidate_allowlist.is_empty()
+            && !candidate_allowlist.iter().any(|ssid| ssid == &network.ssid)
+        {
+            continue;
+        }
+
+        let missing = missing_repeater_parents(&network.ssid, repeater_rules, scanned);
+        if missing.is_empty() {
+            eligible.push(network.clone());
+        } else if !excluded
+            .iter()
+            .any(|(ssid, _): &(String, Vec<String>)| ssid == &network.ssid)
+        {
+            excluded.push((network.ssid.clone(), missing));
+        }
+    }
+
+    (eligible, excluded)
+}
+
 fn build_candidate(
     network: &Network,
     config: &MwifiConfig,
@@ -1556,7 +1662,8 @@ fn with_join_failure_penalty(
 }
 
 pub fn run_once(context: &mut ModuleContext) -> anyhow::Result<Option<ModuleStatus>> {
-    let config = load_config(context);
+    let config = load_config(context)?;
+    let repeater_rules = compile_repeater_rules(&config.repeater_rules)?;
     let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
     let device = parse_wifi_device()?;
     let now = Utc::now();
@@ -1567,9 +1674,12 @@ pub fn run_once(context: &mut ModuleContext) -> anyhow::Result<Option<ModuleStat
     } else {
         config.ssids.clone()
     };
-    let scanned = parse_networks(&allowed);
+    let scan_allowed = scan_allowlist(&allowed, &repeater_rules);
+    let scanned = parse_networks(&scan_allowed);
     let persisted = read_state(&config.state_file);
-    let networks = dedupe_networks(&scanned, &config, &allowed);
+    let (eligible_networks, excluded_repeaters) =
+        filter_candidate_networks(&scanned, &allowed, &repeater_rules);
+    let networks = dedupe_networks(&eligible_networks, &config, &allowed);
     let current = if current.is_empty() {
         current_wifi_signal()?
             .and_then(|signal| infer_current_ssid_from_signal(&networks, signal))
@@ -1638,6 +1748,22 @@ pub fn run_once(context: &mut ModuleContext) -> anyhow::Result<Option<ModuleStat
     } else {
         "unknown".to_string()
     };
+    if !excluded_repeaters.is_empty() {
+        let details = excluded_repeaters
+            .iter()
+            .map(|(ssid, parents)| {
+                format!(
+                    "{ssid} (missing parent{}: {})",
+                    if parents.len() == 1 { "" } else { "s" },
+                    parents.join(", ")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        context
+            .logger
+            .info(&format!("excluded repeater SSIDs: {details}"));
+    }
     let reason = format!(
         "current={}; health=loss:{}% latency:{}ms streak:{}; candidates={}",
         current_description,
@@ -2014,7 +2140,7 @@ pub fn setup(context: &mut ModuleContext) -> anyhow::Result<()> {
         return Err(anyhow::anyhow!("Missing module yaml: {}", path.display()));
     }
 
-    let config = load_config(context);
+    let config = load_config(context)?;
     let device = parse_wifi_device()?;
     let ssids = setup_candidate_ssids(&config, &device)?;
 
@@ -2219,6 +2345,107 @@ TestNet              00:99:88:77:66:55 -65 233 WPA3(PSK/AES/AES)\n";
     }
 
     #[test]
+    fn wifi_repeater_rules_add_scan_only_parents_and_filter_candidates() {
+        let rules = compile_repeater_rules(&[RepeaterRule {
+            pattern: "^Home-EXT$".to_string(),
+            parent_ssid: "Home".to_string(),
+        }])
+        .expect("valid repeater rule");
+        assert_eq!(
+            scan_allowlist(&["Home-EXT".to_string()], &rules),
+            vec!["Home-EXT".to_string(), "Home".to_string()]
+        );
+
+        let repeater = Network {
+            ssid: "Home-EXT".to_string(),
+            band: "5g".to_string(),
+            rssi: -30,
+            channel: "36".to_string(),
+            security: "WPA2".to_string(),
+            ping_ms: None,
+        };
+        let parent = Network {
+            ssid: "Home".to_string(),
+            band: "2g".to_string(),
+            rssi: -70,
+            channel: "1".to_string(),
+            security: "WPA2".to_string(),
+            ping_ms: None,
+        };
+
+        let (without_parent, excluded) = filter_candidate_networks(
+            std::slice::from_ref(&repeater),
+            &["Home-EXT".to_string()],
+            &rules,
+        );
+        assert!(without_parent.is_empty());
+        assert_eq!(
+            excluded,
+            vec![("Home-EXT".to_string(), vec!["Home".to_string()])]
+        );
+
+        let (with_parent, excluded) =
+            filter_candidate_networks(&[repeater, parent], &["Home-EXT".to_string()], &rules);
+        assert_eq!(with_parent.len(), 1);
+        assert_eq!(with_parent[0].ssid, "Home-EXT");
+        assert!(excluded.is_empty());
+    }
+
+    #[test]
+    fn wifi_repeater_rules_require_all_matching_parents() {
+        let rules = compile_repeater_rules(&[
+            RepeaterRule {
+                pattern: "^Home-EXT$".to_string(),
+                parent_ssid: "Home".to_string(),
+            },
+            RepeaterRule {
+                pattern: "EXT$".to_string(),
+                parent_ssid: "Office".to_string(),
+            },
+        ])
+        .expect("valid repeater rules");
+        let repeater = Network {
+            ssid: "Home-EXT".to_string(),
+            band: "5g".to_string(),
+            rssi: -30,
+            channel: "36".to_string(),
+            security: "WPA2".to_string(),
+            ping_ms: None,
+        };
+        let parent = Network {
+            ssid: "Home".to_string(),
+            band: "2g".to_string(),
+            rssi: -70,
+            channel: "1".to_string(),
+            security: "WPA2".to_string(),
+            ping_ms: None,
+        };
+
+        let (eligible, excluded) =
+            filter_candidate_networks(&[repeater, parent], &["Home-EXT".to_string()], &rules);
+        assert!(eligible.is_empty());
+        assert_eq!(
+            excluded,
+            vec![("Home-EXT".to_string(), vec!["Office".to_string()])]
+        );
+    }
+
+    #[test]
+    fn wifi_repeater_rules_reject_invalid_configuration() {
+        let invalid_regex = compile_repeater_rules(&[RepeaterRule {
+            pattern: "[".to_string(),
+            parent_ssid: "Home".to_string(),
+        }]);
+        assert!(invalid_regex.is_err());
+
+        let empty_parent = compile_repeater_rules(&[RepeaterRule {
+            pattern: "^Home-EXT$".to_string(),
+            parent_ssid: "  ".to_string(),
+        }]);
+        assert!(empty_parent.is_err());
+    }
+
+    #[test]
     fn parse_ping_health_scales_penalties() {
         let healthy = parse_ping_health_output(
             "3 packets transmitted, 3 packets received, 0.0% packet loss\nround-trip min/avg/max/stddev = 10.000/20.000/30.000/1.000 ms",
@@ -2287,6 +2514,7 @@ TestNet              00:99:88:77:66:55 -65 233 WPA3(PSK/AES/AES)\n";
             rssi_offset: 100.0,
             min_switch_score_delta: 10.0,
             ssids: Vec::new(),
+            repeater_rules: Vec::new(),
             state_file: String::new(),
             config_path: String::new(),
         }
