@@ -2,22 +2,89 @@ label: com.omar.scriptd
 log_dir: ~/Library/Logs/scriptd
 watch: true
 self_update_check_hours: 12
+
 modules:
   mbrew:
     enabled: true
-    schedule:
-      every_hours: 12
-      window:
-        start: 00:00
-        end: 06:00
   mcpu:
     enabled: false
-    schedule:
-      every_minutes: 1
   mwifi:
     enabled: true
-    schedule:
-      every_minutes: 5
-      window:
-        start: 00:00
-        end: 23:59
+  miwatch:
+    enabled: false
+
+triggers:
+  mbrew-maintenance:
+    enabled: true
+    module: mbrew
+    fire:
+      mode: every_match
+    when:
+      all:
+        - schedule:
+            every_hours: 12
+            timezone: Asia/Dhaka
+        - time_window:
+            timezone: Asia/Dhaka
+            start: "00:00"
+            end: "06:00"
+
+  mcpu-sample:
+    enabled: true
+    module: mcpu
+    fire:
+      mode: every_match
+    when:
+      schedule:
+        every_minutes: 1
+
+  mwifi-sample:
+    enabled: true
+    module: mwifi
+    fire:
+      mode: every_match
+    when:
+      all:
+        - schedule:
+            every_minutes: 5
+        - time_window:
+            timezone: Asia/Dhaka
+            start: "00:00"
+            end: "23:59"
+
+  miwatch-outage:
+    enabled: true
+    module: miwatch
+    fire:
+      mode: latched
+      after:
+        consecutive_matches: 3
+        minimum_seconds: 60
+      reset:
+        after:
+          consecutive_matches: 2
+          minimum_seconds: 30
+        when:
+          all:
+            - wifi_ssid:
+                ssid: knight_riders_5G
+                state: connected
+            - wifi_ssid:
+                ssid: knight_riders_5G
+                state: available
+    when:
+      all:
+        - schedule:
+            every_seconds: 30
+        - wifi_ssid:
+            ssid: knight_riders_5G
+            state: unavailable
+        - any:
+            - time_window:
+                timezone: Asia/Dhaka
+                start: "05:00"
+                end: "02:00"
+            - process_network:
+                applications: [Codex]
+                aggregation: sum
+                at_least_bytes_per_second: 1024

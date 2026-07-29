@@ -1,6 +1,6 @@
 # scriptd
 
-`scriptd` is a lightweight macOS automation supervisor for native Rust modules. It installs a single user-level `launchd` agent, loads modules from `modules/*`, manages long-running daemons and scheduled jobs, and exposes status, health, logs, and configuration controls through a simple shell entrypoint.
+`scriptd` is a lightweight macOS automation supervisor for native Rust modules. It installs a single user-level `launchd` agent, loads modules from `modules/*`, evaluates global Boolean triggers, and exposes status, health, logs, and configuration controls through a simple shell entrypoint.
 
 The project is intentionally minimal:
 
@@ -12,7 +12,7 @@ The project is intentionally minimal:
 
 - Installs one LaunchAgent from `service.yaml`
 - Starts and stops modules based on enabled flags
-- Supports both daemon modules and interval modules
+- Dispatches task modules from global recursive trigger expressions
 - Watches `service.yaml` for live reloads when `watch: true`
 - Writes shared logs plus per-module logs
 - Persists runtime state to a JSON file for `status`
@@ -27,7 +27,8 @@ scriptd.sh
       -> run root -> src/main.rs -> src/supervisor.rs
           -> discover modules from modules/<name>/
           -> load module.rs + module.yaml
-          -> start daemons or schedule interval jobs
+          -> sample shared sensors and evaluate global triggers
+          -> dispatch typed task incidents without overlap
           -> write state.json and logs
 ```
 
@@ -44,9 +45,11 @@ Repo layout:
     │   ├── launchd.rs
     │   ├── config.rs
     │   ├── status.rs
-    │   └── modules.rs
+    │   ├── modules.rs
+    │   └── triggers/
 └── modules/
     ├── mwifi/
+    ├── miwatch/
     ├── mcpu/
     └── mbrew/
 ```
@@ -62,6 +65,8 @@ Repo layout:
 Module-specific tools:
 
 - `mwifi`: `networksetup`, `ping`, and `airport` CLI fallback path
+- global Wi-Fi triggers: CoreWLAN events plus rate-limited visibility scans
+- `miwatch`: `curl` and optional `adb` for autonomous session collection
 - `mcpu`: sysinfo process inspection plus command-level signal support when needed
 - `mbrew`: Homebrew, `security`, and `sudo`
 
@@ -100,7 +105,9 @@ Notes:
 ./scriptd.sh stop root         # stop the LaunchAgent but keep it installed
 ./scriptd.sh uninstall root    # remove the LaunchAgent
 ./scriptd.sh run <module>      # run one module directly
-./scriptd.sh config <module>   # run setup, or update enablement/schedule with flags
+./scriptd.sh miwatch session refresh # renew Xiaomi serviceToken directly
+./scriptd.sh config <module>   # run setup and enable the module
+./scriptd.sh config <module> --enable|--disable
 ./scriptd.sh config <module> show # print the module's service.yaml config
 ./scriptd.sh status            # print launchd + module status
 ./scriptd.sh test              # run unit and integration tests
@@ -119,16 +126,26 @@ watch: true
 modules:
   mwifi:
     enabled: false
-    schedule:
-      every_minutes: 5
+  miwatch:
+    enabled: false
   mcpu:
     enabled: false
-    schedule:
-      every_minutes: 1
   mbrew:
     enabled: true
-    schedule:
-      every_hours: 12
+
+triggers:
+  mwifi-sample:
+    enabled: true
+    module: mwifi
+    fire:
+      mode: every_match
+    when:
+      all:
+        - schedule: { every_minutes: 5 }
+        - time_window:
+            timezone: Asia/Dhaka
+            start: "00:00"
+            end: "23:59"
 ```
 
 Fields:
@@ -137,44 +154,42 @@ Fields:
 - `log_dir`: shared log directory for root and module logs
 - `watch`: when `true`, the supervisor watches `service.yaml` and reapplies config automatically
 - `modules.<name>.enabled`: desired on/off state for each discovered module
-- `modules.<name>.schedule`: interval-module runtime schedule
+- `triggers.<id>`: a global rule targeting one module
 
-Schedules are local-time and wall-clock anchored. You can use exactly one trigger per module:
+`when` and a latched rule's `reset.when` are recursive, non-empty `all`/`any`
+trees. Leaves are:
 
-```yaml
-schedule:
-  every_seconds: 30
-  # or: every_minutes: 5
-  # or: every_hours: 12
-  # or: daily_at: "09:30"
-  # or: cron: "0 */5 * * * *"
+- `schedule`: exactly one of `every_seconds`, `every_minutes`, `every_hours`,
+  `daily_at`, or `cron`
+- `time_window`: IANA timezone, optional weekdays, and a half-open window;
+  crossing midnight is supported
+- `wifi_power`: `on` or `off`
+- `wifi_ssid`: `connected`, `disconnected`, `available`, or `unavailable`
+- `process_network`: application selectors, `sum`, and a bytes-per-second
+  threshold measured on external interfaces. `Codex` includes trusted Codex
+  components owned by either `Codex.app` or the current `ChatGPT.app` host.
+
+Conditions evaluate to `true`, `false`, or `unknown`. Sensor failures are
+`unknown` and cannot authorize an action. `fire.mode: every_match` dispatches
+each matching schedule pulse. `fire.mode: latched` supports sustained
+match/reset counts and durations, persists the incident before dispatch, and
+cannot fire again until its reset expression succeeds.
+
+The complete `miwatch` expression in [`service.yaml`](./service.yaml) is:
+
+```text
+schedule AND SSID unavailable AND
+  (time-window OR Codex desktop network activity >= 1 KiB/s)
 ```
-
-Optional gates can restrict when a trigger is allowed to start:
-
-```yaml
-schedule:
-  daily_at: "09:30"
-  weekdays:
-    - mon
-    - wed
-    - fri
-  window:
-    start: "09:00"
-    end: "17:00"
-```
-
-For `every_*` schedules, `window` is a hard start-time gate and the interval is a minimum spacing. If the next interval due time falls outside the window, the run is moved to the next allowed window start. If the interval is larger than the window duration, the module will run at most once per matching window.
 
 Module-specific algorithm settings still live in each module's `module.yaml`.
 
-Update module enablement and schedules with `config <module>`:
+Update module enablement with `config <module>`. Trigger expressions are
+YAML-authored only:
 
 ```bash
-./scriptd.sh config mwifi --enable --every-minutes 5
+./scriptd.sh config mwifi --enable
 ./scriptd.sh config mcpu --disable
-./scriptd.sh config mbrew --enable --daily-at 09:30 --weekday mon --weekday wed --weekday fri
-./scriptd.sh config mbrew --cron "0 0 */12 * * *"
 ./scriptd.sh config mwifi show
 ```
 
@@ -184,7 +199,7 @@ Run `./scriptd.sh start root` after changing config flags to install/update the 
 
 ### `mwifi`
 
-- Mode: `interval`
+- Mode: `task`
 - Default: disabled
 - Default schedule: every 5 minutes
 - Purpose: scans nearby Wi-Fi networks, scores candidates, and switches to the best allowed SSID
@@ -193,9 +208,23 @@ Run `./scriptd.sh start root` after changing config flags to install/update the 
 
 See [`modules/mwifi/README.md`](./modules/mwifi/README.md).
 
+### `miwatch`
+
+- Mode: `task`
+- Default: disabled
+- Trigger: every 30 seconds inside the configured Boolean outage expression
+- Purpose: detect loss of `knight_riders_5G` and, only after an evidence-backed
+  API profile is supplied, request one authenticated remote router reboot when
+  the outage is inside the 05:00–02:00 window or the Codex desktop components
+  have active external network traffic.
+- Safety: fail-closed until the Mi WiFi request has static and dynamic evidence;
+  ambiguous reboot responses are never retried during the same outage.
+
+See [`modules/miwatch/README.md`](./modules/miwatch/README.md).
+
 ### `mcpu`
 
-- Mode: `interval`
+- Mode: `task`
 - Default: disabled
 - Default schedule: every 1 minute
 - Purpose: tracks processes that stay above a CPU threshold and kills them after a sustained time limit
@@ -205,7 +234,7 @@ See [`modules/mcpu/README.md`](./modules/mcpu/README.md).
 
 ### `mbrew`
 
-- Mode: `interval`
+- Mode: `task`
 - Default: enabled
 - Default schedule: every 12 hours
 - Purpose: runs `brew update`, formula upgrades, cask upgrades, repair fallback flow, and `brew cleanup`
@@ -235,17 +264,27 @@ The `status` command combines:
 - `launchctl list` output for the configured LaunchAgent label
 - the persisted supervisor state file
 - module health, status messages, run counters, restart counters, and metrics
+- each trigger's target, phase, counters, last evaluation/fire, next wake, and
+  redacted observation error
 
 ## Runtime Behavior
 
 - `start root` writes the LaunchAgent plist, re-enables the launchd item, and starts or restarts it as needed.
 - The LaunchAgent points at `~/Library/Application Support/scriptd/Scriptd.app/Contents/MacOS/scriptd`; that launcher executes this checkout's `scriptd.sh run root`.
-- Daemon modules are started immediately when enabled.
-- Interval modules are scheduled from `service.yaml`; `interval_seconds` remains the module fallback cadence.
-- Interval runs do not overlap.
-- Daemon modules are restarted after crashes with a short delay.
+- Trigger deadlines, CoreWLAN events, configuration reloads, and a 30-second
+  sensor fallback wake the supervisor loop.
+- Active SSID visibility scans are shared and rate-limited. External network
+  deltas are attributed by PID to every executable owned by a configured
+  `.app` bundle, including helpers; process arguments are never inspected or
+  logged.
+- Task runs do not overlap. Pending work is coalesced by trigger ID.
+- Trigger phase, debounce/reset counters, incident generation, pending
+  dispatch, errors, and schedule deadlines are atomically persisted.
+- Invalid hot reloads retain the last valid trigger configuration.
 - Disabling a module stops its runtime scheduling immediately and updates module state.
 - With `watch: true`, `service.yaml` changes are applied by the running supervisor automatically.
+- `run <module>` is explicit manual execution and bypasses global conditions.
+  Module-specific safety checks still apply.
 
 ## Writing A Module
 
@@ -260,8 +299,7 @@ Each module folder is validated against a single manifest:
 
 ```yaml
 id: example-job
-mode: interval
-interval_seconds: 60
+mode: task
 display_name: Example Job
 ```
 

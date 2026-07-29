@@ -1,7 +1,6 @@
 id: mbrew
 display_name: Brew Manager
-mode: interval
-interval_seconds: 43200
+mode: task
 askpass_path: ~/Library/Application Support/scriptd/mbrew/brew_askpass.sh
 homebrew_bin: /opt/homebrew/bin/brew
 sudoers_path: /etc/sudoers.d/homebrew

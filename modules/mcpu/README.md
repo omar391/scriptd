@@ -21,7 +21,8 @@ Configuration
 Usage
 - `./scriptd.sh run mcpu`
 - Enable or disable it from `service.yaml`
-- Ongoing cadence is configured in `service.yaml` under `modules.mcpu.schedule`.
+- Ongoing cadence is configured by the top-level `mcpu-sample` trigger in
+  `service.yaml`.
 
 Logging
 - Managed by `scriptd` under the shared log directory from `service.yaml`.

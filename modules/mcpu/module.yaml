@@ -1,7 +1,6 @@
 id: mcpu
 display_name: CPU Monitor
-mode: interval
-interval_seconds: 30
+mode: task
 cpu_threshold: 50
 time_limit_seconds: 600
 exclude_apps:

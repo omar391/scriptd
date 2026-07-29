@@ -1,7 +1,6 @@
 id: mwifi
 display_name: Wi-Fi Monitor
-mode: interval
-interval_seconds: 30
+mode: task
 min_dwell: 180
 ping_target: 1.1.1.1
 ping_count: 3

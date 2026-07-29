@@ -7,14 +7,16 @@ use std::path::PathBuf;
 mod mbrew;
 #[path = "../modules/mcpu/module.rs"]
 mod mcpu;
+#[path = "../modules/miwatch/module.rs"]
+mod miwatch;
 #[path = "../modules/mwifi/module.rs"]
 mod mwifi;
 
-use crate::config::{ModuleManifest, ModuleSchedule, ServiceConfig};
+use crate::config::{ModuleManifest, ServiceConfig};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ModuleMode {
-    Interval,
+    Task,
     Daemon,
 }
 
@@ -23,6 +25,7 @@ pub enum BuiltInModule {
     Mbrew,
     Mcpu,
     Mwifi,
+    Miwatch,
 }
 
 impl BuiltInModule {
@@ -31,19 +34,21 @@ impl BuiltInModule {
             Self::Mbrew => "mbrew",
             Self::Mcpu => "mcpu",
             Self::Mwifi => "mwifi",
+            Self::Miwatch => "miwatch",
         }
     }
 
     pub fn mode(&self) -> ModuleMode {
         match self {
-            Self::Mbrew => ModuleMode::Interval,
-            Self::Mcpu => ModuleMode::Interval,
-            Self::Mwifi => ModuleMode::Interval,
+            Self::Mbrew => ModuleMode::Task,
+            Self::Mcpu => ModuleMode::Task,
+            Self::Mwifi => ModuleMode::Task,
+            Self::Miwatch => ModuleMode::Task,
         }
     }
 
-    pub fn all() -> &'static [Self; 3] {
-        &[Self::Mbrew, Self::Mcpu, Self::Mwifi]
+    pub fn all() -> &'static [Self; 4] {
+        &[Self::Mbrew, Self::Mcpu, Self::Mwifi, Self::Miwatch]
     }
 
     pub fn kind_from_id(id: &str) -> anyhow::Result<Self> {
@@ -51,6 +56,7 @@ impl BuiltInModule {
             "mbrew" => Ok(Self::Mbrew),
             "mcpu" => Ok(Self::Mcpu),
             "mwifi" => Ok(Self::Mwifi),
+            "miwatch" => Ok(Self::Miwatch),
             other => anyhow::bail!("module \"{other}\" not compiled into this build"),
         }
     }
@@ -75,16 +81,6 @@ impl ModulesRegistry {
         for kind in BuiltInModule::all() {
             let id = kind.id();
             let manifest = crate::config::read_module_manifest(id, &config.root_dir)?;
-            if manifest.manifest.mode != "interval" && manifest.manifest.mode != "daemon" {
-                anyhow::bail!(
-                    "module \"{id}\" has unsupported mode \"{}\"",
-                    manifest.manifest.mode
-                );
-            }
-            if manifest.manifest.mode == "interval" && manifest.manifest.interval_seconds.is_none()
-            {
-                anyhow::bail!("module \"{id}\" interval mode requires interval_seconds");
-            }
             modules.insert(
                 id.to_string(),
                 ModuleDefinition {
@@ -112,21 +108,16 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
-    use crate::{config::ServiceConfig, modules::ModulesRegistry};
+    use crate::{
+        config::ServiceConfig,
+        modules::{ModuleMode, ModulesRegistry},
+    };
     use std::collections::HashMap;
 
-    fn write_manifest(base: &std::path::Path, module_id: &str, mode: &str, interval: Option<u64>) {
+    fn write_manifest(base: &std::path::Path, module_id: &str, mode: &str) {
         let dir = base.join("modules").join(module_id);
         fs::create_dir_all(&dir).expect("create module dir");
-        let interval_line = interval
-            .map(|value| format!("interval_seconds: {value}\n"))
-            .unwrap_or_default();
-        let body = format!(
-            "id: {module_id}\nmode: {mode}\n{interval_line}",
-            module_id = module_id,
-            mode = mode,
-            interval_line = interval_line
-        );
+        let body = format!("id: {module_id}\nmode: {mode}\n");
         fs::write(dir.join("module.yaml"), body).expect("write manifest");
     }
 
@@ -137,6 +128,7 @@ mod tests {
             watch: false,
             self_update_check_hours: 12,
             modules: HashMap::new(),
+            triggers: Default::default(),
             path: root.join("service.yaml"),
             root_dir: root.to_path_buf(),
             state_dir: crate::paths::resolve_state_dir(),
@@ -145,46 +137,29 @@ mod tests {
     }
 
     #[test]
-    fn modules_registry_loads_interval_modules_with_interval_metadata() {
+    fn modules_registry_loads_task_modules() {
         let temp = tempdir().expect("temp dir");
         let root = temp.path();
-        write_manifest(root, "mbrew", "interval", Some(30));
-        write_manifest(root, "mcpu", "interval", Some(30));
-        write_manifest(root, "mwifi", "interval", Some(10));
+        write_manifest(root, "mbrew", "task");
+        write_manifest(root, "mcpu", "task");
+        write_manifest(root, "mwifi", "task");
+        write_manifest(root, "miwatch", "task");
 
         let config = service_config(root);
         let registry = ModulesRegistry::load_from_disk(&config).expect("load built-ins");
-        assert_eq!(registry.modules.len(), 3);
+        assert_eq!(registry.modules.len(), 4);
         assert!(registry.get("mwifi").is_some());
-        assert_eq!(
-            registry.get("mcpu").expect("cpu").manifest.interval_ms(),
-            Some(30_000)
-        );
-    }
-
-    #[test]
-    fn modules_registry_rejects_interval_manifest_without_interval_seconds() {
-        let temp = tempdir().expect("temp dir");
-        let root = temp.path();
-        write_manifest(root, "mbrew", "interval", Some(30));
-        write_manifest(root, "mcpu", "interval", Some(30));
-        write_manifest(root, "mwifi", "interval", None);
-
-        let config = service_config(root);
-        let error =
-            ModulesRegistry::load_from_disk(&config).expect_err("expected validation failure");
-        assert!(error
-            .to_string()
-            .contains("interval mode requires interval_seconds"));
+        assert_eq!(registry.get("mcpu").expect("cpu").mode, ModuleMode::Task);
     }
 
     #[test]
     fn modules_registry_rejects_unknown_mode() {
         let temp = tempdir().expect("temp dir");
         let root = temp.path();
-        write_manifest(root, "mbrew", "interval", Some(30));
-        write_manifest(root, "mcpu", "daemon", Some(30));
-        write_manifest(root, "mwifi", "stream", Some(30));
+        write_manifest(root, "mbrew", "task");
+        write_manifest(root, "mcpu", "daemon");
+        write_manifest(root, "mwifi", "stream");
+        write_manifest(root, "miwatch", "task");
 
         let config = service_config(root);
         let error = ModulesRegistry::load_from_disk(&config).expect_err("unknown mode");
@@ -200,6 +175,20 @@ pub struct ModuleContext {
     pub log_dir: PathBuf,
     pub env: HashMap<String, String>,
     pub logger: ModuleLogger,
+    pub invocation: ModuleInvocation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ModuleInvocation {
+    Manual,
+    Trigger(TriggerInvocation),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TriggerInvocation {
+    pub trigger_id: String,
+    pub incident_id: String,
+    pub fired_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Clone, Debug)]
@@ -300,19 +289,30 @@ pub fn module_context_with_console(
         log_dir: log_dir.clone(),
         env,
         logger: ModuleLogger::new(log_dir, id, mirror_to_console),
+        invocation: ModuleInvocation::Manual,
     }
 }
 
 pub fn run_once(
     kind: &BuiltInModule,
     context: &mut ModuleContext,
-    _schedule: &Option<ModuleSchedule>,
 ) -> anyhow::Result<Option<ModuleStatus>> {
     match kind {
         BuiltInModule::Mbrew => mbrew::run_once(context),
         BuiltInModule::Mcpu => mcpu::run_once(context),
         BuiltInModule::Mwifi => mwifi::run_once(context),
+        BuiltInModule::Miwatch => miwatch::run_once(context),
     }
+}
+
+pub fn wifi_trigger_link_snapshot() -> crate::triggers::WifiSnapshot {
+    mwifi::repository_wifi_link_snapshot()
+}
+
+pub fn wifi_trigger_visibility_snapshot(
+    ssids: &[String],
+) -> (Option<std::collections::BTreeSet<String>>, Option<String>) {
+    mwifi::repository_wifi_visibility_snapshot(ssids)
 }
 
 pub fn setup_module(kind: &BuiltInModule, context: &mut ModuleContext) -> anyhow::Result<()> {
@@ -320,6 +320,32 @@ pub fn setup_module(kind: &BuiltInModule, context: &mut ModuleContext) -> anyhow
         BuiltInModule::Mbrew => mbrew::setup(context),
         BuiltInModule::Mcpu => mcpu::setup(context),
         BuiltInModule::Mwifi => mwifi::setup(context),
+        BuiltInModule::Miwatch => miwatch::setup(context),
+    }
+}
+
+pub fn refresh_session(kind: &BuiltInModule, context: &mut ModuleContext) -> anyhow::Result<()> {
+    match kind {
+        BuiltInModule::Miwatch => miwatch::refresh_session(context),
+        _ => anyhow::bail!("session refresh is only supported by miwatch"),
+    }
+}
+
+pub fn verify_remote(kind: &BuiltInModule, context: &mut ModuleContext) -> anyhow::Result<()> {
+    match kind {
+        BuiltInModule::Miwatch => miwatch::verify_remote(context),
+        _ => anyhow::bail!("remote verification is only supported by miwatch"),
+    }
+}
+
+pub fn import_session(
+    kind: &BuiltInModule,
+    context: &mut ModuleContext,
+    input: &str,
+) -> anyhow::Result<()> {
+    match kind {
+        BuiltInModule::Miwatch => miwatch::import_session(context, input),
+        _ => anyhow::bail!("session import is only supported by miwatch"),
     }
 }
 
@@ -328,5 +354,6 @@ pub fn module_status(kind: &BuiltInModule) -> Option<(ModuleStatus, ModuleHealth
         BuiltInModule::Mbrew => mbrew::status(),
         BuiltInModule::Mcpu => mcpu::status(),
         BuiltInModule::Mwifi => mwifi::status(),
+        BuiltInModule::Miwatch => miwatch::status(),
     }
 }

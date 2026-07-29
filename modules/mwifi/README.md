@@ -32,7 +32,8 @@ Files
 Usage
 - `./scriptd.sh run mwifi`
 - Enable or disable it from `service.yaml`
-- Ongoing cadence is configured in `service.yaml` under `modules.mwifi.schedule`.
+- Ongoing cadence is configured by the top-level `mwifi-sample` trigger in
+  `service.yaml`.
 
 Configuration
 - Edit `module.yaml` for the default config, or override values through environment variables.

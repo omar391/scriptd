@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 use crate::config::ServiceConfig;
@@ -24,6 +25,19 @@ pub struct PersistedState {
     pub updated_at: String,
     pub supervisor: PersistedSupervisorState,
     pub modules: BTreeMap<String, PersistedModuleState>,
+    #[serde(default)]
+    pub triggers: BTreeMap<String, PersistedTriggerState>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PersistedTriggerState {
+    pub target: String,
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<crate::triggers::TriggerConfig>,
+    #[serde(rename = "nextWakeAt")]
+    pub next_wake_at: Option<String>,
+    pub runtime: crate::triggers::TriggerState,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -62,9 +76,7 @@ pub fn render_status(config: &ServiceConfig, _config_path: PathBuf) -> anyhow::R
     let (launchd_loaded, launchd_pid, _launchd_exit) = launchd::status_loaded(&config.label);
     let registry = ModulesRegistry::load_from_disk(config).ok();
     let state_path = resolve_state_file();
-    let state: Option<PersistedState> = fs::read_to_string(&state_path)
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok());
+    let state = state_from_file(&state_path).ok().flatten();
 
     println!("scriptd label: {}", config.label);
     println!("Config path: {}", config.path.display());
@@ -132,21 +144,14 @@ pub fn render_status(config: &ServiceConfig, _config_path: PathBuf) -> anyhow::R
                 .as_ref()
                 .and_then(|item| item.get(name))
                 .map(|entry| entry.manifest.mode.clone())
-                .unwrap_or_else(|| "interval".to_string());
+                .unwrap_or_else(|| "task".to_string());
             let state_status = state.modules.get(name);
-            let synthesized_next_run_at = if desired == "enabled" {
-                config.modules.get(name).and_then(|entry| {
-                    entry.schedule.as_ref().and_then(|schedule| {
-                        crate::config::next_scheduled_run(
-                            &Some(schedule.clone()),
-                            chrono::Local::now(),
-                        )
-                        .map(|value| value.to_rfc3339())
-                    })
-                })
-            } else {
-                None
-            };
+            let synthesized_next_run_at = state
+                .triggers
+                .values()
+                .filter(|trigger| trigger.enabled && trigger.target.as_str() == name.as_str())
+                .filter_map(|trigger| trigger.next_wake_at.clone())
+                .min();
             let (runtime_kind, mut status, runs, restarts) = state_status
                 .as_ref()
                 .map(|entry| {
@@ -177,20 +182,33 @@ pub fn render_status(config: &ServiceConfig, _config_path: PathBuf) -> anyhow::R
                 details.push(format!("next={next_run_at}"));
             } else if let Some(next_run_at) = synthesized_next_run_at {
                 details.push(format!("next={next_run_at}"));
-            } else if stale_reason.is_some() && desired == "enabled" {
-                if let Some(entry) = config.modules.get(name) {
-                    if let Some(schedule) = &entry.schedule {
-                        if let Some(next) = crate::config::next_scheduled_run(
-                            &Some(schedule.clone()),
-                            chrono::Local::now(),
-                        ) {
-                            details.push(format!("next={}", next.to_rfc3339()));
-                        }
-                    }
-                }
             }
 
             println!("- {name}: {}", details.join(", "));
+        }
+
+        println!("Triggers:");
+        for (id, trigger) in &state.triggers {
+            println!(
+                "- {id}: target={}, enabled={}, phase={:?}, matches={}, resets={}, last_evaluation={}, last_fire={}, next={}, error={}",
+                trigger.target,
+                trigger.enabled,
+                trigger.runtime.phase,
+                trigger.runtime.match_count,
+                trigger.runtime.reset_count,
+                trigger
+                    .runtime
+                    .last_evaluated_at
+                    .map(|value| value.to_rfc3339())
+                    .unwrap_or_else(|| "-".to_string()),
+                trigger
+                    .runtime
+                    .last_fired_at
+                    .map(|value| value.to_rfc3339())
+                    .unwrap_or_else(|| "-".to_string()),
+                trigger.next_wake_at.as_deref().unwrap_or("-"),
+                trigger.runtime.last_error.as_deref().unwrap_or("-"),
+            );
         }
     } else {
         println!("state: unreadable");
@@ -199,10 +217,17 @@ pub fn render_status(config: &ServiceConfig, _config_path: PathBuf) -> anyhow::R
     Ok(())
 }
 
-pub fn maybe_state_from_file(path: &std::path::Path) -> Option<PersistedState> {
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
+pub fn state_from_file(path: &std::path::Path) -> anyhow::Result<Option<PersistedState>> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("read state file {}", path.display()));
+        }
+    };
+    serde_json::from_str(&text)
+        .map(Some)
+        .with_context(|| format!("parse state file {}", path.display()))
 }
 
 pub fn process_alive(pid: i32) -> bool {
@@ -232,10 +257,22 @@ mod tests {
             "logDir":"/tmp/logs",
             "updatedAt":"2026-06-02T00:00:00Z",
             "supervisor":{ "pid":123, "startedAt":"2026-06-02T00:00:00Z", "watch":true },
-            "modules":{}
+            "modules":{},
+            "triggers":{}
         }"#;
         let parsed: PersistedState = serde_json::from_str(json).expect("state json");
         assert_eq!(parsed.supervisor.pid, 123);
         assert!(parsed.modules.is_empty());
+    }
+
+    #[test]
+    fn persisted_state_reader_distinguishes_missing_from_malformed_state() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("state.json");
+        assert!(state_from_file(&path).expect("missing state").is_none());
+
+        fs::write(&path, "{not-json").expect("write malformed state");
+        let error = state_from_file(&path).expect_err("malformed state must fail");
+        assert!(error.to_string().contains("parse state file"));
     }
 }

@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -501,7 +501,7 @@ fn join_failure_penalty(
     }
 }
 
-fn parse_wifi_device() -> anyhow::Result<String> {
+pub fn parse_wifi_device() -> anyhow::Result<String> {
     let output = Command::new("networksetup")
         .args(["-listallhardwareports"])
         .output()?;
@@ -604,7 +604,7 @@ if let iface = CWWiFiClient.shared().interface(), let channel = iface.wlanChanne
     Ok(parse_wifi_signal_output(&output))
 }
 
-fn current_ssid(device: &str) -> anyhow::Result<String> {
+pub fn current_ssid(device: &str) -> anyhow::Result<String> {
     let output = Command::new("networksetup")
         .args(["-getairportnetwork", device])
         .output()?;
@@ -894,14 +894,18 @@ fn scan_corewlan_networks(_allowed: &[String]) -> Vec<Network> {
     Vec::new()
 }
 
-fn scan_networks(allowed: &[String]) -> Vec<Network> {
+pub fn scan_networks(allowed: &[String]) -> Vec<Network> {
+    scan_networks_result(allowed).unwrap_or_default()
+}
+
+fn scan_networks_result(allowed: &[String]) -> anyhow::Result<Vec<Network>> {
     if let Ok(output) = std::env::var("SCRIPTD_MWIFI_SCAN_OUTPUT") {
-        return parse_airport_output(&output, allowed);
+        return Ok(parse_airport_output(&output, allowed));
     }
 
     let corewlan = scan_corewlan_networks(allowed);
     if !corewlan.is_empty() {
-        return corewlan;
+        return Ok(corewlan);
     }
 
     let output = Command::new(
@@ -922,17 +926,78 @@ fn scan_networks(allowed: &[String]) -> Vec<Network> {
             .ok()
             .map(|_| String::new())
     });
-    let output = output.unwrap_or_default();
-    let parsed = if output.is_empty() {
-        Vec::new()
-    } else {
-        parse_airport_output(&output, allowed)
-    };
-    if !parsed.is_empty() {
-        return parsed;
+    if let Some(output) = output {
+        if !output.is_empty() {
+            return Ok(parse_airport_output(&output, allowed));
+        }
     }
 
-    scan_wifi_via_swift(allowed).unwrap_or_default()
+    scan_wifi_via_swift(allowed)
+}
+
+pub fn repository_wifi_probe(ssid: &str) -> anyhow::Result<bool> {
+    let device = parse_wifi_device()?;
+    let current = current_ssid(&device)?;
+    if current != ssid {
+        return Ok(false);
+    }
+    let allowed = vec![ssid.to_string()];
+    Ok(scan_networks(&allowed)
+        .iter()
+        .any(|network| network.ssid == ssid))
+}
+
+pub fn repository_wifi_link_snapshot() -> crate::triggers::WifiSnapshot {
+    let mut snapshot = crate::triggers::WifiSnapshot::default();
+    let device = match parse_wifi_device() {
+        Ok(device) => device,
+        Err(_) => {
+            snapshot.error = Some("wifi device observation failed".to_string());
+            return snapshot;
+        }
+    };
+
+    match Command::new("networksetup")
+        .args(["-getairportpower", &device])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            let text = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
+            snapshot.power = if text.trim_end().ends_with(": on") {
+                Some(true)
+            } else if text.trim_end().ends_with(": off") {
+                Some(false)
+            } else {
+                None
+            };
+        }
+        _ => snapshot.error = Some("wifi power observation failed".to_string()),
+    }
+
+    match current_ssid(&device) {
+        Ok(current) if current.is_empty() => snapshot.current_ssid = Some(None),
+        Ok(current) => snapshot.current_ssid = Some(Some(current)),
+        Err(_) => snapshot.error = Some("wifi association observation failed".to_string()),
+    }
+
+    snapshot
+}
+
+pub fn repository_wifi_visibility_snapshot(
+    ssids: &[String],
+) -> (Option<BTreeSet<String>>, Option<String>) {
+    match scan_networks_result(ssids) {
+        Ok(networks) => (
+            Some(
+                networks
+                    .into_iter()
+                    .map(|network| network.ssid)
+                    .collect::<BTreeSet<_>>(),
+            ),
+            None,
+        ),
+        Err(_) => (None, Some("wifi visibility observation failed".to_string())),
+    }
 }
 
 fn command_time_ms(output: &str) -> Option<f64> {
@@ -1073,6 +1138,7 @@ pub fn build_candidate_score(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_candidate_score_with_join_failure_penalty(
     network: &Network,
     rank: usize,
@@ -1285,7 +1351,7 @@ fn build_decision_reason(
 
 fn connect_network(device: &str, ssid: &str) -> anyhow::Result<()> {
     match run_networksetup_join(device, ssid, None)? {
-        JoinAttempt::Succeeded => return Ok(()),
+        JoinAttempt::Succeeded => Ok(()),
         JoinAttempt::Failed(message) => {
             if let Some(password) = find_wifi_password(ssid) {
                 match run_networksetup_join(device, ssid, Some(&password))? {

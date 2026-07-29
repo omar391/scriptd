@@ -202,12 +202,12 @@ exit 1
 }
 
 fn write_modules(root: &Path) {
-    for module in ["mbrew", "mcpu", "mwifi"] {
+    for module in ["mbrew", "mcpu", "mwifi", "miwatch"] {
         let module_dir = root.join("modules").join(module);
         fs::create_dir_all(&module_dir).expect("create module dir");
         fs::write(
             module_dir.join("module.yaml"),
-            format!("id: {module}\nmode: interval\ninterval_seconds: 30\n"),
+            format!("id: {module}\nmode: task\n"),
         )
         .expect("write module manifest");
     }
@@ -219,7 +219,7 @@ fn write_brew_module(root: &Path, homebrew_bin: &Path, askpass_path: &Path) {
     fs::write(
         module_dir.join("module.yaml"),
         format!(
-            "id: mbrew\nmode: interval\ninterval_seconds: 30\naskpass_path: {}\nhomebrew_bin: {}\nsudoers_path: {}/sudoers-homebrew\nsudoers_timeout_path: {}/sudoers-timeout\nsudo_timeout_hours: 2\n",
+            "id: mbrew\nmode: task\naskpass_path: {}\nhomebrew_bin: {}\nsudoers_path: {}/sudoers-homebrew\nsudoers_timeout_path: {}/sudoers-timeout\nsudo_timeout_hours: 2\n",
             askpass_path.to_string_lossy(),
             homebrew_bin.to_string_lossy(),
             root.to_string_lossy(),
@@ -243,7 +243,7 @@ fn write_wifi_module_with_repeater_rules(
     fs::write(
         module_dir.join("module.yaml"),
         format!(
-            "id: mwifi\nmode: interval\ninterval_seconds: 30\nmin_dwell: 1\nping_target: 1.1.1.1\nping_count: 3\nping_timeout: 1\nping_high_latency_ms: 250\nhealth_failure_switch_runs: 2\nband_bonus_2g: 0\nband_bonus_5g: 35\nband_bonus_6g: 50\npreference_top_bonus: 30\npreference_rank_decay: 5\ncurrent_sticky_bonus: 25\nrssi_offset: 100\nmin_switch_score_delta: 10\nssids:\n  - Home\n  - Office\n{}state_file: {}\nconfig_path: {}\n",
+            "id: mwifi\nmode: task\nmin_dwell: 1\nping_target: 1.1.1.1\nping_count: 3\nping_timeout: 1\nping_high_latency_ms: 250\nhealth_failure_switch_runs: 2\nband_bonus_2g: 0\nband_bonus_5g: 35\nband_bonus_6g: 50\npreference_top_bonus: 30\npreference_rank_decay: 5\ncurrent_sticky_bonus: 25\nrssi_offset: 100\nmin_switch_score_delta: 10\nssids:\n  - Home\n  - Office\n{}state_file: {}\nconfig_path: {}\n",
             repeater_rules_yaml,
             state_file.to_string_lossy(),
             module_dir.join("module.yaml").to_string_lossy()
@@ -263,7 +263,7 @@ fn write_service_yaml(
     fs::write(
         root.join("service.yaml"),
         format!(
-            "label: com.omar.scriptd\nlog_dir: ~/Library/Logs/scriptd\nwatch: {}\nmodules:\n  mbrew:\n    enabled: {}\n  mcpu:\n    enabled: {}\n  mwifi:\n    enabled: {}\n",
+            "label: com.omar.scriptd\nlog_dir: ~/Library/Logs/scriptd\nwatch: {}\nmodules:\n  mbrew:\n    enabled: {}\n  mcpu:\n    enabled: {}\n  mwifi:\n    enabled: {}\n  miwatch:\n    enabled: false\ntriggers:\n  mbrew-test:\n    enabled: true\n    module: mbrew\n    fire: {{ mode: every_match }}\n    when: {{ schedule: {{ every_hours: 1 }} }}\n  mcpu-test:\n    enabled: true\n    module: mcpu\n    fire: {{ mode: every_match }}\n    when: {{ schedule: {{ every_hours: 1 }} }}\n  mwifi-test:\n    enabled: true\n    module: mwifi\n    fire: {{ mode: every_match }}\n    when: {{ schedule: {{ every_hours: 1 }} }}\n",
             watch,
             brew_enabled,
             cpu_enabled,
@@ -353,7 +353,19 @@ fn integration_status_detects_stale_supervisor_snapshot() {
   "logDir":"/tmp/scriptd-logs",
   "updatedAt":"2020-01-01T00:00:00Z",
   "supervisor":{{"pid":111,"startedAt":"2020-01-01T00:00:00Z","watch":true}},
-  "modules":{{}}
+  "modules":{{}},
+  "triggers":{{
+    "mbrew-test":{{
+      "target":"mbrew",
+      "enabled":true,
+      "nextWakeAt":"2026-07-30T12:00:00Z",
+      "runtime":{{
+        "phase":"matching",
+        "match_count":2,
+        "last_evaluated_at":"2026-07-30T00:00:00Z"
+      }}
+    }}
+  }}
 }}
 "#,
             root.path().to_string_lossy(),
@@ -367,6 +379,9 @@ fn integration_status_detects_stale_supervisor_snapshot() {
     assert!(output.status.success());
     let output = String::from_utf8_lossy(&output.stdout);
     assert!(output.contains("state: stale snapshot"));
+    assert!(output.contains("Triggers:"));
+    assert!(output.contains("mbrew-test: target=mbrew"));
+    assert!(output.contains("matches=2"));
 }
 
 #[test]
@@ -447,6 +462,27 @@ fn integration_run_root_rejects_invalid_module() {
         .unwrap();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("not compiled into this build"),);
+}
+
+#[test]
+#[serial]
+fn integration_run_root_rejects_unknown_trigger_target() {
+    let root = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    write_modules(root.path());
+    fs::write(
+        root.path().join("service.yaml"),
+        "label: com.omar.scriptd\nlog_dir: ~/Library/Logs/scriptd\nmodules: {}\ntriggers:\n  bad-target:\n    enabled: true\n    module: missing\n    fire: { mode: every_match }\n    when: { schedule: { every_minutes: 1 } }\n",
+    )
+    .unwrap();
+    let output = run_scriptd(root.path(), home.path(), root.path())
+        .arg("run")
+        .arg("root")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("trigger bad-target targets unknown module missing"));
 }
 
 #[test]
@@ -842,4 +878,153 @@ fn integration_run_root_reloads_service_yaml_changes() {
         observed,
         "module desire should reload from service.yaml while running"
     );
+}
+
+#[test]
+#[serial]
+fn integration_invalid_trigger_reload_keeps_last_valid_runtime() {
+    let root = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    write_modules(root.path());
+    write_service_yaml(root.path(), true, false, false, false);
+
+    let mut cmd = run_scriptd(root.path(), home.path(), root.path());
+    cmd.arg("run").arg("root");
+    let mut child = cmd.spawn().expect("run root");
+    let state_file = home
+        .path()
+        .join("Library/Application Support/scriptd/state.json");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !state_file.exists() {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(state_file.exists(), "initial state should be persisted");
+
+    fs::write(
+        root.path().join("service.yaml"),
+        "label: com.omar.scriptd\nlog_dir: ~/Library/Logs/scriptd\nwatch: true\nmodules:\n  mbrew: { enabled: false }\ntriggers:\n  broken:\n    enabled: true\n    module: mbrew\n    fire: { mode: every_match }\n    when: { all: [] }\n",
+    )
+    .unwrap();
+    thread::sleep(Duration::from_secs(1));
+
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "supervisor must stay alive"
+    );
+    let state: Value = serde_json::from_str(&fs::read_to_string(&state_file).unwrap()).unwrap();
+    let triggers = state
+        .get("triggers")
+        .and_then(Value::as_object)
+        .expect("persisted triggers");
+    assert!(triggers.contains_key("mbrew-test"));
+    assert!(!triggers.contains_key("broken"));
+
+    let _ = SysCommand::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status();
+    let _ = child.wait();
+}
+
+#[test]
+fn integration_repository_configuration_migrates_all_modules_to_global_triggers() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let service: serde_yaml::Value =
+        serde_yaml::from_str(&fs::read_to_string(root.join("service.yaml")).unwrap()).unwrap();
+    let triggers = service
+        .get("triggers")
+        .and_then(serde_yaml::Value::as_mapping)
+        .expect("global triggers");
+    for id in [
+        "mbrew-maintenance",
+        "mcpu-sample",
+        "mwifi-sample",
+        "miwatch-outage",
+    ] {
+        assert!(
+            triggers.contains_key(&serde_yaml::Value::String(id.to_string())),
+            "missing trigger {id}"
+        );
+    }
+    assert_eq!(
+        service["triggers"]["mbrew-maintenance"]["when"]["all"][0]["schedule"]["every_hours"]
+            .as_u64(),
+        Some(12)
+    );
+    assert_eq!(
+        service["triggers"]["mbrew-maintenance"]["when"]["all"][1]["time_window"]["start"].as_str(),
+        Some("00:00")
+    );
+    assert_eq!(
+        service["triggers"]["mbrew-maintenance"]["when"]["all"][1]["time_window"]["end"].as_str(),
+        Some("06:00")
+    );
+    assert_eq!(
+        service["triggers"]["mcpu-sample"]["when"]["schedule"]["every_minutes"].as_u64(),
+        Some(1)
+    );
+    assert_eq!(
+        service["triggers"]["mwifi-sample"]["when"]["all"][0]["schedule"]["every_minutes"].as_u64(),
+        Some(5)
+    );
+    assert_eq!(
+        service["triggers"]["mwifi-sample"]["when"]["all"][1]["time_window"]["start"].as_str(),
+        Some("00:00")
+    );
+    assert_eq!(
+        service["triggers"]["mwifi-sample"]["when"]["all"][1]["time_window"]["end"].as_str(),
+        Some("23:59")
+    );
+    assert_eq!(
+        service["triggers"]["miwatch-outage"]["when"]["all"][0]["schedule"]["every_seconds"]
+            .as_u64(),
+        Some(30)
+    );
+    assert_eq!(
+        service["triggers"]["miwatch-outage"]["when"]["all"][1]["wifi_ssid"]["state"].as_str(),
+        Some("unavailable")
+    );
+    assert_eq!(
+        service["triggers"]["miwatch-outage"]["when"]["all"][2]["any"][0]["time_window"]["start"]
+            .as_str(),
+        Some("05:00")
+    );
+    assert_eq!(
+        service["triggers"]["miwatch-outage"]["when"]["all"][2]["any"][1]["process_network"]
+            ["applications"][0]
+            .as_str(),
+        Some("Codex")
+    );
+    assert_eq!(
+        service["triggers"]["miwatch-outage"]["when"]["all"][2]["any"][1]["process_network"]
+            ["at_least_bytes_per_second"]
+            .as_u64(),
+        Some(1024)
+    );
+    assert_eq!(
+        service["triggers"]["miwatch-outage"]["fire"]["after"]["consecutive_matches"].as_u64(),
+        Some(3)
+    );
+    assert_eq!(
+        service["triggers"]["miwatch-outage"]["fire"]["reset"]["after"]["consecutive_matches"]
+            .as_u64(),
+        Some(2)
+    );
+    let modules = service
+        .get("modules")
+        .and_then(serde_yaml::Value::as_mapping)
+        .expect("modules");
+    for entry in modules.values() {
+        assert!(entry.get("schedule").is_none());
+    }
+    for module in ["mbrew", "mcpu", "mwifi", "miwatch"] {
+        let manifest: serde_yaml::Value = serde_yaml::from_str(
+            &fs::read_to_string(root.join("modules").join(module).join("module.yaml")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            manifest.get("mode").and_then(serde_yaml::Value::as_str),
+            Some("task")
+        );
+        assert!(manifest.get("interval_seconds").is_none());
+    }
 }

@@ -1,4 +1,5 @@
 use std::env;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -10,6 +11,7 @@ mod modules;
 mod paths;
 mod status;
 mod supervisor;
+mod triggers;
 use crate::modules::BuiltInModule;
 
 fn usage() {
@@ -19,10 +21,11 @@ fn usage() {
     println!("  scriptd.sh uninstall root");
     println!("  scriptd.sh run root");
     println!("  scriptd.sh run <module>");
+    println!("  scriptd.sh miwatch session refresh");
+    println!("  scriptd.sh miwatch session import");
+    println!("  scriptd.sh miwatch remote verify");
     println!("  scriptd.sh config <module> show");
-    println!(
-        "  scriptd.sh config <module> [--enable|--disable] [--every-seconds n|--every-minutes n|--every-hours n|--daily-at HH:MM|--cron expr]"
-    );
+    println!("  scriptd.sh config <module> [--enable|--disable]");
     println!("  scriptd.sh status");
     println!("  scriptd.sh test");
 }
@@ -66,7 +69,6 @@ fn strip_null_yaml_values(value: &mut serde_yaml::Value) {
 
 fn parse_and_update_module_config(args: &[String], repo_root: PathBuf) -> anyhow::Result<()> {
     use crate::modules::BuiltInModule;
-    use config::{ModuleSchedule, ServiceModuleConfig, WeekdayName};
 
     if args.is_empty() {
         anyhow::bail!("module name is required");
@@ -94,19 +96,11 @@ fn parse_and_update_module_config(args: &[String], repo_root: PathBuf) -> anyhow
     }
 
     let mut enabled: Option<bool> = None;
-    let mut schedule = ModuleSchedule::default();
-    let mut has_schedule = false;
-    let mut has_schedule_trigger = false;
-    let mut has_window = false;
-    let mut weekday_list: Vec<config::WeekdayName> = Vec::new();
-    let mut window_start: Option<String> = None;
-    let mut window_end: Option<String> = None;
     let mut enable_seen = false;
     let mut disable_seen = false;
 
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
+    for arg in &args[1..] {
+        match arg.as_str() {
             "--enable" => {
                 enable_seen = true;
                 enabled = Some(true);
@@ -115,147 +109,29 @@ fn parse_and_update_module_config(args: &[String], repo_root: PathBuf) -> anyhow
                 disable_seen = true;
                 enabled = Some(false);
             }
-            "--every-seconds" => {
-                let value = args
-                    .get(i + 1)
-                    .ok_or_else(|| anyhow::anyhow!("missing value for --every-seconds"))?;
-                schedule.every_seconds = Some(value.parse::<u64>()?);
-                has_schedule = true;
-                has_schedule_trigger = true;
-                i += 1;
-            }
-            "--every-minutes" => {
-                let value = args
-                    .get(i + 1)
-                    .ok_or_else(|| anyhow::anyhow!("missing value for --every-minutes"))?;
-                schedule.every_minutes = Some(value.parse::<u64>()?);
-                has_schedule = true;
-                has_schedule_trigger = true;
-                i += 1;
-            }
-            "--every-hours" => {
-                let value = args
-                    .get(i + 1)
-                    .ok_or_else(|| anyhow::anyhow!("missing value for --every-hours"))?;
-                schedule.every_hours = Some(value.parse::<u64>()?);
-                has_schedule = true;
-                has_schedule_trigger = true;
-                i += 1;
-            }
-            "--daily-at" => {
-                let value = args
-                    .get(i + 1)
-                    .ok_or_else(|| anyhow::anyhow!("missing value for --daily-at"))?;
-                schedule
-                    .daily_at
-                    .get_or_insert_with(Vec::new)
-                    .push(value.to_string());
-                has_schedule = true;
-                has_schedule_trigger = true;
-                i += 1;
-            }
-            "--cron" => {
-                let value = args
-                    .get(i + 1)
-                    .ok_or_else(|| anyhow::anyhow!("missing value for --cron"))?;
-                schedule.cron = Some(vec![value.to_string()]);
-                has_schedule = true;
-                has_schedule_trigger = true;
-                i += 1;
-            }
-            "--weekday" => {
-                let raw = args
-                    .get(i + 1)
-                    .ok_or_else(|| anyhow::anyhow!("missing value for --weekday"))?;
-                if let Some(weekday) = WeekdayName::parse(raw) {
-                    weekday_list.push(weekday);
-                } else {
-                    anyhow::bail!("--weekday expects sun, mon, tue, wed, thu, fri, sat");
-                }
-                i += 1;
-            }
-            "--window-start" => {
-                let raw = args
-                    .get(i + 1)
-                    .ok_or_else(|| anyhow::anyhow!("missing value for --window-start"))?;
-                if raw.parse::<chrono::NaiveTime>().is_err() {
-                    anyhow::bail!("--window-start must be HH:MM");
-                }
-                window_start = Some(raw.to_string());
-                has_window = true;
-                has_schedule = true;
-                i += 1;
-            }
-            "--window-end" => {
-                let raw = args
-                    .get(i + 1)
-                    .ok_or_else(|| anyhow::anyhow!("missing value for --window-end"))?;
-                if raw.parse::<chrono::NaiveTime>().is_err() {
-                    anyhow::bail!("--window-end must be HH:MM");
-                }
-                window_end = Some(raw.to_string());
-                has_window = true;
-                has_schedule = true;
-                i += 1;
-            }
+            "--every-seconds" | "--every-minutes" | "--every-hours" | "--daily-at"
+            | "--cron" | "--weekday" | "--window-start" | "--window-end" => anyhow::bail!(
+                "schedule flags were removed; author complex rules in the top-level triggers section of service.yaml"
+            ),
             other => anyhow::bail!("unknown config flag: {other}"),
         }
-        i += 1;
     }
 
     if enable_seen && disable_seen {
         anyhow::bail!("Use only one of --enable or --disable");
     }
 
-    if has_schedule_trigger {
-        let mut trigger_count = 0usize;
-        trigger_count += schedule.cron.is_some() as usize;
-        trigger_count += schedule.every_seconds.is_some() as usize;
-        trigger_count += schedule.every_minutes.is_some() as usize;
-        trigger_count += schedule.every_hours.is_some() as usize;
-        trigger_count += schedule.daily_at.is_some() as usize;
-        if trigger_count > 1 {
-            anyhow::bail!("Use only one schedule trigger per config command");
-        }
-    }
-
-    if has_schedule {
-        if !weekday_list.is_empty() {
-            schedule.weekdays = Some(weekday_list);
-        }
-        if has_window || window_start.is_some() || window_end.is_some() {
-            schedule.window = Some(config::ScheduleWindow {
-                start: window_start.unwrap_or_else(|| "00:00".to_string()),
-                end: window_end.unwrap_or_else(|| "23:59".to_string()),
-            });
-        }
-        schedule.validate()?;
-    } else {
-        schedule = ModuleSchedule::default();
-    }
-
-    let entry = cfg
-        .modules
-        .entry(module_name.to_string())
-        .or_insert_with(|| ServiceModuleConfig {
-            enabled: false,
-            schedule: None,
-        });
+    let entry = cfg.modules.entry(module_name.to_string()).or_default();
     if let Some(next_enabled) = enabled {
         entry.enabled = next_enabled;
     }
-    if has_schedule {
-        entry.schedule = Some(schedule);
-    }
     let enabled = entry.enabled;
-    let has_schedule = entry.schedule.is_some();
 
     write_service_config(&cfg)?;
     println!(
-        "Updated {} in service.yaml (enabled={}, schedule={})",
+        "Updated {} in service.yaml (enabled={})",
         module_name,
         if enabled { "on" } else { "off" },
-        if has_schedule { "custom" } else { "default" }
     );
     Ok(())
 }
@@ -296,6 +172,28 @@ fn cmd_run(args: &[String], root: PathBuf) -> anyhow::Result<()> {
     let module = &args[0];
     BuiltInModule::kind_from_id(module)?;
     supervisor::run_one_module(root, module)
+}
+
+fn cmd_miwatch(args: &[String], root: PathBuf) -> anyhow::Result<()> {
+    if args != ["session", "refresh"]
+        && args != ["session", "import"]
+        && args != ["remote", "verify"]
+    {
+        anyhow::bail!("miwatch supports only: session refresh|import; remote verify");
+    }
+    let config = config::read_service_config(&root)?;
+    let module_dir = cfg::module_dir("miwatch", &config.root_dir)?;
+    let mut context =
+        modules::module_context("miwatch", root, module_dir, config.expanded_log_dir());
+    if args == ["session", "refresh"] {
+        modules::refresh_session(&BuiltInModule::Miwatch, &mut context)
+    } else if args == ["remote", "verify"] {
+        modules::verify_remote(&BuiltInModule::Miwatch, &mut context)
+    } else {
+        let mut input = String::new();
+        std::io::stdin().read_to_string(&mut input)?;
+        modules::import_session(&BuiltInModule::Miwatch, &mut context, &input)
+    }
 }
 
 fn cmd_start(args: &[String], root: PathBuf) -> anyhow::Result<()> {
@@ -380,6 +278,7 @@ fn main() -> ExitCode {
         "stop" => cmd_stop(&args, root),
         "uninstall" => cmd_uninstall(&args, root),
         "run" => cmd_run(&args, root),
+        "miwatch" => cmd_miwatch(&args, root),
         "config" => cmd_config(&args, root),
         "test" => cmd_test(),
         "help" => {
@@ -410,15 +309,10 @@ mod tests {
 
     fn write_service_yaml(root: &Path, body: &str) {
         fs::write(root.join("service.yaml"), body).expect("write service yaml");
-        for builtin in ["mwifi", "mcpu", "mbrew"] {
+        for builtin in ["mwifi", "mcpu", "mbrew", "miwatch"] {
             let dir = root.join("modules").join(builtin);
             fs::create_dir_all(&dir).expect("module dir");
-            let manifest = match builtin {
-                "mwifi" => "id: mwifi\nmode: interval\ninterval_seconds: 30\n",
-                "mcpu" => "id: mcpu\nmode: interval\ninterval_seconds: 30\n",
-                "mbrew" => "id: mbrew\nmode: interval\ninterval_seconds: 30\n",
-                _ => "",
-            };
+            let manifest = format!("id: {builtin}\nmode: task\n");
             fs::write(dir.join("module.yaml"), manifest).expect("module manifest");
         }
     }
@@ -428,7 +322,7 @@ mod tests {
         let temp = tempdir().expect("temp dir");
         write_service_yaml(
             temp.path(),
-            "label: com.omar.scriptd\nlog_dir: ~/Library/Logs/scriptd\nwatch: true\nmodules:\n  mwifi:\n    enabled: true\n",
+            "label: com.omar.scriptd\nlog_dir: ~/Library/Logs/scriptd\nwatch: true\nmodules:\n  mwifi:\n    enabled: true\ntriggers:\n  mwifi-test:\n    enabled: true\n    module: mwifi\n    fire: { mode: every_match }\n    when: { schedule: { every_minutes: 5 } }\n",
         );
 
         let err = parse_and_update_module_config(
@@ -441,14 +335,13 @@ mod tests {
         )
         .expect_err("expected conflict");
 
-        assert!(
-            err.to_string()
-                .contains("Use only one of --enable or --disable")
-        );
+        assert!(err
+            .to_string()
+            .contains("Use only one of --enable or --disable"));
     }
 
     #[test]
-    fn parse_config_rejects_conflicting_schedule_triggers() {
+    fn parse_config_rejects_removed_schedule_flags() {
         let temp = tempdir().expect("temp dir");
         write_service_yaml(
             temp.path(),
@@ -456,58 +349,37 @@ mod tests {
         );
 
         let err = parse_and_update_module_config(
-            &[
-                "mwifi".to_string(),
-                "--every-minutes".to_string(),
-                "10".to_string(),
-                "--every-hours".to_string(),
-                "1".to_string(),
-            ],
+            &["mwifi".to_string(), "--every-minutes".to_string()],
             temp.path().to_path_buf(),
         )
         .expect_err("expected conflict");
 
-        assert!(
-            err.to_string()
-                .contains("Use only one schedule trigger per config command")
-        );
+        assert!(err.to_string().contains("schedule flags were removed"));
     }
 
     #[test]
-    fn parse_config_parses_window_and_weekday_flags() {
+    fn parse_config_updates_module_enablement_only() {
         let temp = tempdir().expect("temp dir");
         write_service_yaml(
             temp.path(),
-            "label: com.omar.scriptd\nlog_dir: ~/Library/Logs/scriptd\nwatch: true\nmodules:\n  mwifi:\n    enabled: true\n",
+            "label: com.omar.scriptd\nlog_dir: ~/Library/Logs/scriptd\nwatch: true\nmodules:\n  mwifi:\n    enabled: true\ntriggers:\n  mwifi-test:\n    enabled: true\n    module: mwifi\n    fire: { mode: every_match }\n    when: { schedule: { every_minutes: 5 } }\n",
         );
 
         parse_and_update_module_config(
-            &[
-                "mwifi".to_string(),
-                "--enable".to_string(),
-                "--every-minutes".to_string(),
-                "15".to_string(),
-                "--weekday".to_string(),
-                "mon".to_string(),
-                "--window-start".to_string(),
-                "09:00".to_string(),
-                "--window-end".to_string(),
-                "17:00".to_string(),
-            ],
+            &["mwifi".to_string(), "--disable".to_string()],
             temp.path().to_path_buf(),
         )
         .expect("config parses");
 
         let updated = fs::read_to_string(temp.path().join("service.yaml")).expect("read service");
-        assert!(updated.contains("enabled: true"));
-        assert!(updated.contains("every_minutes: 15"));
-        assert!(updated.contains("weekdays:") || updated.contains("weekday"));
-        assert!(updated.contains("start: 09:00"));
-        assert!(updated.contains("end: 17:00"));
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&updated).expect("roundtrip yaml");
+        assert_eq!(parsed["modules"]["mwifi"]["enabled"].as_bool(), Some(false));
+        assert!(parsed["modules"]["mwifi"].get("schedule").is_none());
+        assert!(parsed["triggers"].get("mwifi-test").is_some());
     }
 
     #[test]
-    fn parse_config_rejects_invalid_weekday() {
+    fn parse_config_rejects_unknown_flag() {
         let temp = tempdir().expect("temp dir");
         write_service_yaml(
             temp.path(),
@@ -515,19 +387,12 @@ mod tests {
         );
 
         let err = parse_and_update_module_config(
-            &[
-                "mwifi".to_string(),
-                "--weekday".to_string(),
-                "funday".to_string(),
-            ],
+            &["mwifi".to_string(), "--funday".to_string()],
             temp.path().to_path_buf(),
         )
         .expect_err("expected invalid weekday");
 
-        assert!(
-            err.to_string()
-                .contains("--weekday expects sun, mon, tue, wed, thu, fri, sat")
-        );
+        assert!(err.to_string().contains("unknown config flag"));
     }
 
     #[test]
@@ -535,7 +400,7 @@ mod tests {
         let temp = tempdir().expect("temp dir");
         write_service_yaml(
             temp.path(),
-            "label: com.omar.scriptd\nlog_dir: ~/Library/Logs/scriptd\nwatch: true\nmodules:\n  mwifi:\n    enabled: true\n    schedule:\n      every_minutes: 5\n",
+            "label: com.omar.scriptd\nlog_dir: ~/Library/Logs/scriptd\nwatch: true\nmodules:\n  mwifi:\n    enabled: true\n",
         );
 
         show_module_config(&["mwifi".to_string()], temp.path().to_path_buf()).expect("show config");
@@ -564,7 +429,7 @@ mod tests {
             );
         }
 
-        for module_id in ["mbrew", "mcpu", "mwifi"] {
+        for module_id in ["mbrew", "mcpu", "mwifi", "miwatch"] {
             assert!(
                 !root
                     .join(format!("modules/{module_id}/package.json"))
