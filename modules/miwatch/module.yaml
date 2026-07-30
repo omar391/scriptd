@@ -1,25 +1,20 @@
-id: miwatch
-display_name: Mi WiFi Remote Reboot Watchdog
-mode: task
+# yaml-language-server: $schema=../../schemas/v1/modules/miwatch.schema.json
+version: 1
 
-# The exact target stays in the restricted local session store. The
-# authenticated preflight succeeds against the configured Xiaomi API.
-cooldown_seconds: 1800
-state_file: "~/Library/Application Support/scriptd/miwatch_state.json"
-token_file: "~/Library/Application Support/scriptd/miwatch_session.json"
-verified_remote_api: true
+module:
+  id: miwatch
+  display_name: Mi WiFi Remote Reboot Watchdog
+  mode: task
 
-# Populate only from corroborated static + dynamic evidence. Never commit
-# tokens, cookies, passwords, or raw captures.
-# account_base_url defaults to https://account.xiaomi.com and is fixed by
-# validation; the session file is seeded once from the authorized emulator.
-# remote:
-remote:
-  xiaomi:
-    base_url: https://api.miwifi.com
-    account_base_url: https://account.xiaomi.com
-    # Keep router_private_id in the restricted session file, never in this
-    # public repository.
-    user_agent: "Dalvik/2.1.0 (Linux; U; Android 14; sdk_gphone64_arm64 Build/UE1A.230829.036.A2) APP/com.xiaomi.router APPV/5.9.0"
-    success_statuses: [200]
-  timeout_seconds: 30
+settings:
+  cooldown_seconds: 1800
+  state_file: "~/Library/Application Support/scriptd/miwatch_state.json"
+  token_file: "~/Library/Application Support/scriptd/miwatch_session.json"
+  verified_remote_api: true
+  remote:
+    xiaomi:
+      base_url: https://api.miwifi.com
+      account_base_url: https://account.xiaomi.com
+      user_agent: "Dalvik/2.1.0 (Linux; U; Android 14; sdk_gphone64_arm64 Build/UE1A.230829.036.A2) APP/com.xiaomi.router APPV/5.9.0"
+      success_statuses: [200]
+    timeout_seconds: 30

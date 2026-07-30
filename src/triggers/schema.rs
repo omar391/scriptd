@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, LocalResult, NaiveTime, TimeZone, Utc, Weekday};
 use chrono_tz::Tz;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -24,7 +25,7 @@ impl TriggerConfig {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
 pub enum FirePolicy {
     EveryMatch,
@@ -50,16 +51,17 @@ impl FirePolicy {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ResetPolicy {
     pub after: MatchRequirement,
     pub when: Condition,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MatchRequirement {
+    #[schemars(range(min = 1))]
     pub consecutive_matches: u32,
     pub minimum_seconds: u64,
 }
@@ -73,7 +75,8 @@ impl MatchRequirement {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[schemars(with = "ConditionDef")]
 #[serde(from = "ConditionDef", into = "ConditionDef")]
 pub enum Condition {
     All(Vec<Condition>),
@@ -85,7 +88,7 @@ pub enum Condition {
     ProcessNetwork(ProcessNetworkCondition),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
 enum ConditionDef {
     All(AllCondition),
@@ -97,44 +100,53 @@ enum ConditionDef {
     ProcessNetwork(ProcessNetworkLeaf),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(description = "A non-empty recursive Boolean condition tree.")]
 struct AllCondition {
+    #[schemars(length(min = 1))]
     all: Vec<Condition>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(description = "A non-empty recursive Boolean condition tree.")]
 struct AnyCondition {
+    #[schemars(length(min = 1))]
     any: Vec<Condition>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(description = "A schedule leaf that emits evaluation pulses.")]
 struct ScheduleLeaf {
     schedule: ScheduleCondition,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(description = "A half-open local-time window, including overnight windows.")]
 struct TimeWindowLeaf {
     time_window: TimeWindowCondition,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(description = "A Wi-Fi power-state sensor condition.")]
 struct WifiPowerLeaf {
     wifi_power: WifiPowerCondition,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(description = "A connected or visible SSID sensor condition.")]
 struct WifiSsidLeaf {
     wifi_ssid: WifiSsidCondition,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(description = "An aggregate network-throughput condition for application bundles.")]
 struct ProcessNetworkLeaf {
     process_network: ProcessNetworkCondition,
 }
@@ -218,68 +230,101 @@ impl Condition {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct ScheduleCondition {
-    #[serde(default)]
-    pub every_seconds: Option<u64>,
-    #[serde(default)]
-    pub every_minutes: Option<u64>,
-    #[serde(default)]
-    pub every_hours: Option<u64>,
-    #[serde(default, deserialize_with = "deserialize_optional_string_list")]
-    pub daily_at: Option<Vec<String>>,
-    #[serde(default, deserialize_with = "deserialize_optional_string_list")]
-    pub cron: Option<Vec<String>>,
-    #[serde(default)]
+pub struct EverySecondsSchedule {
+    #[schemars(range(min = 1))]
+    pub every_seconds: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timezone: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EveryMinutesSchedule {
+    #[schemars(range(min = 1))]
+    pub every_minutes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EveryHoursSchedule {
+    #[schemars(range(min = 1))]
+    pub every_hours: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DailyAtSchedule {
+    #[serde(deserialize_with = "deserialize_string_list")]
+    #[schemars(with = "StringOrStringListSchema")]
+    pub daily_at: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CronSchedule {
+    #[serde(deserialize_with = "deserialize_string_list")]
+    #[schemars(with = "StringOrStringListSchema")]
+    pub cron: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum ScheduleCondition {
+    EverySeconds(EverySecondsSchedule),
+    EveryMinutes(EveryMinutesSchedule),
+    EveryHours(EveryHoursSchedule),
+    DailyAt(DailyAtSchedule),
+    Cron(CronSchedule),
+}
+
+#[derive(JsonSchema)]
+#[schemars(untagged)]
+#[allow(dead_code)]
+enum StringOrStringListSchema {
+    One(String),
+    Many(#[schemars(length(min = 1), extend("uniqueItems" = true))] Vec<String>),
 }
 
 impl ScheduleCondition {
     pub fn validate(&self) -> Result<()> {
-        let count = [
-            self.every_seconds.is_some(),
-            self.every_minutes.is_some(),
-            self.every_hours.is_some(),
-            self.daily_at.is_some(),
-            self.cron.is_some(),
-        ]
-        .into_iter()
-        .filter(|value| *value)
-        .count();
-        if count != 1 {
-            anyhow::bail!(
-                "schedule must define exactly one of every_seconds/every_minutes/every_hours/daily_at/cron"
-            );
-        }
-
         if self.interval_seconds() == Some(0) {
             anyhow::bail!("schedule interval must be greater than zero");
         }
-        if (self.every_seconds.is_some()
-            || self.every_minutes.is_some()
-            || self.every_hours.is_some())
-            && self.interval_seconds().is_none()
-        {
-            anyhow::bail!("schedule interval is too large");
-        }
         let timezone = self.timezone()?;
-        if let Some(values) = &self.daily_at {
-            if values.is_empty() {
+        if let ScheduleCondition::DailyAt(schedule) = self {
+            if schedule.daily_at.is_empty() {
                 anyhow::bail!("daily_at must not be empty");
             }
-            for value in values {
+            for value in &schedule.daily_at {
                 parse_time(value)?;
             }
+            let unique = schedule.daily_at.iter().collect::<BTreeSet<_>>();
+            if unique.len() != schedule.daily_at.len() {
+                anyhow::bail!("daily_at must not contain duplicates");
+            }
         }
-        if let Some(values) = &self.cron {
-            if values.is_empty() {
+        if let ScheduleCondition::Cron(schedule) = self {
+            if schedule.cron.is_empty() {
                 anyhow::bail!("cron must not be empty");
             }
-            for value in values {
+            for value in &schedule.cron {
                 let _: cron::Schedule = value
                     .parse()
                     .with_context(|| format!("invalid cron expression {value}"))?;
+            }
+            let unique = schedule.cron.iter().collect::<BTreeSet<_>>();
+            if unique.len() != schedule.cron.len() {
+                anyhow::bail!("cron must not contain duplicates");
             }
         }
         let _ = timezone;
@@ -287,25 +332,34 @@ impl ScheduleCondition {
     }
 
     pub fn interval_seconds(&self) -> Option<u64> {
-        self.every_seconds
-            .or_else(|| self.every_minutes.and_then(|value| value.checked_mul(60)))
-            .or_else(|| {
-                self.every_hours
-                    .and_then(|value| value.checked_mul(60 * 60))
-            })
+        match self {
+            Self::EverySeconds(value) => Some(value.every_seconds),
+            Self::EveryMinutes(value) => value.every_minutes.checked_mul(60),
+            Self::EveryHours(value) => value.every_hours.checked_mul(60 * 60),
+            Self::DailyAt(_) | Self::Cron(_) => None,
+        }
     }
 
     pub fn timezone(&self) -> Result<Tz> {
-        self.timezone
-            .as_deref()
+        self.timezone_name()
             .unwrap_or("UTC")
             .parse::<Tz>()
             .with_context(|| {
                 format!(
                     "invalid schedule timezone {}",
-                    self.timezone.as_deref().unwrap_or("UTC")
+                    self.timezone_name().unwrap_or("UTC")
                 )
             })
+    }
+
+    fn timezone_name(&self) -> Option<&str> {
+        match self {
+            Self::EverySeconds(value) => value.timezone.as_deref(),
+            Self::EveryMinutes(value) => value.timezone.as_deref(),
+            Self::EveryHours(value) => value.timezone.as_deref(),
+            Self::DailyAt(value) => value.timezone.as_deref(),
+            Self::Cron(value) => value.timezone.as_deref(),
+        }
     }
 
     pub fn next_after(&self, after: DateTime<Utc>) -> Option<DateTime<Utc>> {
@@ -333,8 +387,9 @@ impl ScheduleCondition {
 
         let timezone = self.timezone().ok()?;
         let local_after = after.with_timezone(&timezone);
-        if let Some(times) = &self.daily_at {
-            let mut parsed = times
+        if let Self::DailyAt(schedule) = self {
+            let mut parsed = schedule
+                .daily_at
                 .iter()
                 .filter_map(|value| parse_time(value).ok())
                 .collect::<Vec<_>>();
@@ -353,14 +408,19 @@ impl ScheduleCondition {
             return None;
         }
 
-        self.cron.as_ref().and_then(|values| {
-            values
-                .iter()
-                .filter_map(|value| value.parse::<cron::Schedule>().ok())
-                .filter_map(|value| value.after(&local_after).next())
-                .min()
-                .map(|value| value.with_timezone(&Utc))
-        })
+        match self {
+            Self::Cron(schedule) => Some(
+                schedule
+                    .cron
+                    .iter()
+                    .filter_map(|value| value.parse::<cron::Schedule>().ok())
+                    .filter_map(|value| value.after(&local_after).next())
+                    .min()
+                    .map(|value| value.with_timezone(&Utc)),
+            )
+            .flatten(),
+            _ => None,
+        }
     }
 }
 
@@ -383,13 +443,15 @@ fn local_candidate_after(
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TimeWindowCondition {
     pub timezone: String,
+    #[schemars(regex(pattern = r"^(?:[01][0-9]|2[0-3]):[0-5][0-9]$"))]
     pub start: String,
+    #[schemars(regex(pattern = r"^(?:[01][0-9]|2[0-3]):[0-5][0-9]$"))]
     pub end: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub weekdays: Option<Vec<WeekdayName>>,
 }
 
@@ -407,6 +469,14 @@ impl TimeWindowCondition {
             .is_some_and(|values| values.is_empty())
         {
             anyhow::bail!("time_window weekdays must not be empty");
+        }
+        if self.weekdays.as_ref().is_some_and(|values| {
+            values
+                .iter()
+                .enumerate()
+                .any(|(index, value)| values[..index].contains(value))
+        }) {
+            anyhow::bail!("time_window weekdays must not contain duplicates");
         }
         Ok(())
     }
@@ -433,7 +503,7 @@ impl TimeWindowCondition {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum WeekdayName {
     Sun,
@@ -459,27 +529,28 @@ impl WeekdayName {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WifiPowerCondition {
     pub state: WifiPowerState,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum WifiPowerState {
     On,
     Off,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WifiSsidCondition {
+    #[schemars(length(min = 1))]
     pub ssid: String,
     pub state: WifiSsidState,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum WifiSsidState {
     Connected,
@@ -488,11 +559,17 @@ pub enum WifiSsidState {
     Unavailable,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessNetworkCondition {
+    #[schemars(
+        length(min = 1),
+        inner(length(min = 1)),
+        extend("uniqueItems" = true)
+    )]
     pub applications: Vec<String>,
     pub aggregation: NetworkAggregation,
+    #[schemars(range(min = 1))]
     pub at_least_bytes_per_second: u64,
 }
 
@@ -523,7 +600,7 @@ impl ProcessNetworkCondition {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum NetworkAggregation {
     Sum,
@@ -555,4 +632,12 @@ where
             OneOrMany::Many(values) => values,
         }),
     )
+}
+
+fn deserialize_string_list<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    deserialize_optional_string_list(deserializer)?
+        .ok_or_else(|| serde::de::Error::custom("expected a string or non-empty string list"))
 }

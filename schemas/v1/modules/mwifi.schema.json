@@ -1,0 +1,180 @@
+{
+  "$defs": {
+    "ModuleManifest": {
+      "additionalProperties": false,
+      "description": "Stable identity and execution mode for a module.",
+      "properties": {
+        "display_name": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "id": {
+          "const": "mwifi",
+          "type": "string"
+        },
+        "mode": {
+          "$ref": "#/$defs/ModuleMode",
+          "const": "task"
+        }
+      },
+      "required": [
+        "id",
+        "display_name",
+        "mode"
+      ],
+      "type": "object"
+    },
+    "ModuleMode": {
+      "enum": [
+        "task",
+        "daemon"
+      ],
+      "type": "string"
+    },
+    "MwifiConfig": {
+      "additionalProperties": false,
+      "description": "Typed Wi-Fi selection, health, and repeater settings.",
+      "properties": {
+        "band_bonus_2g": {
+          "default": 0.0,
+          "format": "double",
+          "type": "number"
+        },
+        "band_bonus_5g": {
+          "default": 35.0,
+          "format": "double",
+          "type": "number"
+        },
+        "band_bonus_6g": {
+          "default": 50.0,
+          "format": "double",
+          "type": "number"
+        },
+        "current_sticky_bonus": {
+          "default": 25.0,
+          "format": "double",
+          "type": "number"
+        },
+        "health_failure_switch_runs": {
+          "default": 2,
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "min_dwell": {
+          "default": 180,
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "min_switch_score_delta": {
+          "default": 10.0,
+          "format": "double",
+          "type": "number"
+        },
+        "ping_count": {
+          "default": 3,
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "ping_high_latency_ms": {
+          "default": 250,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "ping_target": {
+          "default": "1.1.1.1",
+          "minLength": 1,
+          "type": "string"
+        },
+        "ping_timeout": {
+          "default": 1,
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "preference_rank_decay": {
+          "default": 5.0,
+          "format": "double",
+          "type": "number"
+        },
+        "preference_top_bonus": {
+          "default": 30.0,
+          "format": "double",
+          "type": "number"
+        },
+        "repeater_rules": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/RepeaterRule"
+          },
+          "type": "array"
+        },
+        "rssi_offset": {
+          "default": 100.0,
+          "format": "double",
+          "type": "number"
+        },
+        "ssids": {
+          "default": [],
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "state_file": {
+          "default": "",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "RepeaterRule": {
+      "additionalProperties": false,
+      "properties": {
+        "parent_ssid": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "pattern": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "pattern",
+        "parent_ssid"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "urn:scriptd:module:mwifi:v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Validated scriptd configuration document. Generated from Rust types.",
+  "properties": {
+    "module": {
+      "$ref": "#/$defs/ModuleManifest"
+    },
+    "settings": {
+      "$ref": "#/$defs/MwifiConfig"
+    },
+    "version": {
+      "const": 1,
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "version",
+    "module",
+    "settings"
+  ],
+  "title": "ModuleDocument",
+  "type": "object"
+}

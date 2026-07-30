@@ -1,0 +1,95 @@
+{
+  "$defs": {
+    "MbrewConfig": {
+      "additionalProperties": false,
+      "description": "Typed Homebrew maintenance settings.",
+      "properties": {
+        "askpass_path": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "homebrew_bin": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "sudo_timeout_hours": {
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "sudoers_path": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "sudoers_timeout_path": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "askpass_path",
+        "homebrew_bin",
+        "sudoers_path",
+        "sudoers_timeout_path",
+        "sudo_timeout_hours"
+      ],
+      "type": "object"
+    },
+    "ModuleManifest": {
+      "additionalProperties": false,
+      "description": "Stable identity and execution mode for a module.",
+      "properties": {
+        "display_name": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "id": {
+          "const": "mbrew",
+          "type": "string"
+        },
+        "mode": {
+          "$ref": "#/$defs/ModuleMode",
+          "const": "task"
+        }
+      },
+      "required": [
+        "id",
+        "display_name",
+        "mode"
+      ],
+      "type": "object"
+    },
+    "ModuleMode": {
+      "enum": [
+        "task",
+        "daemon"
+      ],
+      "type": "string"
+    }
+  },
+  "$id": "urn:scriptd:module:mbrew:v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Validated scriptd configuration document. Generated from Rust types.",
+  "properties": {
+    "module": {
+      "$ref": "#/$defs/ModuleManifest"
+    },
+    "settings": {
+      "$ref": "#/$defs/MbrewConfig"
+    },
+    "version": {
+      "const": 1,
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "version",
+    "module",
+    "settings"
+  ],
+  "title": "ModuleDocument",
+  "type": "object"
+}

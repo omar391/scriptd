@@ -1,8 +1,14 @@
-id: mbrew
-display_name: Brew Manager
-mode: task
-askpass_path: ~/Library/Application Support/scriptd/mbrew/brew_askpass.sh
-homebrew_bin: /opt/homebrew/bin/brew
-sudoers_path: /etc/sudoers.d/homebrew
-sudoers_timeout_path: /etc/sudoers.d/homebrew_timeout
-sudo_timeout_hours: 2
+# yaml-language-server: $schema=../../schemas/v1/modules/mbrew.schema.json
+version: 1
+
+module:
+  id: mbrew
+  display_name: Brew Manager
+  mode: task
+
+settings:
+  askpass_path: ~/Library/Application Support/scriptd/mbrew/brew_askpass.sh
+  homebrew_bin: /opt/homebrew/bin/brew
+  sudoers_path: /etc/sudoers.d/homebrew
+  sudoers_timeout_path: /etc/sudoers.d/homebrew_timeout
+  sudo_timeout_hours: 2

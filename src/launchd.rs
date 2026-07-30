@@ -206,6 +206,17 @@ pub fn status_loaded(label: &str) -> (bool, Option<u32>, Option<i32>) {
     (false, None, None)
 }
 
+pub fn run_launchctl(args: &[&str], must_succeed: bool) -> Result<()> {
+    let result = Command::new("launchctl").args(args).status();
+    if must_succeed {
+        let status = result?;
+        if !status.success() {
+            anyhow::bail!("launchctl {} failed", args.join(" "));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ensure_stable_service_root, plist_contents};
@@ -227,15 +238,4 @@ mod tests {
         let error = ensure_stable_service_root(root.path()).expect_err("linked worktree rejected");
         assert!(error.to_string().contains("primary checkout"));
     }
-}
-
-pub fn run_launchctl(args: &[&str], must_succeed: bool) -> Result<()> {
-    let result = Command::new("launchctl").args(args).status();
-    if must_succeed {
-        let status = result?;
-        if !status.success() {
-            anyhow::bail!("launchctl {} failed", args.join(" "));
-        }
-    }
-    Ok(())
 }

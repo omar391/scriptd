@@ -37,7 +37,7 @@ live LAN-independence test is required before enabling production automation.
 Configuration
 -------------
 
-Edit the top-level `miwatch-outage` rule in
+Edit `modules.miwatch.triggers.outage` in
 [`service.yaml`](../../service.yaml) for the SSID, timezone/window, schedule,
 network-throughput threshold, match debounce, and reset debounce. `module.yaml` retains only
 action concerns: cooldown, state/session paths, the verified remote profile,
@@ -134,13 +134,11 @@ requires the same account cookie set that the APK's `LoginManager` attaches:
 `serviceToken`, `userId`, `cUserId`, and `passToken`. `miwatch` supplies those
 restricted session values only to the Xiaomi API; it never logs them.
 
-On 2026-07-30, an authenticated read-only preflight returned HTTP 200. In
-the open operating window, three real Rust watchdog ticks then observed the
-SSID as unavailable; the third sent the single approved remote reboot request
-and Xiaomi accepted it. The persisted watchdog state recorded
-`last_outcome=reboot_accepted`. After the reboot interval, the authenticated
-preflight again returned HTTP 200. `verified_remote_api` is therefore enabled
-for this exact profile. No retries were made.
+On 2026-07-30, one explicitly approved live cloud reboot was accepted by the
+Xiaomi API. The Mac's Wi-Fi association dropped, `knight_riders_5G` became
+visible again, and the authenticated read-only preflight recovered with HTTP
+200. The attempt and cooldown were persisted before the request, and the state
+store was verified as mode `0600`. Production automation was then enabled.
 
 The legacy generic template path remains test-only and must not be used for
 Xiaomi. The code contains the APK's RC4-drop-1024/SHA-256/SHA-1 signing path,
@@ -159,5 +157,3 @@ Usage
 issuing a reboot. `run miwatch` is a manual reboot attempt: it bypasses global
 conditions but still enforces the exact verified profile, cooldown,
 attempt-before-request persistence, and no retry after an ambiguous result.
-Keep the module disabled in `service.yaml` until you choose to enable
-automatic production monitoring.

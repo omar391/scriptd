@@ -398,13 +398,15 @@ Codex Helper.11,10,20,
     fn visibility_cache_is_invalidated_when_the_requested_ssids_change() {
         let old = BTreeSet::from(["old-network".to_string()]);
         let new = BTreeSet::from(["new-network".to_string()]);
-        let mut suite = SensorSuite::default();
-        suite.last_visibility = Some(super::VisibilityCache {
-            scanned_at: std::time::Instant::now(),
-            requested_ssids: old.clone(),
-            visible_ssids: Some(old.clone()),
-            error: None,
-        });
+        let suite = SensorSuite {
+            last_visibility: Some(super::VisibilityCache {
+                scanned_at: std::time::Instant::now(),
+                requested_ssids: old.clone(),
+                visible_ssids: Some(old.clone()),
+                error: None,
+            }),
+            ..SensorSuite::default()
+        };
 
         assert!(!suite.should_scan_visibility(&old));
         assert!(suite.should_scan_visibility(&new));

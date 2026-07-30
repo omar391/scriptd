@@ -32,7 +32,7 @@ Files
 Usage
 - `./scriptd.sh run mwifi`
 - Enable or disable it from `service.yaml`
-- Ongoing cadence is configured by the top-level `mwifi-sample` trigger in
+- Ongoing cadence is configured by `modules.mwifi.triggers.sample` in
   `service.yaml`.
 
 Configuration
@@ -47,12 +47,12 @@ Configuration
 - `MWIFI_AIRPORT_PATH` — override the `airport` scanner path; if the command is missing or fails, the module uses a safer command-based fallback.
 
 Config file
-- `module.yaml` is the single module manifest/config file. Example keys:
-  - `ssids`: array of SSID strings (overridden by `MWIFI_SSIDS` env if set)
-  - `repeater_rules`: conditional SSID rules; each rule has a regular-expression `pattern` and exact `parent_ssid`
-  - `min_dwell`: minimum seconds to stay on a network after switching
-  - `ping_target`, `ping_timeout`
-  - `band_bonus_2g`, `band_bonus_5g`, `band_bonus_6g`, `rssi_offset`, `min_switch_score_delta`
+- `module.yaml` contains the module manifest plus the typed `settings` object. Example keys:
+  - `settings.ssids`: array of SSID strings (overridden by `MWIFI_SSIDS` env if set)
+  - `settings.repeater_rules`: conditional SSID rules; each rule has a regular-expression `pattern` and exact `parent_ssid`
+  - `settings.min_dwell`: minimum seconds to stay on a network after switching
+  - `settings.ping_target`, `settings.ping_timeout`
+  - `settings.band_bonus_2g`, `settings.band_bonus_5g`, `settings.band_bonus_6g`, `settings.rssi_offset`, `settings.min_switch_score_delta`
 
 The monitor resolves settings in this order: environment variables (if present) → `module.yaml` → built-in defaults.
 

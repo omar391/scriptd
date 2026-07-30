@@ -1,21 +1,26 @@
 #![allow(dead_code)]
 
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{BTreeSet, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sysinfo::{ProcessesToUpdate, System};
 
 use crate::modules::{ModuleContext, ModuleHealth, ModuleLogger, ModuleStatus};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct McpuConfig {
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(description = "Typed high-CPU process monitor settings.")]
+pub(crate) struct McpuConfig {
     #[serde(rename = "cpu_threshold")]
+    #[schemars(range(min = 1))]
     cpu_threshold: u64,
     #[serde(rename = "time_limit_seconds")]
+    #[schemars(range(min = 1))]
     time_limit_seconds: u64,
     #[serde(rename = "exclude_apps")]
+    #[schemars(inner(length(min = 1)), extend("uniqueItems" = true))]
     exclude_apps: Vec<String>,
 }
 
@@ -61,12 +66,38 @@ fn now_secs() -> u64 {
         .map_or(0, |value| value.as_secs())
 }
 
-fn read_cpu_config(module_dir: &Path) -> McpuConfig {
-    let path = module_dir.join("module.yaml");
-    match std::fs::read_to_string(&path) {
-        Ok(contents) => serde_yaml::from_str(&contents).unwrap_or_else(|_| McpuConfig::default()),
-        Err(_) => McpuConfig::default(),
+pub(crate) fn validate_config(config: &McpuConfig) -> anyhow::Result<()> {
+    if config.cpu_threshold == 0 {
+        anyhow::bail!("mcpu cpu_threshold must be greater than zero");
     }
+    if config.time_limit_seconds == 0 {
+        anyhow::bail!("mcpu time_limit_seconds must be greater than zero");
+    }
+    if config
+        .exclude_apps
+        .iter()
+        .any(|value| value.trim().is_empty() || value.trim() != value)
+    {
+        anyhow::bail!(
+            "mcpu exclude_apps must contain non-empty names without surrounding whitespace"
+        );
+    }
+    let unique_apps = config
+        .exclude_apps
+        .iter()
+        .map(|value| value.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    if unique_apps.len() != config.exclude_apps.len() {
+        anyhow::bail!("mcpu exclude_apps must not contain duplicates");
+    }
+    Ok(())
+}
+
+fn read_cpu_config(context: &ModuleContext) -> anyhow::Result<McpuConfig> {
+    let Some(crate::config::ModuleSettings::Mcpu(config)) = context.settings.as_ref() else {
+        anyhow::bail!("mcpu typed settings were not loaded");
+    };
+    Ok(config.clone())
 }
 
 fn parse_cpu_snapshot(config: &McpuConfig, _logger: &ModuleLogger) -> Vec<(u32, TrackedProcess)> {
@@ -123,7 +154,7 @@ fn reconcile_tracked_processes(
 
 pub fn run_once(context: &mut ModuleContext) -> anyhow::Result<Option<ModuleStatus>> {
     let mut system = System::new_all();
-    let config = read_cpu_config(&context.module_dir);
+    let config = read_cpu_config(context)?;
     system.refresh_processes(ProcessesToUpdate::All, true);
     let snapshot = parse_cpu_snapshot(&config, &context.logger);
 

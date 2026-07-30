@@ -1,12 +1,18 @@
-id: mcpu
-display_name: CPU Monitor
-mode: task
-cpu_threshold: 50
-time_limit_seconds: 600
-exclude_apps:
-  - Finder
-  - Dock
-  - Terminal
-  - Activity Monitor
-  - kernel_task
-  - loginwindow
+# yaml-language-server: $schema=../../schemas/v1/modules/mcpu.schema.json
+version: 1
+
+module:
+  id: mcpu
+  display_name: CPU Monitor
+  mode: task
+
+settings:
+  cpu_threshold: 50
+  time_limit_seconds: 600
+  exclude_apps:
+    - Finder
+    - Dock
+    - Terminal
+    - Activity Monitor
+    - kernel_task
+    - loginwindow

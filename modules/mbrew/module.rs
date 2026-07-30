@@ -5,23 +5,31 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use anyhow::{bail, Context};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::credentials;
 use crate::modules::{ModuleContext, ModuleHealth, ModuleLogger, ModuleStatus};
 use crate::paths::expand_home;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct MbrewConfig {
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(description = "Typed Homebrew maintenance settings.")]
+pub(crate) struct MbrewConfig {
     #[serde(rename = "askpass_path")]
+    #[schemars(length(min = 1))]
     askpass_path: String,
     #[serde(rename = "homebrew_bin")]
+    #[schemars(length(min = 1))]
     homebrew_bin: String,
     #[serde(rename = "sudoers_path")]
+    #[schemars(length(min = 1))]
     sudoers_path: String,
     #[serde(rename = "sudoers_timeout_path")]
+    #[schemars(length(min = 1))]
     sudoers_timeout_path: String,
     #[serde(rename = "sudo_timeout_hours")]
+    #[schemars(range(min = 1))]
     sudo_timeout_hours: u64,
 }
 
@@ -194,12 +202,26 @@ fn command_for_brew(config: &MbrewConfig, args: &[&str]) -> anyhow::Result<(Stri
     Ok(command)
 }
 
-fn update_from_config(module_dir: &std::path::Path) -> MbrewConfig {
-    let path = module_dir.join("module.yaml");
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|text| serde_yaml::from_str::<MbrewConfig>(&text).ok())
-        .unwrap_or_default()
+pub(crate) fn validate_config(config: &MbrewConfig) -> anyhow::Result<()> {
+    for (name, value) in [
+        ("askpass_path", config.askpass_path.as_str()),
+        ("homebrew_bin", config.homebrew_bin.as_str()),
+        ("sudoers_path", config.sudoers_path.as_str()),
+        ("sudoers_timeout_path", config.sudoers_timeout_path.as_str()),
+    ] {
+        crate::paths::validate_config_path(&format!("mbrew {name}"), value, false)?;
+    }
+    if config.sudo_timeout_hours == 0 {
+        anyhow::bail!("mbrew sudo_timeout_hours must be greater than zero");
+    }
+    Ok(())
+}
+
+fn update_from_config(context: &ModuleContext) -> anyhow::Result<MbrewConfig> {
+    let Some(crate::config::ModuleSettings::Mbrew(config)) = context.settings.as_ref() else {
+        anyhow::bail!("mbrew typed settings were not loaded");
+    };
+    Ok(config.clone())
 }
 
 fn brew_maintenance(config: &MbrewConfig, logger: &ModuleLogger) -> anyhow::Result<Vec<String>> {
@@ -280,7 +302,7 @@ fn brew_maintenance(config: &MbrewConfig, logger: &ModuleLogger) -> anyhow::Resu
 }
 
 pub fn setup(context: &mut ModuleContext) -> anyhow::Result<()> {
-    let config = update_from_config(&context.module_dir);
+    let config = update_from_config(context)?;
     let password = credentials::admin_password_or_prompt()?;
     write_askpass(&config, &context.logger)?;
     configure_sudo(&config, &password, &context.logger)?;
@@ -290,7 +312,7 @@ pub fn setup(context: &mut ModuleContext) -> anyhow::Result<()> {
 }
 
 pub fn run_once(context: &mut ModuleContext) -> anyhow::Result<Option<ModuleStatus>> {
-    let config = update_from_config(&context.module_dir);
+    let config = update_from_config(context)?;
     let result = brew_maintenance(&config, &context.logger);
     let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
 

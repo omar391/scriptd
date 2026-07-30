@@ -1,3 +1,4 @@
+use anyhow::Context;
 use std::env;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -9,6 +10,7 @@ mod launchd;
 mod logger;
 mod modules;
 mod paths;
+mod schema;
 mod status;
 mod supervisor;
 mod triggers;
@@ -27,6 +29,8 @@ fn usage() {
     println!("  scriptd.sh config <module> show");
     println!("  scriptd.sh config <module> [--enable|--disable]");
     println!("  scriptd.sh status");
+    println!("  scriptd.sh schema service");
+    println!("  scriptd.sh schema module <module>");
     println!("  scriptd.sh test");
 }
 
@@ -81,11 +85,18 @@ fn parse_and_update_module_config(args: &[String], repo_root: PathBuf) -> anyhow
     }
 
     if args.len() == 1 {
-        let mut context = modules::module_context(
+        let registry = modules::ModulesRegistry::load_from_disk(&cfg)?;
+        let definition = registry
+            .get(module_name)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("module \"{module_name}\" not found"))?;
+        let mut context = modules::module_context_with_settings(
             module_name,
             repo_root.clone(),
-            cfg::module_dir(module_name, &cfg.root_dir)?,
+            definition.dir,
             cfg.expanded_log_dir(),
+            false,
+            definition.settings,
         );
         let kind = BuiltInModule::kind_from_id(module_name)?;
         modules::setup_module(&kind, &mut context)?;
@@ -111,7 +122,7 @@ fn parse_and_update_module_config(args: &[String], repo_root: PathBuf) -> anyhow
             }
             "--every-seconds" | "--every-minutes" | "--every-hours" | "--daily-at"
             | "--cron" | "--weekday" | "--window-start" | "--window-end" => anyhow::bail!(
-                "schedule flags were removed; author complex rules in the top-level triggers section of service.yaml"
+                "schedule flags were removed; author complex rules in modules.<module>.triggers in service.yaml"
             ),
             other => anyhow::bail!("unknown config flag: {other}"),
         }
@@ -141,22 +152,16 @@ fn read_service_config_with_setup(repo_root: &Path) -> anyhow::Result<config::Se
 }
 
 fn write_service_config(config: &config::ServiceConfig) -> anyhow::Result<()> {
-    let raw = serde_yaml::to_string(config)?;
-    std::fs::write(&config.path, raw)?;
+    let raw = format!(
+        "# yaml-language-server: $schema=./schemas/v1/service.schema.json\n{}",
+        serde_yaml::to_string(config)?
+    );
+    let tmp = config
+        .path
+        .with_extension(format!("{}.tmp", std::process::id()));
+    std::fs::write(&tmp, raw)?;
+    std::fs::rename(tmp, &config.path)?;
     Ok(())
-}
-
-mod cfg {
-    use std::path::{Path, PathBuf};
-
-    pub fn module_dir(module_id: &str, root: &Path) -> anyhow::Result<PathBuf> {
-        let base = crate::paths::resolve_modules_dir(root);
-        let path = base.join(module_id);
-        if !path.exists() {
-            anyhow::bail!("module directory missing: {}", path.display());
-        }
-        Ok(path)
-    }
 }
 
 fn cmd_run(args: &[String], root: PathBuf) -> anyhow::Result<()> {
@@ -182,9 +187,19 @@ fn cmd_miwatch(args: &[String], root: PathBuf) -> anyhow::Result<()> {
         anyhow::bail!("miwatch supports only: session refresh|import; remote verify");
     }
     let config = config::read_service_config(&root)?;
-    let module_dir = cfg::module_dir("miwatch", &config.root_dir)?;
-    let mut context =
-        modules::module_context("miwatch", root, module_dir, config.expanded_log_dir());
+    let registry = modules::ModulesRegistry::load_from_disk(&config)?;
+    let definition = registry
+        .get("miwatch")
+        .cloned()
+        .context("miwatch module is not available")?;
+    let mut context = modules::module_context_with_settings(
+        "miwatch",
+        root,
+        definition.dir,
+        config.expanded_log_dir(),
+        false,
+        definition.settings,
+    );
     if args == ["session", "refresh"] {
         modules::refresh_session(&BuiltInModule::Miwatch, &mut context)
     } else if args == ["remote", "verify"] {
@@ -226,6 +241,16 @@ fn cmd_uninstall(args: &[String], root: PathBuf) -> anyhow::Result<()> {
 fn cmd_status(root: PathBuf) -> anyhow::Result<()> {
     let config = config::read_service_config(&root)?;
     status::render_status(&config, config.path.clone())?;
+    Ok(())
+}
+
+fn cmd_schema(args: &[String]) -> anyhow::Result<()> {
+    let (target, module_id) = match args {
+        [target] if target == "service" => (target.as_str(), None),
+        [target, module_id] if target == "module" => (target.as_str(), Some(module_id.as_str())),
+        _ => anyhow::bail!("schema supports: service; module <mbrew|mcpu|mwifi|miwatch>"),
+    };
+    print!("{}", schema::render(target, module_id)?);
     Ok(())
 }
 
@@ -280,6 +305,7 @@ fn main() -> ExitCode {
         "run" => cmd_run(&args, root),
         "miwatch" => cmd_miwatch(&args, root),
         "config" => cmd_config(&args, root),
+        "schema" => cmd_schema(&args),
         "test" => cmd_test(),
         "help" => {
             usage();
@@ -312,8 +338,11 @@ mod tests {
         for builtin in ["mwifi", "mcpu", "mbrew", "miwatch"] {
             let dir = root.join("modules").join(builtin);
             fs::create_dir_all(&dir).expect("module dir");
-            let manifest = format!("id: {builtin}\nmode: task\n");
-            fs::write(dir.join("module.yaml"), manifest).expect("module manifest");
+            let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("modules")
+                .join(builtin)
+                .join("module.yaml");
+            fs::copy(source, dir.join("module.yaml")).expect("module manifest");
         }
     }
 
@@ -322,7 +351,7 @@ mod tests {
         let temp = tempdir().expect("temp dir");
         write_service_yaml(
             temp.path(),
-            "label: com.omar.scriptd\nlog_dir: ~/Library/Logs/scriptd\nwatch: true\nmodules:\n  mwifi:\n    enabled: true\ntriggers:\n  mwifi-test:\n    enabled: true\n    module: mwifi\n    fire: { mode: every_match }\n    when: { schedule: { every_minutes: 5 } }\n",
+            "version: 1\nservice: { label: com.omar.scriptd, log_dir: ~/Library/Logs/scriptd, watch: true }\nmodules:\n  mwifi:\n    enabled: true\n    triggers:\n      test:\n        enabled: true\n        fire: { mode: every_match }\n        when: { schedule: { every_minutes: 5 } }\n",
         );
 
         let err = parse_and_update_module_config(
@@ -345,7 +374,7 @@ mod tests {
         let temp = tempdir().expect("temp dir");
         write_service_yaml(
             temp.path(),
-            "label: com.omar.scriptd\nlog_dir: ~/Library/Logs/scriptd\nwatch: true\nmodules:\n  mwifi:\n    enabled: true\n",
+            "version: 1\nservice: { label: com.omar.scriptd, log_dir: ~/Library/Logs/scriptd, watch: true }\nmodules:\n  mwifi: { enabled: true }\n",
         );
 
         let err = parse_and_update_module_config(
@@ -362,7 +391,7 @@ mod tests {
         let temp = tempdir().expect("temp dir");
         write_service_yaml(
             temp.path(),
-            "label: com.omar.scriptd\nlog_dir: ~/Library/Logs/scriptd\nwatch: true\nmodules:\n  mwifi:\n    enabled: true\ntriggers:\n  mwifi-test:\n    enabled: true\n    module: mwifi\n    fire: { mode: every_match }\n    when: { schedule: { every_minutes: 5 } }\n",
+            "version: 1\nservice: { label: com.omar.scriptd, log_dir: ~/Library/Logs/scriptd, watch: true }\nmodules:\n  mwifi:\n    enabled: true\n    triggers:\n      test:\n        enabled: true\n        fire: { mode: every_match }\n        when: { schedule: { every_minutes: 5 } }\n",
         );
 
         parse_and_update_module_config(
@@ -375,7 +404,7 @@ mod tests {
         let parsed: serde_yaml::Value = serde_yaml::from_str(&updated).expect("roundtrip yaml");
         assert_eq!(parsed["modules"]["mwifi"]["enabled"].as_bool(), Some(false));
         assert!(parsed["modules"]["mwifi"].get("schedule").is_none());
-        assert!(parsed["triggers"].get("mwifi-test").is_some());
+        assert!(parsed["modules"]["mwifi"]["triggers"].get("test").is_some());
     }
 
     #[test]
@@ -383,7 +412,7 @@ mod tests {
         let temp = tempdir().expect("temp dir");
         write_service_yaml(
             temp.path(),
-            "label: com.omar.scriptd\nlog_dir: ~/Library/Logs/scriptd\nwatch: true\nmodules:\n  mwifi:\n    enabled: true\n",
+            "version: 1\nservice: { label: com.omar.scriptd, log_dir: ~/Library/Logs/scriptd, watch: true }\nmodules:\n  mwifi: { enabled: true }\n",
         );
 
         let err = parse_and_update_module_config(
@@ -400,7 +429,7 @@ mod tests {
         let temp = tempdir().expect("temp dir");
         write_service_yaml(
             temp.path(),
-            "label: com.omar.scriptd\nlog_dir: ~/Library/Logs/scriptd\nwatch: true\nmodules:\n  mwifi:\n    enabled: true\n",
+            "version: 1\nservice: { label: com.omar.scriptd, log_dir: ~/Library/Logs/scriptd, watch: true }\nmodules:\n  mwifi: { enabled: true }\n",
         );
 
         show_module_config(&["mwifi".to_string()], temp.path().to_path_buf()).expect("show config");

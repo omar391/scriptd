@@ -13,7 +13,7 @@ The project is intentionally minimal:
 - Installs one LaunchAgent from `service.yaml`
 - Starts and stops modules based on enabled flags
 - Dispatches task modules from global recursive trigger expressions
-- Watches `service.yaml` for live reloads when `watch: true`
+- Watches `service.yaml` and module manifests for live reloads when `watch: true`
 - Writes shared logs plus per-module logs
 - Persists runtime state to a JSON file for `status`
 - Lets modules report health and structured metrics
@@ -26,7 +26,7 @@ scriptd.sh
       -> start/stop/uninstall/status/test commands
       -> run root -> src/main.rs -> src/supervisor.rs
           -> discover modules from modules/<name>/
-          -> load module.rs + module.yaml
+          -> load service.yaml + typed modules/<name>/module.yaml
           -> sample shared sensors and evaluate global triggers
           -> dispatch typed task incidents without overlap
           -> write state.json and logs
@@ -108,8 +108,10 @@ Notes:
 ./scriptd.sh miwatch session refresh # renew Xiaomi serviceToken directly
 ./scriptd.sh config <module>   # run setup and enable the module
 ./scriptd.sh config <module> --enable|--disable
-./scriptd.sh config <module> show # print the module's service.yaml config
+./scriptd.sh config <module> show # print the module's service policy
 ./scriptd.sh status            # print launchd + module status
+./scriptd.sh schema service    # print the generated service JSON Schema
+./scriptd.sh schema module miwatch # print one module JSON Schema
 ./scriptd.sh test              # run unit and integration tests
 ```
 
@@ -117,44 +119,40 @@ Notes:
 
 ## Service Configuration
 
-Global service configuration lives in [`service.yaml`](./service.yaml):
+Global orchestration configuration lives in [`service.yaml`](./service.yaml).
+It owns daemon settings, module enablement, schedules, and triggers. Module
+implementation settings live in the corresponding versioned
+`modules/<module>/module.yaml` file.
 
 ```yaml
-label: com.omar.scriptd
-log_dir: ~/Library/Logs/scriptd
-watch: true
+version: 1
+service:
+  label: com.omar.scriptd
+  log_dir: ~/Library/Logs/scriptd
+  watch: true
 modules:
   mwifi:
     enabled: false
-  miwatch:
-    enabled: false
-  mcpu:
-    enabled: false
-  mbrew:
-    enabled: true
-
-triggers:
-  mwifi-sample:
-    enabled: true
-    module: mwifi
-    fire:
-      mode: every_match
-    when:
-      all:
-        - schedule: { every_minutes: 5 }
-        - time_window:
-            timezone: Asia/Dhaka
-            start: "00:00"
-            end: "23:59"
+    triggers:
+      sample:
+        fire: { mode: every_match }
+        when:
+          all:
+            - schedule: { every_minutes: 5 }
+            - time_window:
+                timezone: Asia/Dhaka
+                start: "00:00"
+                end: "23:59"
 ```
 
 Fields:
 
-- `label`: LaunchAgent label
-- `log_dir`: shared log directory for root and module logs
-- `watch`: when `true`, the supervisor watches `service.yaml` and reapplies config automatically
+- `version`: strict service document version; current version is `1`
+- `service.label`: LaunchAgent label
+- `service.log_dir`: shared log directory for root and module logs
+- `service.watch`: when `true`, the supervisor watches service and module YAML files
 - `modules.<name>.enabled`: desired on/off state for each discovered module
-- `triggers.<id>`: a global rule targeting one module
+- `modules.<name>.triggers.<id>`: a rule owned by that module; its canonical runtime ID is `<module>.<id>`
 
 `when` and a latched rule's `reset.when` are recursive, non-empty `all`/`any`
 trees. Leaves are:
@@ -182,7 +180,22 @@ schedule AND SSID unavailable AND
   (time-window OR Codex desktop network activity >= 1 KiB/s)
 ```
 
-Module-specific algorithm settings still live in each module's `module.yaml`.
+Each module manifest has a versioned metadata and typed `settings` object:
+
+```yaml
+# yaml-language-server: $schema=../../schemas/v1/modules/mwifi.schema.json
+version: 1
+module:
+  id: mwifi
+  display_name: Wi-Fi Monitor
+  mode: task
+settings:
+  min_dwell: 180
+  ping_target: 1.1.1.1
+```
+
+Generated JSON Schemas are checked in under `schemas/v1/`; the modelines
+in each YAML file provide editor validation.
 
 Update module enablement with `config <module>`. Trigger expressions are
 YAML-authored only:
@@ -193,7 +206,7 @@ YAML-authored only:
 ./scriptd.sh config mwifi show
 ```
 
-Run `./scriptd.sh start root` after changing config flags to install/update the LaunchAgent and restart it if it is already running. When `watch: true`, a running supervisor also picks up `service.yaml` edits automatically.
+Run `./scriptd.sh start root` after changing config flags to install/update the LaunchAgent and restart it if it is already running. When `watch: true`, a running supervisor also picks up service and module YAML edits automatically.
 
 ## Bundled Modules
 

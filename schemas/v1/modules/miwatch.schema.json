@@ -1,0 +1,225 @@
+{
+  "$defs": {
+    "ModuleManifest": {
+      "additionalProperties": false,
+      "description": "Stable identity and execution mode for a module.",
+      "properties": {
+        "display_name": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "id": {
+          "const": "miwatch",
+          "type": "string"
+        },
+        "mode": {
+          "$ref": "#/$defs/ModuleMode",
+          "const": "task"
+        }
+      },
+      "required": [
+        "id",
+        "display_name",
+        "mode"
+      ],
+      "type": "object"
+    },
+    "ModuleMode": {
+      "enum": [
+        "task",
+        "daemon"
+      ],
+      "type": "string"
+    },
+    "RemoteApiConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "access_token_field": {
+          "default": "access_token",
+          "type": "string"
+        },
+        "expires_at_field": {
+          "default": "expires_at",
+          "type": "string"
+        },
+        "reboot": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RequestTemplate"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "refresh": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RequestTemplate"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "refresh_token_field": {
+          "default": "refresh_token",
+          "type": "string"
+        },
+        "timeout_seconds": {
+          "default": 30,
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "xiaomi": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/XiaomiRemoteConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "type": "object"
+    },
+    "RequestTemplate": {
+      "additionalProperties": false,
+      "properties": {
+        "body": {
+          "default": null
+        },
+        "headers": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "type": "object"
+        },
+        "method": {
+          "type": "string"
+        },
+        "success_statuses": {
+          "default": [],
+          "items": {
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "method",
+        "url"
+      ],
+      "type": "object"
+    },
+    "WatchdogConfig": {
+      "additionalProperties": false,
+      "description": "Typed remote-router watchdog settings; credentials remain in restricted state.",
+      "properties": {
+        "cooldown_seconds": {
+          "default": 1800,
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "remote": {
+          "$ref": "#/$defs/RemoteApiConfig",
+          "default": {
+            "access_token_field": "access_token",
+            "expires_at_field": "expires_at",
+            "reboot": null,
+            "refresh": null,
+            "refresh_token_field": "refresh_token",
+            "timeout_seconds": 30,
+            "xiaomi": null
+          }
+        },
+        "state_file": {
+          "default": "",
+          "type": "string"
+        },
+        "token_file": {
+          "default": "",
+          "type": "string"
+        },
+        "verified_remote_api": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "XiaomiRemoteConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "account_base_url": {
+          "const": "https://account.xiaomi.com",
+          "type": "string"
+        },
+        "base_url": {
+          "enum": [
+            "https://api.miwifi.com",
+            "https://eu.api.miwifi.com",
+            "https://in.api.miwifi.com"
+          ],
+          "type": "string"
+        },
+        "success_statuses": {
+          "default": [],
+          "items": {
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "user_agent": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "user_agent"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "urn:scriptd:module:miwatch:v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Validated scriptd configuration document. Generated from Rust types.",
+  "properties": {
+    "module": {
+      "$ref": "#/$defs/ModuleManifest"
+    },
+    "settings": {
+      "$ref": "#/$defs/WatchdogConfig"
+    },
+    "version": {
+      "const": 1,
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "version",
+    "module",
+    "settings"
+  ],
+  "title": "ModuleDocument",
+  "type": "object"
+}

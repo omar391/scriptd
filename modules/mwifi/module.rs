@@ -8,6 +8,7 @@ use std::process::{Command, Stdio};
 
 use chrono::{DateTime, Utc};
 use regex::Regex;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::credentials;
@@ -65,9 +66,12 @@ struct WifiSignal {
     rssi: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RepeaterRule {
+    #[schemars(length(min = 1))]
     pub pattern: String,
+    #[schemars(length(min = 1))]
     pub parent_ssid: String,
 }
 
@@ -77,15 +81,23 @@ struct CompiledRepeaterRule {
     parent_ssid: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[serde(default)]
+#[schemars(description = "Typed Wi-Fi selection, health, and repeater settings.")]
 pub struct MwifiConfig {
     #[serde(rename = "min_dwell")]
+    #[schemars(range(min = 1))]
     pub min_dwell_seconds: u64,
+    #[schemars(length(min = 1))]
     pub ping_target: String,
+    #[schemars(range(min = 1))]
     pub ping_count: u64,
     #[serde(rename = "ping_timeout")]
+    #[schemars(range(min = 1))]
     pub ping_timeout_seconds: u64,
     pub ping_high_latency_ms: u64,
+    #[schemars(range(min = 1))]
     pub health_failure_switch_runs: u64,
     #[serde(rename = "band_bonus_2g")]
     pub band_bonus_2g: f64,
@@ -104,12 +116,13 @@ pub struct MwifiConfig {
     #[serde(rename = "min_switch_score_delta")]
     pub min_switch_score_delta: f64,
     #[serde(default)]
+    #[schemars(inner(length(min = 1)), extend("uniqueItems" = true))]
     pub ssids: Vec<String>,
     #[serde(default)]
     pub repeater_rules: Vec<RepeaterRule>,
     #[serde(default)]
     pub state_file: String,
-    #[serde(default)]
+    #[serde(skip)]
     pub config_path: String,
 }
 
@@ -163,6 +176,48 @@ fn compile_repeater_rules(rules: &[RepeaterRule]) -> anyhow::Result<Vec<Compiled
             })
         })
         .collect()
+}
+
+pub(crate) fn validate_config(config: &MwifiConfig) -> anyhow::Result<()> {
+    if config.min_dwell_seconds == 0
+        || config.ping_count == 0
+        || config.ping_timeout_seconds == 0
+        || config.health_failure_switch_runs == 0
+    {
+        anyhow::bail!("mwifi dwell, ping, and health intervals must be greater than zero");
+    }
+    if config.ping_target.trim().is_empty() {
+        anyhow::bail!("mwifi ping_target must not be empty");
+    }
+    crate::paths::validate_config_path("mwifi state_file", &config.state_file, true)?;
+    if config
+        .ssids
+        .iter()
+        .any(|value| value.trim().is_empty() || value.trim() != value)
+    {
+        anyhow::bail!("mwifi ssids must contain non-empty names without surrounding whitespace");
+    }
+    let unique_ssids = config
+        .ssids
+        .iter()
+        .map(|value| value.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    if unique_ssids.len() != config.ssids.len() {
+        anyhow::bail!("mwifi ssids must not contain duplicates");
+    }
+    if !config.band_bonus_2g.is_finite()
+        || !config.band_bonus_5g.is_finite()
+        || !config.band_bonus_6g.is_finite()
+        || !config.preference_top_bonus.is_finite()
+        || !config.preference_rank_decay.is_finite()
+        || !config.current_sticky_bonus.is_finite()
+        || !config.rssi_offset.is_finite()
+        || !config.min_switch_score_delta.is_finite()
+    {
+        anyhow::bail!("mwifi score values must be finite");
+    }
+    compile_repeater_rules(&config.repeater_rules)?;
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -1562,10 +1617,10 @@ fn wait_for_connected_ssid(device: &str, target: &str, networks: &[Network]) -> 
 }
 
 fn load_config(context: &ModuleContext) -> anyhow::Result<MwifiConfig> {
-    let path = context.module_dir.join("module.yaml");
-    let contents = fs::read_to_string(&path)?;
-    let mut config = serde_yaml::from_str::<MwifiConfig>(&contents)
-        .map_err(|error| anyhow::anyhow!("invalid mwifi configuration: {error}"))?;
+    let Some(crate::config::ModuleSettings::Mwifi(raw)) = context.settings.as_ref() else {
+        anyhow::bail!("mwifi typed settings were not loaded");
+    };
+    let mut config = raw.clone();
 
     let env = EnvMap::default();
     config = resolve_mwifi_config(&config, &env);

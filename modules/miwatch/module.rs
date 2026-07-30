@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, HashMap};
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -9,6 +9,7 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use chrono::{DateTime, Duration, Utc};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha1::{Digest as Sha1Digest, Sha1};
@@ -30,19 +31,29 @@ const XIAOMI_ACCOUNT_SERVICE_LOGIN_PATH: &str = "/pass/serviceLogin";
 const CURL_STATUS_MARKER: &str = "__SCRIPTD_HTTP_STATUS__";
 const EMULATOR_COLLECTOR_DEX: &str = "/data/local/tmp/miwatch-collector.dex";
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(
+    description = "Typed remote-router watchdog settings; credentials remain in restricted state."
+)]
 pub struct WatchdogConfig {
     #[serde(rename = "ssid", default)]
+    #[schemars(skip)]
     legacy_ssid: Option<String>,
     #[serde(rename = "timezone", default)]
+    #[schemars(skip)]
     legacy_timezone: Option<String>,
     #[serde(rename = "window_start", default)]
+    #[schemars(skip)]
     legacy_window_start: Option<String>,
     #[serde(rename = "window_end", default)]
+    #[schemars(skip)]
     legacy_window_end: Option<String>,
     #[serde(rename = "failure_threshold", default)]
+    #[schemars(skip)]
     legacy_failure_threshold: Option<u32>,
     #[serde(default = "default_cooldown_seconds")]
+    #[schemars(range(min = 1))]
     pub cooldown_seconds: u64,
     #[serde(default)]
     pub state_file: String,
@@ -76,7 +87,7 @@ impl Default for WatchdogConfig {
 }
 
 impl WatchdogConfig {
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if self.legacy_ssid.is_some()
             || self.legacy_timezone.is_some()
             || self.legacy_window_start.is_some()
@@ -84,12 +95,14 @@ impl WatchdogConfig {
             || self.legacy_failure_threshold.is_some()
         {
             anyhow::bail!(
-                "miwatch SSID, timezone/window, and debounce fields moved to top-level triggers"
+                "miwatch SSID, timezone/window, and debounce fields moved to modules.miwatch.triggers in service.yaml"
             );
         }
         if self.cooldown_seconds == 0 || i64::try_from(self.cooldown_seconds).is_err() {
             anyhow::bail!("miwatch cooldown_seconds must be between 1 and i64::MAX");
         }
+        crate::paths::validate_config_path("miwatch state_file", &self.state_file, true)?;
+        crate::paths::validate_config_path("miwatch token_file", &self.token_file, true)?;
         self.remote.validate(self.verified_remote_api)
     }
 
@@ -110,7 +123,8 @@ impl WatchdogConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RemoteApiConfig {
     #[serde(default)]
     pub xiaomi: Option<XiaomiRemoteConfig>,
@@ -125,6 +139,7 @@ pub struct RemoteApiConfig {
     #[serde(default = "default_expires_at_field")]
     pub expires_at_field: String,
     #[serde(default = "default_request_timeout_seconds")]
+    #[schemars(range(min = 1))]
     pub timeout_seconds: u64,
 }
 
@@ -142,14 +157,14 @@ impl Default for RemoteApiConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct XiaomiRemoteConfig {
     #[serde(default = "default_xiaomi_base_url")]
     pub base_url: String,
     #[serde(default = "default_xiaomi_account_base_url")]
     pub account_base_url: String,
-    #[serde(default)]
-    pub router_private_id: Option<String>,
+    #[schemars(length(min = 1))]
     pub user_agent: String,
     #[serde(default)]
     pub success_statuses: Vec<u16>,
@@ -234,7 +249,8 @@ impl RemoteApiConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RequestTemplate {
     pub method: String,
     pub url: String,
@@ -665,13 +681,12 @@ fn prepare_xiaomi_init_info_request(
 }
 
 fn xiaomi_router_private_id<'a>(
-    profile: &'a XiaomiRemoteConfig,
+    _profile: &'a XiaomiRemoteConfig,
     tokens: &'a SessionTokens,
 ) -> Result<&'a str> {
-    profile
+    tokens
         .router_private_id
         .as_deref()
-        .or(tokens.router_private_id.as_deref())
         .filter(|value| !value.trim().is_empty())
         .context(
             "Mi WiFi router private ID is missing; store router_private_id in the restricted session file",
@@ -1056,42 +1071,8 @@ impl ConfiguredRemoteClient {
     }
 
     fn save_tokens(&self, tokens: &SessionTokens) -> Result<()> {
-        if let Some(parent) = self.token_file.parent() {
-            fs::create_dir_all(parent)?;
-        }
         let data = serde_json::to_vec_pretty(tokens)?;
-        let temporary = self.token_file.with_extension(format!(
-            "{}-{}.tmp",
-            std::process::id(),
-            Utc::now().timestamp_micros()
-        ));
-        let result = (|| {
-            let mut options = OpenOptions::new();
-            options.create_new(true).write(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            let mut file = options.open(&temporary)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))?;
-            }
-            file.write_all(&data)?;
-            file.sync_all()?;
-            drop(file);
-            fs::rename(&temporary, &self.token_file)?;
-            if let Some(parent) = self.token_file.parent() {
-                fs::File::open(parent)?.sync_all()?;
-            }
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temporary);
-        }
-        result
+        crate::paths::write_private_atomic(&self.token_file, &data)
     }
 
     fn refresh(&self, tokens: &mut SessionTokens) -> Result<()> {
@@ -1165,15 +1146,7 @@ impl ConfiguredRemoteClient {
                 "Mi WiFi service-token expiry is required or stale; bootstrap user/pass credentials through the authorized emulator"
             );
         }
-        let router_private_id = tokens
-            .router_private_id
-            .clone()
-            .or_else(|| profile.router_private_id.clone());
-        let mut collected = self.collect_xiaomi_session(profile)?;
-        if collected.router_private_id.is_none() && router_private_id.is_some() {
-            collected.router_private_id = router_private_id;
-            self.save_tokens(&collected)?;
-        }
+        let collected = self.collect_xiaomi_session(profile)?;
         *tokens = collected;
         Ok(())
     }
@@ -1364,15 +1337,36 @@ impl RemoteRebooter for ConfiguredRemoteClient {
 }
 
 fn read_config(context: &ModuleContext) -> Result<WatchdogConfig> {
-    let path = context.module_dir.join("module.yaml");
-    let raw = fs::read_to_string(&path)
-        .with_context(|| format!("read miwatch config {}", path.display()))?;
-    let config: WatchdogConfig = serde_yaml::from_str(&raw).context("parse miwatch config")?;
+    let Some(crate::config::ModuleSettings::Miwatch(config)) = context.settings.as_ref() else {
+        anyhow::bail!("miwatch typed settings were not loaded");
+    };
+    let config = config.as_ref().clone();
     config.validate()?;
     Ok(config)
 }
 
 fn load_state(path: &Path) -> Result<WatchdogState> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        match fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    anyhow::bail!("miwatch state file must not be a symbolic link");
+                }
+                if metadata.permissions().mode() & 0o077 != 0 {
+                    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+                        .context("restrict miwatch state file permissions")?;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspect miwatch state {}", path.display()));
+            }
+        }
+    }
     let raw = match fs::read_to_string(path) {
         Ok(raw) => raw,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1386,13 +1380,8 @@ fn load_state(path: &Path) -> Result<WatchdogState> {
 }
 
 fn save_state(path: &Path, state: &WatchdogState) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
-    fs::write(&tmp, serde_json::to_vec_pretty(state)?)?;
-    fs::rename(tmp, path)?;
-    Ok(())
+    let data = serde_json::to_vec_pretty(state)?;
+    crate::paths::write_private_atomic(path, &data)
 }
 
 fn outcome_message(outcome: &TickOutcome) -> &'static str {
@@ -1552,9 +1541,6 @@ impl ConfiguredRemoteClient {
         .and_then(|mut tokens| {
             if !ConfiguredRemoteClient::can_refresh_xiaomi(&tokens) {
                 anyhow::bail!("emulator collector returned no usable Xiaomi account credentials");
-            }
-            if tokens.router_private_id.is_none() {
-                tokens.router_private_id = profile.router_private_id.clone();
             }
             if tokens
                 .service_token
@@ -1934,7 +1920,9 @@ failure_threshold: 3
         .unwrap();
 
         let error = config.validate().unwrap_err();
-        assert!(error.to_string().contains("moved to top-level triggers"));
+        assert!(error
+            .to_string()
+            .contains("moved to modules.miwatch.triggers"));
     }
 
     #[test]
@@ -1969,6 +1957,32 @@ failure_threshold: 3
             TickOutcome::Cooldown
         );
         assert_eq!(rebooter.calls, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watchdog_state_store_is_restricted_on_write_and_read() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("watchdog-state.json");
+        let state = WatchdogState {
+            last_outcome: Some("test".to_string()),
+            ..WatchdogState::default()
+        };
+
+        save_state(&state_path, &state).unwrap();
+        assert_eq!(
+            fs::metadata(&state_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        fs::set_permissions(&state_path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(load_state(&state_path).unwrap(), state);
+        assert_eq!(
+            fs::metadata(&state_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]
@@ -2135,7 +2149,6 @@ failure_threshold: 3
         let profile = XiaomiRemoteConfig {
             base_url: "https://api.miwifi.com".to_string(),
             account_base_url: "https://account.xiaomi.com".to_string(),
-            router_private_id: None,
             user_agent: "Android APP/com.xiaomi.router APPV/5.9.0".to_string(),
             success_statuses: vec![200],
         };
@@ -2172,7 +2185,6 @@ failure_threshold: 3
         config.remote.xiaomi = Some(XiaomiRemoteConfig {
             base_url: "https://api.miwifi.com".to_string(),
             account_base_url: "https://account.xiaomi.com".to_string(),
-            router_private_id: Some("router-private-123".to_string()),
             user_agent: "Android APP/com.xiaomi.router APPV/5.9.0".to_string(),
             success_statuses: vec![200],
         });
@@ -2198,8 +2210,10 @@ failure_threshold: 3
 
     #[test]
     fn verified_config_requires_exact_xiaomi_profile() {
-        let mut config = WatchdogConfig::default();
-        config.verified_remote_api = true;
+        let mut config = WatchdogConfig {
+            verified_remote_api: true,
+            ..WatchdogConfig::default()
+        };
         config.remote.reboot = Some(RequestTemplate {
             method: "POST".to_string(),
             url: "https://example.invalid/reboot".to_string(),
@@ -2364,6 +2378,7 @@ failure_threshold: 3
                 user_id: Some("user-1".to_string()),
                 c_user_id: Some("c-user-1".to_string()),
                 pass_token: Some("pass-secret".to_string()),
+                router_private_id: Some("router-private-123".to_string()),
                 ..Default::default()
             })
             .unwrap(),
@@ -2376,7 +2391,6 @@ failure_threshold: 3
         config.remote.xiaomi = Some(XiaomiRemoteConfig {
             base_url: format!("http://{}", server.address),
             account_base_url: format!("http://{}", server.address),
-            router_private_id: Some("router-private-123".to_string()),
             user_agent: "Mi WiFi/5.9.0".to_string(),
             success_statuses: vec![200],
         });
@@ -2459,6 +2473,7 @@ failure_threshold: 3
                 expires_at: Some(1),
                 user_id: Some("user-1".to_string()),
                 pass_token: Some("pass-secret".to_string()),
+                router_private_id: Some("router-private-123".to_string()),
                 ..Default::default()
             })
             .unwrap(),
@@ -2471,7 +2486,6 @@ failure_threshold: 3
         config.remote.xiaomi = Some(XiaomiRemoteConfig {
             base_url: format!("http://{}", server.address),
             account_base_url: format!("http://{}", server.address),
-            router_private_id: Some("router-private-123".to_string()),
             user_agent: "Android APP/com.xiaomi.router APPV/5.9.0".to_string(),
             success_statuses: vec![200],
         });
@@ -2552,6 +2566,7 @@ failure_threshold: 3
                 expires_at: Some(Utc::now().timestamp() + 86_400),
                 user_id: Some("user-1".to_string()),
                 pass_token: Some("pass-secret".to_string()),
+                router_private_id: Some("router-private-123".to_string()),
                 ..Default::default()
             })
             .unwrap(),
@@ -2564,7 +2579,6 @@ failure_threshold: 3
         config.remote.xiaomi = Some(XiaomiRemoteConfig {
             base_url: format!("http://{}", server.address),
             account_base_url: format!("http://{}", server.address),
-            router_private_id: Some("router-private-123".to_string()),
             user_agent: "Android APP/com.xiaomi.router APPV/5.9.0".to_string(),
             success_statuses: vec![200],
         });

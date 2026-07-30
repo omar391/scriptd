@@ -21,12 +21,12 @@ Configuration
 Usage
 - `./scriptd.sh run mcpu`
 - Enable or disable it from `service.yaml`
-- Ongoing cadence is configured by the top-level `mcpu-sample` trigger in
+- Ongoing cadence is configured by `modules.mcpu.triggers.sample` in
   `service.yaml`.
 
 Logging
 - Managed by `scriptd` under the shared log directory from `service.yaml`.
 
 Notes
-- The module is an interval plugin.
+- The module is a task invoked by the global trigger engine.
 - It tracks PIDs in memory while the root supervisor is running.

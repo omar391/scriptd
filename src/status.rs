@@ -143,7 +143,7 @@ pub fn render_status(config: &ServiceConfig, _config_path: PathBuf) -> anyhow::R
             let definition = registry
                 .as_ref()
                 .and_then(|item| item.get(name))
-                .map(|entry| entry.manifest.mode.clone())
+                .map(|entry| entry.manifest.mode.as_str().to_string())
                 .unwrap_or_else(|| "task".to_string());
             let state_status = state.modules.get(name);
             let synthesized_next_run_at = state

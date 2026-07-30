@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use chrono::{TimeZone, Utc};
 
-use super::schema::ScheduleCondition;
+use super::schema::{DailyAtSchedule, ScheduleCondition};
 use super::*;
 
 fn parse_rule(yaml: &str) -> TriggerConfig {
@@ -274,14 +274,10 @@ when:
 
 #[test]
 fn daily_schedule_skips_a_nonexistent_dst_wall_time() {
-    let schedule = ScheduleCondition {
-        daily_at: Some(vec!["02:30".to_string()]),
+    let schedule = ScheduleCondition::DailyAt(DailyAtSchedule {
+        daily_at: vec!["02:30".to_string()],
         timezone: Some("America/New_York".to_string()),
-        every_seconds: None,
-        every_minutes: None,
-        every_hours: None,
-        cron: None,
-    };
+    });
     let after = Utc
         .with_ymd_and_hms(2026, 3, 7, 12, 0, 0)
         .single()
@@ -319,6 +315,24 @@ enabled: true
 module: mcpu
 fire: { mode: every_match }
 when: { process_network: { applications: [Codex], aggregation: sum, at_least_bytes_per_second: 0 } }
+"#,
+        r#"
+enabled: true
+module: mcpu
+fire: { mode: every_match }
+when: { schedule: { daily_at: ["05:00", "05:00"] } }
+"#,
+        r#"
+enabled: true
+module: mcpu
+fire: { mode: every_match }
+when: { process_network: { applications: [Codex, codex], aggregation: sum, at_least_bytes_per_second: 1024 } }
+"#,
+        r#"
+enabled: true
+module: mcpu
+fire: { mode: every_match }
+when: { time_window: { timezone: UTC, start: "00:00", end: "01:00", weekdays: [mon, mon] } }
 "#,
         r#"
 enabled: true
@@ -376,7 +390,7 @@ when:
         .expect("base");
     for (seconds, expected) in [
         (5 * 3600, true),
-        (24 * 3600 + 1 * 3600 + 59 * 60 + 59, true),
+        (24 * 3600 + 3600 + 59 * 60 + 59, true),
         (24 * 3600 + 2 * 3600, false),
         (24 * 3600 + 4 * 3600 + 59 * 60, false),
     ] {

@@ -1,0 +1,90 @@
+{
+  "$defs": {
+    "McpuConfig": {
+      "additionalProperties": false,
+      "description": "Typed high-CPU process monitor settings.",
+      "properties": {
+        "cpu_threshold": {
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "exclude_apps": {
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "time_limit_seconds": {
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "cpu_threshold",
+        "time_limit_seconds",
+        "exclude_apps"
+      ],
+      "type": "object"
+    },
+    "ModuleManifest": {
+      "additionalProperties": false,
+      "description": "Stable identity and execution mode for a module.",
+      "properties": {
+        "display_name": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "id": {
+          "const": "mcpu",
+          "type": "string"
+        },
+        "mode": {
+          "$ref": "#/$defs/ModuleMode",
+          "const": "task"
+        }
+      },
+      "required": [
+        "id",
+        "display_name",
+        "mode"
+      ],
+      "type": "object"
+    },
+    "ModuleMode": {
+      "enum": [
+        "task",
+        "daemon"
+      ],
+      "type": "string"
+    }
+  },
+  "$id": "urn:scriptd:module:mcpu:v1",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Validated scriptd configuration document. Generated from Rust types.",
+  "properties": {
+    "module": {
+      "$ref": "#/$defs/ModuleManifest"
+    },
+    "settings": {
+      "$ref": "#/$defs/McpuConfig"
+    },
+    "version": {
+      "const": 1,
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "version",
+    "module",
+    "settings"
+  ],
+  "title": "ModuleDocument",
+  "type": "object"
+}

@@ -5,7 +5,7 @@ mod sensors;
 pub use evaluator::{
     SensorSnapshot, TriggerDispatch, TriggerPhase, TriggerRuntime, TriggerState, WifiSnapshot,
 };
-pub use schema::{FirePolicy, TriggerConfig, TriggerMap};
+pub use schema::{Condition, FirePolicy, TriggerConfig, TriggerMap};
 pub use sensors::{SensorSuite, WifiEventWatcher};
 
 #[cfg(test)]

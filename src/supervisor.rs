@@ -72,7 +72,7 @@ impl ModuleRuntime {
         let kind = BuiltInModule::kind_from_id(&definition.id).unwrap_or(BuiltInModule::Mcpu);
         Self {
             id: definition.id.clone(),
-            mode: definition.manifest.mode.clone(),
+            mode: definition.manifest.mode.as_str().to_string(),
             definition,
             kind,
             desired_enabled: false,
@@ -93,7 +93,7 @@ impl ModuleRuntime {
     fn update_from_definition(&mut self, definition: ModuleDefinition) {
         self.kind = BuiltInModule::kind_from_id(&definition.id).unwrap_or(self.kind);
         self.id = definition.id.clone();
-        self.mode = definition.manifest.mode.clone();
+        self.mode = definition.manifest.mode.as_str().to_string();
         self.definition = definition;
     }
 
@@ -315,7 +315,7 @@ impl RunningSupervisor {
         Ok(supervisor)
     }
 
-    fn start_watcher(&mut self, path: &Path) -> Result<()> {
+    fn start_watcher(&mut self) -> Result<()> {
         let (tx, rx): (UnboundedSender<()>, UnboundedReceiver<()>) = unbounded_channel();
         let mut watcher =
             notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
@@ -330,8 +330,11 @@ impl RunningSupervisor {
             })
             .context("create service config watcher")?;
         watcher
-            .watch(path, RecursiveMode::NonRecursive)
+            .watch(&self.config_path, RecursiveMode::NonRecursive)
             .context("watch service config")?;
+        watcher
+            .watch(&self.root.join("modules"), RecursiveMode::Recursive)
+            .context("watch module configuration")?;
         self.watcher = Some(watcher);
         self.reload_receiver = Some(rx);
         Ok(())
@@ -343,7 +346,8 @@ impl RunningSupervisor {
         registry: ModulesRegistry,
     ) -> Result<()> {
         if config.watch && self.watcher.is_none() {
-            self.start_watcher(&config.path)?;
+            self.config_path = config.path.clone();
+            self.start_watcher()?;
         } else if !config.watch {
             self.watcher = None;
             self.reload_receiver = None;
@@ -484,15 +488,11 @@ impl RunningSupervisor {
             modules: module_states,
             triggers: trigger_states,
         };
-        if let Some(parent) = self.state_file.parent() {
-            std::fs::create_dir_all(parent).context("ensure state directory")?;
-        }
-        let tmp = self
-            .state_file
-            .with_extension(format!("{}.tmp", std::process::id()));
-        std::fs::write(&tmp, serde_json::to_string_pretty(&state)?)
-            .context("write temporary state")?;
-        std::fs::rename(&tmp, &self.state_file).context("install state file")?;
+        crate::paths::write_private_atomic(
+            &self.state_file,
+            serde_json::to_string_pretty(&state)?.as_bytes(),
+        )
+        .context("persist supervisor state")?;
         self.last_state_fingerprint = Some(fingerprint);
         Ok(())
     }
@@ -501,11 +501,13 @@ impl RunningSupervisor {
         let Some(runtime) = self.modules.get_mut(&dispatch.module) else {
             return Ok(());
         };
-        let mut context = modules::module_context(
+        let mut context = modules::module_context_with_settings(
             &runtime.id,
             self.root.clone(),
             runtime.definition.dir.clone(),
             self.log_dir.clone(),
+            false,
+            runtime.definition.settings.clone(),
         );
         context.invocation = ModuleInvocation::Trigger(TriggerInvocation {
             trigger_id: dispatch.trigger_id.clone(),
@@ -762,7 +764,7 @@ fn build_trigger_runtimes(
         .iter()
         .map(|(id, trigger)| {
             let state = restored
-                .and_then(|states| states.get(id))
+                .and_then(|states| states.get(id).or_else(|| states.get(legacy_trigger_id(id))))
                 .filter(|saved| saved.target == trigger.module)
                 .map(|saved| restored_trigger_state(saved, trigger));
             (
@@ -837,6 +839,16 @@ fn read_state_config(root: &Path) -> Result<(ServiceConfig, ModulesRegistry)> {
     Ok((config, registry))
 }
 
+fn legacy_trigger_id(canonical_id: &str) -> &str {
+    match canonical_id {
+        "mbrew.maintenance" => "mbrew-maintenance",
+        "mcpu.sample" => "mcpu-sample",
+        "mwifi.sample" => "mwifi-sample",
+        "miwatch.outage" => "miwatch-outage",
+        _ => canonical_id,
+    }
+}
+
 pub fn run_supervisor(root: PathBuf) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -852,12 +864,13 @@ pub fn run_one_module(root: PathBuf, module: &str) -> Result<()> {
         .get(module)
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("module \"{module}\" not found"))?;
-    let mut context = modules::module_context_with_console(
+    let mut context = modules::module_context_with_settings(
         module,
         root,
         definition.dir,
         config.expanded_log_dir(),
         true,
+        definition.settings,
     );
     context.invocation = ModuleInvocation::Manual;
     println!("Running {module}...");
@@ -872,8 +885,7 @@ async fn run_supervisor_async(root: PathBuf) -> Result<()> {
     let singleton_lock = acquire_singleton_lock(&config)?;
     let mut supervisor = RunningSupervisor::build(&root, config, registry, singleton_lock)?;
     if supervisor.watch {
-        let config_path = supervisor.config_path.clone();
-        supervisor.start_watcher(&config_path)?;
+        supervisor.start_watcher()?;
     }
 
     let update_root = supervisor.root.clone();
@@ -913,25 +925,26 @@ mod tests {
     fn compatible_reload_restores_a_latched_incident() {
         let config: ServiceConfig = serde_yaml::from_str(
             r#"
-label: com.test.scriptd
-log_dir: /tmp/logs
-modules: { miwatch: { enabled: false } }
-triggers:
-  outage:
-    enabled: true
-    module: miwatch
-    fire:
-      mode: latched
-      after: { consecutive_matches: 1, minimum_seconds: 0 }
-      reset:
-        after: { consecutive_matches: 1, minimum_seconds: 0 }
-        when: { wifi_ssid: { ssid: test, state: connected } }
-    when: { wifi_ssid: { ssid: test, state: unavailable } }
+version: 1
+service: { label: com.test.scriptd, log_dir: /tmp/logs }
+modules:
+  miwatch:
+    enabled: false
+    triggers:
+      outage:
+        enabled: true
+        fire:
+          mode: latched
+          after: { consecutive_matches: 1, minimum_seconds: 0 }
+          reset:
+            after: { consecutive_matches: 1, minimum_seconds: 0 }
+            when: { wifi_ssid: { ssid: test, state: connected } }
+        when: { wifi_ssid: { ssid: test, state: unavailable } }
 "#,
         )
         .expect("config");
         let saved = BTreeMap::from([(
-            "outage".to_string(),
+            "miwatch.outage".to_string(),
             PersistedTriggerState {
                 target: "miwatch".to_string(),
                 enabled: true,
@@ -946,11 +959,102 @@ triggers:
             },
         )]);
         let runtimes = build_trigger_runtimes(&config, Utc::now(), Some(&saved));
-        assert_eq!(runtimes["outage"].state.phase, TriggerPhase::Latched);
         assert_eq!(
-            runtimes["outage"].state.incident_id.as_deref(),
+            runtimes["miwatch.outage"].state.phase,
+            TriggerPhase::Latched
+        );
+        assert_eq!(
+            runtimes["miwatch.outage"].state.incident_id.as_deref(),
             Some("outage:1")
         );
+    }
+
+    #[test]
+    fn legacy_trigger_ids_restore_into_canonical_ids() {
+        let config: ServiceConfig = serde_yaml::from_str(
+            r#"
+version: 1
+service: { label: com.test.scriptd, log_dir: /tmp/logs }
+modules:
+  mbrew:
+    enabled: true
+    triggers:
+      maintenance:
+        enabled: true
+        fire: { mode: every_match }
+        when: { schedule: { every_minutes: 1 } }
+  mcpu:
+    enabled: true
+    triggers:
+      sample:
+        enabled: true
+        fire: { mode: every_match }
+        when: { schedule: { every_minutes: 1 } }
+  mwifi:
+    enabled: true
+    triggers:
+      sample:
+        enabled: true
+        fire: { mode: every_match }
+        when: { schedule: { every_minutes: 1 } }
+  miwatch:
+    enabled: false
+    triggers:
+      outage:
+        enabled: true
+        fire:
+          mode: latched
+          after: { consecutive_matches: 1, minimum_seconds: 0 }
+          reset:
+            after: { consecutive_matches: 1, minimum_seconds: 0 }
+            when: { wifi_power: { state: on } }
+        when: { wifi_power: { state: off } }
+"#,
+        )
+        .expect("config");
+        let saved = [
+            ("mbrew-maintenance", "mbrew", "mbrew:1"),
+            ("mcpu-sample", "mcpu", "mcpu:2"),
+            ("mwifi-sample", "mwifi", "mwifi:3"),
+            ("miwatch-outage", "miwatch", "miwatch:4"),
+        ]
+        .into_iter()
+        .map(|(id, target, incident_id)| {
+            (
+                id.to_string(),
+                PersistedTriggerState {
+                    target: target.to_string(),
+                    enabled: true,
+                    config: None,
+                    next_wake_at: None,
+                    runtime: TriggerState {
+                        phase: if target == "miwatch" {
+                            TriggerPhase::Latched
+                        } else {
+                            TriggerPhase::Pending
+                        },
+                        generation: 1,
+                        incident_id: Some(incident_id.to_string()),
+                        ..TriggerState::default()
+                    },
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+
+        let runtimes = build_trigger_runtimes(&config, Utc::now(), Some(&saved));
+
+        for (canonical_id, incident_id) in [
+            ("mbrew.maintenance", "mbrew:1"),
+            ("mcpu.sample", "mcpu:2"),
+            ("mwifi.sample", "mwifi:3"),
+            ("miwatch.outage", "miwatch:4"),
+        ] {
+            assert_eq!(
+                runtimes[canonical_id].state.incident_id.as_deref(),
+                Some(incident_id)
+            );
+        }
     }
 
     #[test]
@@ -982,9 +1086,11 @@ when: {{ wifi_power: {{ state: off }} }}
                 "outage".to_string(),
                 TriggerRuntime::new("outage".to_string(), config, now, Some(restored)),
             )]);
-            let enabled_modules = module_enabled
-                .then(|| BTreeSet::from(["miwatch".to_string()]))
-                .unwrap_or_default();
+            let enabled_modules = if module_enabled {
+                BTreeSet::from(["miwatch".to_string()])
+            } else {
+                BTreeSet::new()
+            };
 
             let dispatches = collect_pending_dispatches(&mut triggers, &enabled_modules);
 
@@ -1037,15 +1143,16 @@ when: { schedule: { every_hours: 1 } }
         .expect("old trigger");
         let config: ServiceConfig = serde_yaml::from_str(
             r#"
-label: com.test.scriptd
-log_dir: /tmp/logs
-modules: { mcpu: { enabled: true } }
-triggers:
-  sample:
+version: 1
+service: { label: com.test.scriptd, log_dir: /tmp/logs }
+modules:
+  mcpu:
     enabled: true
-    module: mcpu
-    fire: { mode: every_match }
-    when: { schedule: { every_minutes: 1 } }
+    triggers:
+      sample:
+        enabled: true
+        fire: { mode: every_match }
+        when: { schedule: { every_minutes: 1 } }
 "#,
         )
         .expect("new service config");
@@ -1055,7 +1162,7 @@ triggers:
             .expect("fixed time");
         let old_deadline = now + chrono::Duration::hours(1);
         let saved = BTreeMap::from([(
-            "sample".to_string(),
+            "mcpu.sample".to_string(),
             PersistedTriggerState {
                 target: "mcpu".to_string(),
                 enabled: true,
@@ -1071,9 +1178,9 @@ triggers:
 
         let runtimes = build_trigger_runtimes(&config, now, Some(&saved));
 
-        assert_eq!(runtimes["sample"].state.generation, 7);
+        assert_eq!(runtimes["mcpu.sample"].state.generation, 7);
         assert_eq!(
-            runtimes["sample"].next_wake(),
+            runtimes["mcpu.sample"].next_wake(),
             Some(now + chrono::Duration::minutes(1))
         );
     }
@@ -1096,26 +1203,27 @@ when: { wifi_ssid: { ssid: old-network, state: unavailable } }
         .expect("old trigger");
         let config: ServiceConfig = serde_yaml::from_str(
             r#"
-label: com.test.scriptd
-log_dir: /tmp/logs
-modules: { miwatch: { enabled: true } }
-triggers:
-  outage:
+version: 1
+service: { label: com.test.scriptd, log_dir: /tmp/logs }
+modules:
+  miwatch:
     enabled: true
-    module: miwatch
-    fire:
-      mode: latched
-      after: { consecutive_matches: 1, minimum_seconds: 0 }
-      reset:
-        after: { consecutive_matches: 1, minimum_seconds: 0 }
-        when: { wifi_power: { state: on } }
-    when: { wifi_ssid: { ssid: new-network, state: unavailable } }
+    triggers:
+      outage:
+        enabled: true
+        fire:
+          mode: latched
+          after: { consecutive_matches: 1, minimum_seconds: 0 }
+          reset:
+            after: { consecutive_matches: 1, minimum_seconds: 0 }
+            when: { wifi_power: { state: on } }
+        when: { wifi_ssid: { ssid: new-network, state: unavailable } }
 "#,
         )
         .expect("new config");
         let now = Utc::now();
         let saved = BTreeMap::from([(
-            "outage".to_string(),
+            "miwatch.outage".to_string(),
             PersistedTriggerState {
                 target: "miwatch".to_string(),
                 enabled: true,
@@ -1132,7 +1240,7 @@ triggers:
         )]);
 
         let runtimes = build_trigger_runtimes(&config, now, Some(&saved));
-        let runtime = &runtimes["outage"];
+        let runtime = &runtimes["miwatch.outage"];
 
         assert!(runtime.pending_dispatch().is_none());
         assert_eq!(runtime.state.phase, TriggerPhase::Latched);
@@ -1158,7 +1266,7 @@ triggers:
     #[test]
     fn persisted_trigger_state_from_another_root_is_rejected() {
         let mut config: ServiceConfig = serde_yaml::from_str(
-            "label: com.test.scriptd\nlog_dir: /tmp/logs\nmodules: {}\ntriggers: {}\n",
+            "version: 1\nservice: { label: com.test.scriptd, log_dir: /tmp/logs }\nmodules: {}\n",
         )
         .expect("config");
         config.path = PathBuf::from("/current/service.yaml");
