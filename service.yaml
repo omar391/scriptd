@@ -15,14 +15,9 @@ modules:
         fire:
           mode: every_match
         when:
-          all:
-            - schedule:
-                every_hours: 12
-                timezone: Asia/Dhaka
-            - time_window:
-                timezone: Asia/Dhaka
-                start: "00:00"
-                end: "06:00"
+          schedule:
+            daily_at: "00:00"
+            timezone: Asia/Dhaka
 
   mcpu:
     enabled: false
@@ -41,13 +36,8 @@ modules:
         fire:
           mode: every_match
         when:
-          all:
-            - schedule:
-                every_minutes: 5
-            - time_window:
-                timezone: Asia/Dhaka
-                start: "00:00"
-                end: "23:59"
+          schedule:
+            every_minutes: 5
 
   miwatch:
     enabled: true

@@ -943,29 +943,17 @@ fn integration_repository_configuration_migrates_all_modules_to_global_triggers(
     let wifi = &service["modules"]["mwifi"]["triggers"]["sample"];
     let watchdog = &service["modules"]["miwatch"]["triggers"]["outage"];
     assert_eq!(
-        brew["when"]["all"][0]["schedule"]["every_hours"].as_u64(),
-        Some(12)
-    );
-    assert_eq!(
-        brew["when"]["all"][1]["time_window"]["start"].as_str(),
+        brew["when"]["schedule"]["daily_at"].as_str(),
         Some("00:00")
     );
     assert_eq!(
-        brew["when"]["all"][1]["time_window"]["end"].as_str(),
-        Some("06:00")
+        brew["when"]["schedule"]["timezone"].as_str(),
+        Some("Asia/Dhaka")
     );
     assert_eq!(cpu["when"]["schedule"]["every_minutes"].as_u64(), Some(1));
     assert_eq!(
-        wifi["when"]["all"][0]["schedule"]["every_minutes"].as_u64(),
+        wifi["when"]["schedule"]["every_minutes"].as_u64(),
         Some(5)
-    );
-    assert_eq!(
-        wifi["when"]["all"][1]["time_window"]["start"].as_str(),
-        Some("00:00")
-    );
-    assert_eq!(
-        wifi["when"]["all"][1]["time_window"]["end"].as_str(),
-        Some("23:59")
     );
     assert_eq!(
         watchdog["when"]["all"][0]["schedule"]["every_seconds"].as_u64(),

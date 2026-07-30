@@ -467,6 +467,56 @@ when:
 }
 
 #[test]
+fn restored_overdue_daily_schedule_coalesces_missed_deadlines() {
+    let rule = parse_rule(
+        r#"
+enabled: true
+module: mcpu
+fire: { mode: every_match }
+when:
+  schedule:
+    daily_at: "00:00"
+    timezone: UTC
+"#,
+    );
+    let before_deadline = Utc
+        .with_ymd_and_hms(2026, 7, 28, 23, 59, 0)
+        .single()
+        .expect("valid start");
+    let resumed_at = Utc
+        .with_ymd_and_hms(2026, 7, 31, 10, 0, 0)
+        .single()
+        .expect("valid resume time");
+    let next_deadline = Utc
+        .with_ymd_and_hms(2026, 8, 1, 0, 0, 0)
+        .single()
+        .expect("valid next deadline");
+
+    let initial = TriggerRuntime::new("daily".to_string(), rule.clone(), before_deadline, None);
+    let mut resumed = TriggerRuntime::new(
+        "daily".to_string(),
+        rule,
+        resumed_at,
+        Some(initial.snapshot_state()),
+    );
+
+    let dispatch = resumed
+        .evaluate(resumed_at, &SensorSnapshot::default())
+        .expect("overdue deadline should catch up once");
+    assert_eq!(dispatch.fired_at, resumed_at);
+    assert_eq!(resumed.state.generation, 1);
+
+    resumed.mark_dispatched(&dispatch.incident_id);
+    assert_eq!(resumed.next_wake(), Some(next_deadline));
+    assert!(
+        resumed
+            .evaluate(resumed_at, &SensorSnapshot::default())
+            .is_none(),
+        "missed daily deadlines must not be replayed"
+    );
+}
+
+#[test]
 fn overnight_window_is_start_inclusive_and_end_exclusive() {
     let rule = parse_rule(
         r#"

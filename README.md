@@ -137,12 +137,7 @@ modules:
       sample:
         fire: { mode: every_match }
         when:
-          all:
-            - schedule: { every_minutes: 5 }
-            - time_window:
-                timezone: Asia/Dhaka
-                start: "00:00"
-                end: "23:59"
+          schedule: { every_minutes: 5 }
 ```
 
 Fields:
@@ -160,10 +155,16 @@ trees. Leaves are:
 - `schedule`: exactly one of `every_seconds`, `every_minutes`, `every_hours`,
   `daily_at`, or `cron`. A schedule is a true pulse at its deadline. A schedule
   required by every Boolean path gates evaluation; a schedule in one `any`
-  branch does not suppress independently sufficient sibling branches.
+  branch does not suppress independently sufficient sibling branches. A
+  persisted overdue deadline is evaluated once and then advanced from the
+  current time, so missed deadlines are coalesced rather than replayed. New or
+  edited schedules begin from the current time and do not backfill older
+  deadlines.
 - `time_window`: IANA timezone, optional weekdays, and a half-open window;
-  crossing midnight is supported. For an overnight window, `weekdays` names
-  the day on which the window starts.
+  crossing midnight is supported. It is a continuous eligibility condition for
+  Boolean policies and native-event evaluations, not a replacement for a
+  schedule pulse. For an overnight window, `weekdays` names the day on which
+  the window starts.
 - `wifi_power`: `on` or `off`
 - `wifi_ssid`: `connected`, `disconnected`, `available`, or `unavailable`
 - `process_network`: application selectors, `sum`, and a bytes-per-second
@@ -262,7 +263,7 @@ See [`modules/mcpu/README.md`](./modules/mcpu/README.md).
 
 - Mode: `task`
 - Default: enabled
-- Default schedule: every 12 hours
+- Default schedule: daily at 00:00 Asia/Dhaka, with one immediate catch-up when overdue
 - Purpose: runs `brew update`, formula upgrades, cask upgrades, repair fallback flow, and `brew cleanup`
 - Setup: stores a sudo password in Keychain, writes an askpass helper, and installs sudoers rules
 
