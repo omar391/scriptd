@@ -9,6 +9,7 @@ env/
 target/
 worktrees/
 tmp/
+solution-notes.md
 
 # git-land trunk
 .trunk/*
