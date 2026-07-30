@@ -1,8 +1,8 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use chrono::{TimeZone, Utc};
 
-use super::schema::{DailyAtSchedule, ScheduleCondition};
+use super::schema::{DailyAtSchedule, EveryHoursSchedule, EverySecondsSchedule, ScheduleCondition};
 use super::*;
 
 fn parse_rule(yaml: &str) -> TriggerConfig {
@@ -30,10 +30,10 @@ fn sensors(
             visible_ssids: Some(visible.iter().map(|value| value.to_string()).collect()),
             error: None,
         },
-        application_network_bytes_per_second: BTreeMap::from([(
-            "Codex".to_string(),
-            codex_network_bytes_per_second,
-        )]),
+        application_network: vec![ApplicationNetworkSample {
+            applications: BTreeSet::from(["Codex".to_string()]),
+            bytes_per_second: codex_network_bytes_per_second,
+        }],
         network_error: None,
     }
 }
@@ -53,9 +53,7 @@ fire:
       consecutive_matches: 2
       minimum_seconds: 30
     when:
-      all:
-        - wifi_ssid: { ssid: knight_riders_5G, state: connected }
-        - wifi_ssid: { ssid: knight_riders_5G, state: available }
+      wifi_ssid: { ssid: knight_riders_5G, state: available }
 when:
   all:
     - schedule: { every_seconds: 30 }
@@ -109,7 +107,12 @@ fn unavailable_ssid_fires_after_three_sustained_schedule_matches() {
     let snapshot = sensors(None, &[], 0);
 
     assert!(runtime.evaluate(at(30), &snapshot).is_none());
+    assert_eq!(runtime.state.match_count, 1);
     assert!(runtime.evaluate(at(59), &snapshot).is_none());
+    assert_eq!(
+        runtime.state.match_count, 1,
+        "non-schedule wakeups must not count as observations"
+    );
     assert!(runtime.evaluate(at(60), &snapshot).is_none());
     let dispatch = runtime
         .evaluate(at(90), &snapshot)
@@ -155,7 +158,7 @@ fn unknown_wifi_does_not_match_unavailable() {
 }
 
 #[test]
-fn latched_incident_rearms_only_after_connected_and_visible_reset() {
+fn latched_incident_rearms_after_the_ssid_is_visible_without_requiring_association() {
     let mut runtime =
         TriggerRuntime::new("miwatch-outage".to_string(), miwatch_rule(), at(0), None);
     let unavailable = sensors(None, &[], 0);
@@ -171,16 +174,109 @@ fn latched_incident_rearms_only_after_connected_and_visible_reset() {
     );
 
     let visible_only = sensors(None, &["knight_riders_5G"], 0);
-    for second in [120, 150] {
-        assert!(runtime.evaluate(at(second), &visible_only).is_none());
-    }
+    assert!(runtime.evaluate(at(120), &visible_only).is_none());
     assert_eq!(runtime.state.phase, TriggerPhase::Latched);
-
-    let recovered = sensors(Some("knight_riders_5G"), &["knight_riders_5G"], 0);
-    assert!(runtime.evaluate(at(180), &recovered).is_none());
-    assert_eq!(runtime.state.phase, TriggerPhase::Latched);
-    assert!(runtime.evaluate(at(210), &recovered).is_none());
+    assert!(runtime.evaluate(at(150), &visible_only).is_none());
     assert_eq!(runtime.state.phase, TriggerPhase::Armed);
+}
+
+#[test]
+fn a_schedule_in_an_any_branch_does_not_gate_sibling_sensor_branches() {
+    let rule = parse_rule(
+        r#"
+enabled: true
+module: mcpu
+fire: { mode: every_match }
+when:
+  any:
+    - schedule: { every_hours: 1 }
+    - wifi_power: { state: off }
+"#,
+    );
+    let mut runtime = TriggerRuntime::new("optional-schedule".to_string(), rule, at(0), None);
+    let snapshot = SensorSnapshot {
+        wifi: WifiSnapshot {
+            power: Some(false),
+            ..WifiSnapshot::default()
+        },
+        ..SensorSnapshot::default()
+    };
+
+    assert!(
+        runtime.evaluate(at(30), &snapshot).is_some(),
+        "the Wi-Fi branch is independently sufficient"
+    );
+}
+
+#[test]
+fn missed_required_schedule_pulses_break_a_sustained_match_streak() {
+    let mut runtime =
+        TriggerRuntime::new("miwatch-outage".to_string(), miwatch_rule(), at(0), None);
+    let unavailable_with_network = sensors(None, &[], 1024);
+
+    assert!(runtime
+        .evaluate(at(30), &unavailable_with_network)
+        .is_none());
+    assert!(runtime
+        .evaluate(at(60), &unavailable_with_network)
+        .is_none());
+    assert_eq!(runtime.state.match_count, 2);
+
+    assert!(
+        runtime
+            .evaluate(at(3600), &unavailable_with_network)
+            .is_none(),
+        "a post-sleep observation must start a fresh streak"
+    );
+    assert_eq!(runtime.state.match_count, 1);
+    assert!(runtime
+        .evaluate(at(3630), &unavailable_with_network)
+        .is_none());
+    assert!(runtime
+        .evaluate(at(3660), &unavailable_with_network)
+        .is_some());
+}
+
+#[test]
+fn overlapping_application_selectors_count_each_process_once() {
+    let rule = parse_rule(
+        r#"
+enabled: true
+module: mcpu
+fire: { mode: every_match }
+when:
+  process_network:
+    applications: [Codex, ChatGPT]
+    aggregation: sum
+    at_least_bytes_per_second: 1000
+"#,
+    );
+    let snapshot = SensorSnapshot {
+        application_network: vec![ApplicationNetworkSample {
+            applications: BTreeSet::from(["ChatGPT".to_string(), "Codex".to_string()]),
+            bytes_per_second: 600,
+        }],
+        ..SensorSnapshot::default()
+    };
+    let mut below =
+        TriggerRuntime::new("network-union-below".to_string(), rule.clone(), at(0), None);
+
+    assert!(below.evaluate(at(0), &snapshot).is_none());
+
+    let mut at_threshold = TriggerRuntime::new(
+        "network-union-threshold".to_string(),
+        TriggerConfig {
+            when: Condition::ProcessNetwork(super::schema::ProcessNetworkCondition {
+                applications: vec!["Codex".to_string(), "ChatGPT".to_string()],
+                aggregation: super::schema::NetworkAggregation::Sum,
+                at_least_bytes_per_second: 600,
+            }),
+            ..rule
+        },
+        at(0),
+        None,
+    );
+    assert!(at_threshold.evaluate(at(0), &snapshot).is_some());
 }
 
 #[test]
@@ -398,6 +494,58 @@ when:
         let mut runtime = TriggerRuntime::new("window".to_string(), rule.clone(), base, None);
         let fired = runtime.evaluate(now, &SensorSnapshot::default()).is_some();
         assert_eq!(fired, expected, "unexpected result at {now}");
+    }
+}
+
+#[test]
+fn overnight_weekdays_name_the_day_on_which_the_window_starts() {
+    let rule = parse_rule(
+        r#"
+enabled: true
+module: mcpu
+fire: { mode: every_match }
+when:
+  time_window:
+    timezone: UTC
+    start: "22:00"
+    end: "02:00"
+    weekdays: [mon]
+"#,
+    );
+    for ((year, month, day, hour, minute), expected) in [
+        ((2026, 8, 3, 21, 59), false),
+        ((2026, 8, 3, 22, 0), true),
+        ((2026, 8, 4, 1, 59), true),
+        ((2026, 8, 4, 2, 0), false),
+        ((2026, 8, 4, 22, 0), false),
+    ] {
+        let now = Utc
+            .with_ymd_and_hms(year, month, day, hour, minute, 0)
+            .single()
+            .expect("fixed time");
+        let mut runtime =
+            TriggerRuntime::new("weekday-window".to_string(), rule.clone(), now, None);
+        assert_eq!(
+            runtime.evaluate(now, &SensorSnapshot::default()).is_some(),
+            expected,
+            "unexpected result at {now}"
+        );
+    }
+}
+
+#[test]
+fn validation_rejects_schedule_intervals_that_cannot_be_represented() {
+    for schedule in [
+        ScheduleCondition::EverySeconds(EverySecondsSchedule {
+            every_seconds: u64::MAX,
+            timezone: None,
+        }),
+        ScheduleCondition::EveryHours(EveryHoursSchedule {
+            every_hours: u64::MAX,
+            timezone: None,
+        }),
+    ] {
+        assert!(schedule.validate().is_err());
     }
 }
 

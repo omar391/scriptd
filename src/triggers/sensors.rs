@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use sysinfo::{Pid, ProcessesToUpdate, System};
 
-use super::SensorSnapshot;
+use super::{ApplicationNetworkSample, SensorSnapshot};
 
 #[derive(Debug)]
 pub struct SensorSuite {
@@ -145,8 +145,8 @@ RunLoop.main.run()
             }
         }
 
-        let (application_network_bytes_per_second, network_error) = if applications.is_empty() {
-            (BTreeMap::new(), None)
+        let (application_network, network_error) = if applications.is_empty() {
+            (Vec::new(), None)
         } else {
             self.system.refresh_processes(ProcessesToUpdate::All, true);
             match sample_external_network_bytes_by_pid() {
@@ -159,16 +159,13 @@ RunLoop.main.run()
                     });
                     (aggregate_application_network(applications, processes), None)
                 }
-                Err(error) => (
-                    applications.iter().cloned().map(|name| (name, 0)).collect(),
-                    Some(error),
-                ),
+                Err(error) => (Vec::new(), Some(error)),
             }
         };
 
         SensorSnapshot {
             wifi,
-            application_network_bytes_per_second,
+            application_network,
             network_error,
         }
     }
@@ -241,24 +238,23 @@ fn parse_nettop_last_sample(output: &str) -> Option<BTreeMap<u32, u64>> {
 fn aggregate_application_network<'a>(
     applications: &BTreeSet<String>,
     processes: impl Iterator<Item = (&'a Path, u64)>,
-) -> BTreeMap<String, u64> {
-    let mut totals = applications
-        .iter()
-        .cloned()
-        .map(|name| (name, 0_u64))
-        .collect::<BTreeMap<_, _>>();
-    for (executable, bytes) in processes {
-        let bundles = application_bundle_names(executable);
-        for (configured, total) in &mut totals {
-            if bundles
+) -> Vec<ApplicationNetworkSample> {
+    processes
+        .filter_map(|(executable, bytes_per_second)| {
+            let bundles = application_bundle_names(executable);
+            bundles
                 .iter()
-                .any(|bundle| configured.eq_ignore_ascii_case(bundle))
-            {
-                *total = (*total).saturating_add(bytes);
-            }
-        }
-    }
-    totals
+                .any(|bundle| {
+                    applications
+                        .iter()
+                        .any(|configured| configured.eq_ignore_ascii_case(bundle))
+                })
+                .then_some(ApplicationNetworkSample {
+                    applications: bundles,
+                    bytes_per_second,
+                })
+        })
+        .collect()
 }
 
 fn application_bundle_names(executable: &Path) -> BTreeSet<String> {
@@ -369,8 +365,32 @@ mod tests {
             ),
             (Path::new("/opt/homebrew/bin/codex"), 300_000),
         ];
-        let totals = aggregate_application_network(&configured, processes.into_iter());
-        assert_eq!(totals.get("Codex").copied(), Some(111_000));
+        let samples = aggregate_application_network(&configured, processes.into_iter());
+        assert_eq!(
+            samples
+                .iter()
+                .map(|sample| sample.bytes_per_second)
+                .sum::<u64>(),
+            111_000
+        );
+    }
+
+    #[test]
+    fn counts_a_process_matching_multiple_application_aliases_only_once() {
+        let configured = BTreeSet::from(["ChatGPT".to_string(), "Codex".to_string()]);
+        let processes = [(
+            Path::new("/Applications/ChatGPT.app/Contents/Resources/codex"),
+            600,
+        )];
+
+        let samples = aggregate_application_network(&configured, processes.into_iter());
+
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].bytes_per_second, 600);
+        assert_eq!(
+            samples[0].applications,
+            BTreeSet::from(["ChatGPT".to_string(), "Codex".to_string()])
+        );
     }
 
     #[test]

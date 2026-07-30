@@ -996,6 +996,10 @@ fn integration_repository_configuration_migrates_all_modules_to_global_triggers(
         watchdog["fire"]["reset"]["after"]["consecutive_matches"].as_u64(),
         Some(2)
     );
+    assert_eq!(
+        watchdog["fire"]["reset"]["when"]["wifi_ssid"]["state"].as_str(),
+        Some("available")
+    );
     for entry in modules.values() {
         assert!(entry.get("settings").is_none());
     }

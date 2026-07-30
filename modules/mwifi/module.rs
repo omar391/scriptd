@@ -6,6 +6,7 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+use anyhow::Context;
 use chrono::{DateTime, Utc};
 use regex::Regex;
 use schemars::JsonSchema;
@@ -725,13 +726,24 @@ fn infer_current_ssid_from_signal(networks: &[Network], signal: WifiSignal) -> O
     }
 }
 
-fn parse_airport_output(output: &str, allowed: &[String]) -> Vec<Network> {
+fn parse_airport_output(output: &str, allowed: &[String]) -> anyhow::Result<Vec<Network>> {
+    let mut lines = output.lines();
+    let Some(_) = lines.find(|line| {
+        let header = line.to_ascii_uppercase();
+        header.contains("BSSID") && header.contains("RSSI") && header.contains("CHANNEL")
+    }) else {
+        anyhow::bail!("unrecognized airport scan output");
+    };
+
     let mut out = Vec::new();
-    for line in output.lines().skip(1) {
+    let mut saw_data = false;
+    let mut parsed_rows = 0_u64;
+    for line in lines {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
+        saw_data = true;
 
         let tokens = trimmed.split_whitespace().collect::<Vec<_>>();
         let Some(bssid_index) = tokens.iter().position(|token| {
@@ -751,12 +763,13 @@ fn parse_airport_output(output: &str, allowed: &[String]) -> Vec<Network> {
         if ssid.is_empty() {
             continue;
         }
-        if !allowed.is_empty() && !allowed.iter().any(|value| value == &ssid) {
-            continue;
-        }
 
         let parts = &tokens[bssid_index..];
         if parts.len() < 4 {
+            continue;
+        }
+        parsed_rows = parsed_rows.saturating_add(1);
+        if !allowed.is_empty() && !allowed.iter().any(|value| value == &ssid) {
             continue;
         }
 
@@ -794,7 +807,10 @@ fn parse_airport_output(output: &str, allowed: &[String]) -> Vec<Network> {
             ping_ms: None,
         });
     }
-    out
+    if saw_data && parsed_rows == 0 {
+        anyhow::bail!("malformed airport scan rows");
+    }
+    Ok(out)
 }
 
 fn parse_security(summary: &str) -> String {
@@ -812,14 +828,15 @@ fn parse_security(summary: &str) -> String {
     }
 }
 
-fn parse_swift_wifi_scan_output(output: &str) -> Vec<Network> {
-    let Ok(parsed) = serde_json::from_str::<Vec<SwiftScanRecord>>(output) else {
-        return Vec::new();
-    };
+fn parse_swift_wifi_scan_output(output: &str) -> anyhow::Result<Vec<Network>> {
+    let parsed = serde_json::from_str::<Vec<SwiftScanRecord>>(output)
+        .context("parse CoreWLAN scan output")?;
+    if parsed.iter().any(|item| item.ssid.trim().is_empty()) {
+        anyhow::bail!("CoreWLAN scan output contains an empty SSID");
+    }
 
-    parsed
+    Ok(parsed
         .into_iter()
-        .filter(|item| !item.ssid.trim().is_empty())
         .map(|item| {
             let channel_number = item
                 .channel
@@ -849,7 +866,7 @@ fn parse_swift_wifi_scan_output(output: &str) -> Vec<Network> {
                 ping_ms: None,
             }
         })
-        .collect()
+        .collect())
 }
 
 fn scan_wifi_via_swift(allowed: &[String]) -> anyhow::Result<Vec<Network>> {
@@ -886,7 +903,7 @@ print(String(data: data, encoding: .utf8) ?? "[]")
 "#,
     )?;
 
-    let parsed = parse_swift_wifi_scan_output(&output);
+    let parsed = parse_swift_wifi_scan_output(&output)?;
     Ok(parsed
         .into_iter()
         .filter(|network| allowed.is_empty() || allowed.iter().any(|value| value == &network.ssid))
@@ -955,7 +972,7 @@ pub fn scan_networks(allowed: &[String]) -> Vec<Network> {
 
 fn scan_networks_result(allowed: &[String]) -> anyhow::Result<Vec<Network>> {
     if let Ok(output) = std::env::var("SCRIPTD_MWIFI_SCAN_OUTPUT") {
-        return Ok(parse_airport_output(&output, allowed));
+        return parse_airport_output(&output, allowed);
     }
 
     let corewlan = scan_corewlan_networks(allowed);
@@ -983,7 +1000,7 @@ fn scan_networks_result(allowed: &[String]) -> anyhow::Result<Vec<Network>> {
     });
     if let Some(output) = output {
         if !output.is_empty() {
-            return Ok(parse_airport_output(&output, allowed));
+            return parse_airport_output(&output, allowed);
         }
     }
 
@@ -997,7 +1014,7 @@ pub fn repository_wifi_probe(ssid: &str) -> anyhow::Result<bool> {
         return Ok(false);
     }
     let allowed = vec![ssid.to_string()];
-    Ok(scan_networks(&allowed)
+    Ok(scan_networks_result(&allowed)?
         .iter()
         .any(|network| network.ssid == ssid))
 }
@@ -2448,7 +2465,8 @@ TestNet              00:11:22:33:44:55 -55 36 WPA2(PSK/AES/AES)\n\
 OldNet               00:AA:22:33:44:55 -40 6 auth\n\
 TestNet              00:99:88:77:66:55 -65 233 WPA3(PSK/AES/AES)\n";
 
-        let parsed = parse_airport_output(sample, &["TestNet".to_string(), "OldNet".to_string()]);
+        let parsed = parse_airport_output(sample, &["TestNet".to_string(), "OldNet".to_string()])
+            .expect("recognized airport output");
         assert_eq!(parsed.len(), 3);
         assert!(parsed.iter().any(|network| network.ssid == "TestNet"));
         let testnet = parsed
@@ -2463,6 +2481,28 @@ TestNet              00:99:88:77:66:55 -65 233 WPA3(PSK/AES/AES)\n";
             &["TestNet".to_string(), "OldNet".to_string()],
         );
         assert_eq!(deduped.len(), 2);
+    }
+
+    #[test]
+    fn scan_parsers_distinguish_valid_empty_results_from_malformed_output() {
+        assert!(
+            parse_airport_output("airport command is deprecated", &[]).is_err(),
+            "diagnostic text is not evidence that no SSIDs are visible"
+        );
+        assert!(parse_airport_output("BSSID RSSI CHANNEL\n", &[])
+            .expect("recognized empty airport result")
+            .is_empty());
+        assert!(parse_airport_output("BSSID RSSI CHANNEL\ntruncated row\n", &[]).is_err());
+        assert!(
+            parse_swift_wifi_scan_output("CoreWLAN warning").is_err(),
+            "diagnostic text is not an empty CoreWLAN result"
+        );
+        assert!(
+            parse_swift_wifi_scan_output(r#"[{"ssid":"","rssi":-50,"channel":"36"}]"#).is_err()
+        );
+        assert!(parse_swift_wifi_scan_output("[]")
+            .expect("valid empty CoreWLAN result")
+            .is_empty());
     }
 
     #[test]

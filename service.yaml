@@ -63,13 +63,9 @@ modules:
               consecutive_matches: 2
               minimum_seconds: 30
             when:
-              all:
-                - wifi_ssid:
-                    ssid: knight_riders_5G
-                    state: connected
-                - wifi_ssid:
-                    ssid: knight_riders_5G
-                    state: available
+              wifi_ssid:
+                ssid: knight_riders_5G
+                state: available
         when:
           all:
             - schedule:

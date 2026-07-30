@@ -3,7 +3,8 @@ mod schema;
 mod sensors;
 
 pub use evaluator::{
-    SensorSnapshot, TriggerDispatch, TriggerPhase, TriggerRuntime, TriggerState, WifiSnapshot,
+    ApplicationNetworkSample, SensorSnapshot, TriggerDispatch, TriggerPhase, TriggerRuntime,
+    TriggerState, WifiSnapshot,
 };
 pub use schema::{Condition, FirePolicy, TriggerConfig, TriggerMap};
 pub use sensors::{SensorSuite, WifiEventWatcher};

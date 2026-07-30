@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -61,8 +61,14 @@ pub struct WifiSnapshot {
 #[derive(Clone, Debug, Default)]
 pub struct SensorSnapshot {
     pub wifi: WifiSnapshot,
-    pub application_network_bytes_per_second: BTreeMap<String, u64>,
+    pub application_network: Vec<ApplicationNetworkSample>,
     pub network_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ApplicationNetworkSample {
+    pub applications: BTreeSet<String>,
+    pub bytes_per_second: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -90,6 +96,12 @@ impl ScheduleRuntime {
 
     fn is_due(&self, now: DateTime<Utc>) -> bool {
         self.next_due.is_some_and(|due| due <= now)
+    }
+
+    fn has_missed_pulse(&self, now: DateTime<Utc>) -> bool {
+        self.next_due.is_some_and(|due| {
+            due <= now && self.config.next_after(due).is_some_and(|next| next <= now)
+        })
     }
 }
 
@@ -221,16 +233,6 @@ impl TriggerRuntime {
             return None;
         }
         let evaluating_reset = self.state.phase == TriggerPhase::Latched;
-        let schedules = if evaluating_reset {
-            &self.reset_schedules
-        } else {
-            &self.when_schedules
-        };
-        if !schedules.is_empty() && !schedules.iter().any(|schedule| schedule.is_due(now)) {
-            return None;
-        }
-
-        self.state.last_evaluated_at = Some(now);
         let active_condition = if evaluating_reset {
             match &self.config.fire {
                 FirePolicy::Latched { reset, .. } => &reset.when,
@@ -239,6 +241,21 @@ impl TriggerRuntime {
         } else {
             &self.config.when
         };
+        let schedules = if evaluating_reset {
+            &self.reset_schedules
+        } else {
+            &self.when_schedules
+        };
+        let requires_schedule_pulse = condition_requires_schedule_pulse(active_condition);
+        if requires_schedule_pulse && !schedules.iter().any(|schedule| schedule.is_due(now)) {
+            return None;
+        }
+        let missed_required_pulse = requires_schedule_pulse
+            && schedules
+                .iter()
+                .any(|schedule| schedule.has_missed_pulse(now));
+
+        self.state.last_evaluated_at = Some(now);
         self.state.last_error = condition_sensor_error(active_condition, sensors);
 
         if self.state.phase == TriggerPhase::Latched {
@@ -250,6 +267,10 @@ impl TriggerRuntime {
                     &mut self.reset_schedules.iter_mut(),
                 );
                 self.state.last_truth = Some(truth);
+                if missed_required_pulse {
+                    self.state.reset_count = 0;
+                    self.state.reset_started_at = None;
+                }
                 update_requirement(
                     truth,
                     now,
@@ -300,6 +321,10 @@ impl TriggerRuntime {
                 })
             }
             FirePolicy::Latched { after, .. } => {
+                if missed_required_pulse {
+                    self.state.match_count = 0;
+                    self.state.match_started_at = None;
+                }
                 update_requirement(
                     truth,
                     now,
@@ -466,6 +491,18 @@ fn collect_schedules(condition: &Condition) -> Vec<ScheduleCondition> {
     out
 }
 
+fn condition_requires_schedule_pulse(condition: &Condition) -> bool {
+    match condition {
+        Condition::All(children) => children.iter().any(condition_requires_schedule_pulse),
+        Condition::Any(children) => children.iter().all(condition_requires_schedule_pulse),
+        Condition::Schedule(_) => true,
+        Condition::TimeWindow(_)
+        | Condition::WifiPower(_)
+        | Condition::WifiSsid(_)
+        | Condition::ProcessNetwork(_) => false,
+    }
+}
+
 fn evaluate_condition<'a>(
     condition: &Condition,
     now: DateTime<Utc>,
@@ -527,16 +564,19 @@ fn evaluate_condition<'a>(
             if sensors.network_error.is_some() {
                 return Truth::Unknown;
             }
-            let total = value.applications.iter().fold(0_u64, |total, application| {
-                total.saturating_add(
-                    sensors
-                        .application_network_bytes_per_second
-                        .iter()
-                        .filter(|(name, _)| name.eq_ignore_ascii_case(application))
-                        .map(|(_, bytes)| *bytes)
-                        .fold(0_u64, u64::saturating_add),
-                )
-            });
+            let total = sensors
+                .application_network
+                .iter()
+                .filter(|sample| {
+                    sample.applications.iter().any(|sampled| {
+                        value
+                            .applications
+                            .iter()
+                            .any(|configured| configured.eq_ignore_ascii_case(sampled))
+                    })
+                })
+                .map(|sample| sample.bytes_per_second)
+                .fold(0_u64, u64::saturating_add);
             Truth::from(total >= value.at_least_bytes_per_second)
         }
     }

@@ -158,20 +158,28 @@ Fields:
 trees. Leaves are:
 
 - `schedule`: exactly one of `every_seconds`, `every_minutes`, `every_hours`,
-  `daily_at`, or `cron`
+  `daily_at`, or `cron`. A schedule is a true pulse at its deadline. A schedule
+  required by every Boolean path gates evaluation; a schedule in one `any`
+  branch does not suppress independently sufficient sibling branches.
 - `time_window`: IANA timezone, optional weekdays, and a half-open window;
-  crossing midnight is supported
+  crossing midnight is supported. For an overnight window, `weekdays` names
+  the day on which the window starts.
 - `wifi_power`: `on` or `off`
 - `wifi_ssid`: `connected`, `disconnected`, `available`, or `unavailable`
 - `process_network`: application selectors, `sum`, and a bytes-per-second
-  threshold measured on external interfaces. `Codex` includes trusted Codex
-  components owned by either `Codex.app` or the current `ChatGPT.app` host.
+  threshold measured from a one-second external-interface delta sample.
+  Applications are a union, so one process matching multiple selectors is
+  counted once. `Codex` includes trusted Codex components owned by either
+  `Codex.app` or the current `ChatGPT.app` host.
 
 Conditions evaluate to `true`, `false`, or `unknown`. Sensor failures are
 `unknown` and cannot authorize an action. `fire.mode: every_match` dispatches
-each matching schedule pulse. `fire.mode: latched` supports sustained
-match/reset counts and durations, persists the incident before dispatch, and
-cannot fire again until its reset expression succeeds.
+each matching evaluation. `fire.mode: latched` supports sustained match/reset
+counts and durations, persists the incident before dispatch, and cannot fire
+again until its reset expression succeeds. Trigger-level `after` applies to
+repeated observations: for the production 30-second `miwatch` schedule, three
+matching one-second network samples span at least 60 seconds. Traffic between
+samples is not assumed, and a missed required schedule pulse breaks the streak.
 
 The complete `miwatch` expression in [`service.yaml`](./service.yaml) is:
 
@@ -179,6 +187,11 @@ The complete `miwatch` expression in [`service.yaml`](./service.yaml) is:
 schedule AND SSID unavailable AND
   (time-window OR Codex desktop network activity >= 1 KiB/s)
 ```
+
+The latch resets after the SSID is visible in two observations spanning at
+least 30 seconds. Association is not required: visibility is the direct
+recovery inverse of the outage condition, while the Mac may remain connected
+through another route.
 
 Each module manifest has a versioned metadata and typed `settings` object:
 

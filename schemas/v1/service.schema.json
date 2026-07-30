@@ -235,6 +235,7 @@
           "uniqueItems": true
         },
         "at_least_bytes_per_second": {
+          "description": "Inclusive aggregate threshold over a one-second external-interface delta sample. Trigger-level debounce requires repeated sampled matches; traffic between observations is not assumed.",
           "format": "uint64",
           "minimum": 1,
           "type": "integer"
@@ -457,9 +458,11 @@
           "type": "string"
         },
         "weekdays": {
+          "description": "Optional local weekdays. For an overnight window, the weekday is the day on which the window starts.",
           "items": {
             "$ref": "#/$defs/WeekdayName"
           },
+          "minItems": 1,
           "type": [
             "array",
             "null"

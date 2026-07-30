@@ -44,6 +44,14 @@ action concerns: cooldown, state/session paths, the verified remote profile,
 and request timeout. Complex trigger changes are YAML-authored; the CLI only
 changes module enablement.
 
+`process_network.at_least_bytes_per_second` is checked against a one-second
+external-interface delta sample at each scheduled observation. The configured
+three matches over at least 60 seconds mean three qualifying samples, not a
+continuous 60-second average. Missing a required 30-second schedule pulse
+breaks the match streak. The recovery latch uses SSID visibility alone for two
+observations over at least 30 seconds; the Mac does not need to reassociate
+with that SSID before the outage can rearm.
+
 The session file is a scriptd-owned JSON file. The one-time emulator bootstrap
 must provision `user_id` or `c_user_id` and `pass_token`; the file may also
 contain the current `service_token`, Base64 `ssecurity`, optional

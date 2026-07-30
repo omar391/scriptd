@@ -297,8 +297,13 @@ enum StringOrStringListSchema {
 
 impl ScheduleCondition {
     pub fn validate(&self) -> Result<()> {
-        if self.interval_seconds() == Some(0) {
-            anyhow::bail!("schedule interval must be greater than zero");
+        if let Some(seconds) = self.checked_interval_seconds()? {
+            if seconds == 0 {
+                anyhow::bail!("schedule interval must be greater than zero");
+            }
+            if i64::try_from(seconds).is_err() {
+                anyhow::bail!("schedule interval is too large");
+            }
         }
         let timezone = self.timezone()?;
         if let ScheduleCondition::DailyAt(schedule) = self {
@@ -332,11 +337,25 @@ impl ScheduleCondition {
     }
 
     pub fn interval_seconds(&self) -> Option<u64> {
+        self.checked_interval_seconds().ok().flatten()
+    }
+
+    fn checked_interval_seconds(&self) -> Result<Option<u64>> {
         match self {
-            Self::EverySeconds(value) => Some(value.every_seconds),
-            Self::EveryMinutes(value) => value.every_minutes.checked_mul(60),
-            Self::EveryHours(value) => value.every_hours.checked_mul(60 * 60),
-            Self::DailyAt(_) | Self::Cron(_) => None,
+            Self::EverySeconds(value) => Ok(Some(value.every_seconds)),
+            Self::EveryMinutes(value) => Ok(Some(
+                value
+                    .every_minutes
+                    .checked_mul(60)
+                    .context("schedule interval is too large")?,
+            )),
+            Self::EveryHours(value) => Ok(Some(
+                value
+                    .every_hours
+                    .checked_mul(60 * 60)
+                    .context("schedule interval is too large")?,
+            )),
+            Self::DailyAt(_) | Self::Cron(_) => Ok(None),
         }
     }
 
@@ -452,6 +471,11 @@ pub struct TimeWindowCondition {
     #[schemars(regex(pattern = r"^(?:[01][0-9]|2[0-3]):[0-5][0-9]$"))]
     pub end: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(
+        length(min = 1),
+        extend("uniqueItems" = true),
+        description = "Optional local weekdays. For an overnight window, the weekday is the day on which the window starts."
+    )]
     pub weekdays: Option<Vec<WeekdayName>>,
 }
 
@@ -486,20 +510,29 @@ impl TimeWindowCondition {
         let start = parse_time(&self.start).ok()?;
         let end = parse_time(&self.end).ok()?;
         let local = now.with_timezone(&timezone);
+        let time = local.time();
+        let matches_time = if start <= end {
+            time >= start && time < end
+        } else {
+            time >= start || time < end
+        };
+        if !matches_time {
+            return Some(false);
+        }
         if let Some(weekdays) = &self.weekdays {
+            let window_weekday = if start > end && time < end {
+                local.date_naive().pred_opt()?.weekday()
+            } else {
+                local.weekday()
+            };
             if !weekdays
                 .iter()
-                .any(|value| value.as_weekday() == local.weekday())
+                .any(|value| value.as_weekday() == window_weekday)
             {
                 return Some(false);
             }
         }
-        let time = local.time();
-        Some(if start <= end {
-            time >= start && time < end
-        } else {
-            time >= start || time < end
-        })
+        Some(true)
     }
 }
 
@@ -569,7 +602,10 @@ pub struct ProcessNetworkCondition {
     )]
     pub applications: Vec<String>,
     pub aggregation: NetworkAggregation,
-    #[schemars(range(min = 1))]
+    #[schemars(
+        range(min = 1),
+        description = "Inclusive aggregate threshold over a one-second external-interface delta sample. Trigger-level debounce requires repeated sampled matches; traffic between observations is not assumed."
+    )]
     pub at_least_bytes_per_second: u64,
 }
 
