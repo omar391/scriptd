@@ -15,7 +15,7 @@
 - If `tmp/plan.md` is missing or empty, create or update it before implementation; use Codex Plan mode when available, otherwise write the plan directly.
 - Keep heavy/generated temporary assets outside the repo or inside ignored `tmp/`; never commit `temp`, `tmp`, `_temp`, `_tmp`, `.tmp`, or `.temp` paths.
 - Run relevant tests/builds/checks before landing.
-- **User-facing messages:** At the start of each major work turn—substantive work or a material change in direction—give one brief plan covering what, why, and how. Otherwise, do not narrate routine actions, tool calls, or intermediate progress. Update only for a material plan change or when user input, approval, or awareness is required. Before stopping, concisely summarize work done, outcome, relevant checks, and unresolved issues. This limits only visible output—not reasoning, investigation, tool use, execution, or verification. Omit logs, diffs, repetition, and obvious context unless requested.
+- **User-facing messages:** Give one brief what/why/how plan when substantive work starts; repeat only if direction materially changes. Otherwise, message only when user input, approval, or awareness is required—not to narrate routine actions, tool calls, or intermediate progress. Before stopping, concisely report completed work, outcome, relevant checks, and unresolved issues. Reduce only status prose; never reduce reasoning, investigation, tool use, execution, verification, or requested output. Omit logs, diffs, repetition, and obvious context unless needed or requested.
 
 <!-- END rules:spec:common -->
 <!-- BEGIN rules:spec:coding -->
