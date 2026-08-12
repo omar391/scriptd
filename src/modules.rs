@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 
 use std::collections::HashMap;
+use std::error::Error;
+use std::fmt;
 use std::path::PathBuf;
 
 #[path = "../modules/mbrew/module.rs"]
@@ -26,6 +28,31 @@ pub enum BuiltInModule {
     Mcpu,
     Mwifi,
     Miwatch,
+}
+
+#[derive(Debug)]
+pub struct RetryableModuleError {
+    source: anyhow::Error,
+}
+
+impl fmt::Display for RetryableModuleError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl Error for RetryableModuleError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.source.root_cause())
+    }
+}
+
+pub fn retryable_module_error(error: anyhow::Error) -> anyhow::Error {
+    anyhow::Error::new(RetryableModuleError { source: error })
+}
+
+pub fn is_retryable_module_error(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<RetryableModuleError>().is_some()
 }
 
 impl BuiltInModule {

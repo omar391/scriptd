@@ -15,10 +15,16 @@ Safety state
   device evidence.
 - A transport timeout or connection loss after a reboot request is treated as
   ambiguous and is never retried during the same outage.
+- Transient authentication/preparation failures happen before the attempt
+  marker and rearm the trigger for a later retry; once the reboot request is
+  dispatched, the attempt is latched and never duplicated.
 - Trigger incidents and action attempt/cooldown state are persisted atomically
   across process restarts.
 - `attempt_started` is persisted before sending the HTTP request. A crash,
   timeout, or connection loss cannot redispatch that incident.
+- Every curl, `adb`, compiler, and emulator helper has a deadline and is
+  started in an owned process group so a stalled child cannot block the
+  supervisor indefinitely.
 - Logs contain incident/outcome summaries only; tokens, cookies,
   request bodies, and response bodies are not logged.
 
@@ -30,7 +36,8 @@ does not ping a public target before rebooting. If the Mac has Ethernet,
 another Wi-Fi path, or another working route, the cloud reboot request can be
 independent of the missing router LAN. If `knight_riders_5G` is the Mac's only
 route, the reboot request will normally fail or become ambiguous; the client
-records that outcome and suppresses retries for the outage. A missing SSID can
+records a dispatched reboot as ambiguous and suppresses retries for the
+outage. Transient failures before dispatch are retryable. A missing SSID can
 also represent a Mac radio/driver problem rather than a router failure, so a
 live LAN-independence test is required before enabling production automation.
 
@@ -109,12 +116,36 @@ the APK's authenticated `MiAccountManager` API, not private app files, and
 streams the JSON over stdin into scriptd. Do not use `adb logcat` as a token
 transport.
 
-When `miwatch` needs to issue a reboot and the session file is missing, lacks
-bootstrap fields, or cannot refresh, the Rust reboot path automatically
-compiles and runs the collector, imports the account fields, performs the
-direct service-token refresh, and continues with the reboot. It requires the
-logged-in, debuggable `codex_mygp`-style AVD because the collector uses
-`adb root` to load the authorized APK's own account-manager classes.
+When `miwatch` needs to issue a reboot and the session file is missing or
+lacks bootstrap fields, the Rust reboot path automatically compiles and runs
+the collector, imports the account fields, performs the direct service-token
+refresh, and continues with the reboot. A failed direct refresh is surfaced as
+an authentication/transport result; it does not silently fall back to the
+emulator. The collector requires the logged-in, debuggable `codex_mygp`-style
+AVD because it uses `adb root` to load the authorized APK's own account-manager
+classes.
+
+The collector owns its resources on demand. It uses an already-running
+`codex_mygp` only when it can identify that exact AVD, and never stops a
+pre-existing emulator or ADB server. Otherwise it starts a private foreground
+ADB server and a headless `codex_mygp` instance on explicit serial/ports. All
+success and failure paths remove the temporary collector dex, stop the exact
+emulator process, and stop the private ADB server, so `adb`/AVD processes are
+not left running after collection. A cold boot is bounded at 120 seconds.
+
+The lifecycle smoke suite exercises real macOS process groups with disposable
+helpers: helper timeouts and descendants, failed private-ADB startup, ADB
+shutdown failure, and preservation of pre-existing ADB/AVD resources. Run it
+without contacting Xiaomi:
+
+```bash
+./scriptd.sh test
+# Or just the miwatch lifecycle smoke tests:
+cargo test modules::miwatch::tests:: -- --nocapture
+```
+
+The suite does not issue a production reboot. An authenticated remote reboot
+remains an explicit `./scriptd.sh run miwatch` operation.
 
 Verified request profile
 ------------------------

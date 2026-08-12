@@ -657,6 +657,36 @@ fn pending_and_latched_incidents_restore_without_duplicate_generation() {
 }
 
 #[test]
+fn retryable_dispatch_rearms_without_consuming_incident_latch() {
+    let rule = miwatch_rule();
+    let mut runtime = TriggerRuntime::new("miwatch-outage".to_string(), rule, at(0), None);
+    let unavailable = sensors(None, &[], 0);
+    for second in [30, 60] {
+        assert!(runtime.evaluate(at(second), &unavailable).is_none());
+    }
+    let dispatch = runtime
+        .evaluate(at(90), &unavailable)
+        .expect("initial dispatch");
+
+    runtime.rearm_pending(&dispatch.incident_id);
+
+    assert_eq!(runtime.state.phase, TriggerPhase::Armed);
+    assert_eq!(runtime.state.generation, 1);
+    assert_eq!(
+        runtime.state.incident_id.as_deref(),
+        Some("miwatch-outage:1")
+    );
+    assert!(runtime.pending_dispatch().is_none());
+    for second in [120, 150] {
+        assert!(runtime.evaluate(at(second), &unavailable).is_none());
+    }
+    let retry = runtime
+        .evaluate(at(180), &unavailable)
+        .expect("rearmed trigger should be eligible to retry");
+    assert_eq!(retry.incident_id, "miwatch-outage:2");
+}
+
+#[test]
 fn suppressing_a_pending_latched_dispatch_consumes_it_without_rearming() {
     let rule = miwatch_rule();
     let mut runtime = TriggerRuntime::new("miwatch-outage".to_string(), rule, at(0), None);

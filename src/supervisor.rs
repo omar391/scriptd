@@ -497,9 +497,9 @@ impl RunningSupervisor {
         Ok(())
     }
 
-    fn run_module_once(&mut self, dispatch: &TriggerDispatch) -> Result<()> {
+    fn run_module_once(&mut self, dispatch: &TriggerDispatch) -> Result<bool> {
         let Some(runtime) = self.modules.get_mut(&dispatch.module) else {
-            return Ok(());
+            return Ok(false);
         };
         let mut context = modules::module_context_with_settings(
             &runtime.id,
@@ -524,23 +524,25 @@ impl RunningSupervisor {
         runtime.last_exit_at = Some(completed.clone());
         runtime.last_run_at = Some(completed);
         runtime.runs = runtime.runs.saturating_add(1);
-        match outcome {
+        let retryable = match outcome {
             Ok(status) => {
                 runtime.restarts = 0;
                 runtime.status = RuntimeStatus::Scheduled;
                 runtime.message = status
                     .and_then(|value| value.message)
                     .unwrap_or_else(|| format!("trigger {} completed", dispatch.trigger_id));
+                false
             }
             Err(error) => {
                 runtime.restarts = runtime.restarts.saturating_add(1);
                 runtime.last_error = Some(error.to_string());
                 runtime.status = RuntimeStatus::Error;
                 runtime.message = format!("trigger {} failed: {error}", dispatch.trigger_id);
+                modules::is_retryable_module_error(&error)
             }
-        }
+        };
         runtime.refresh_status();
-        Ok(())
+        Ok(retryable)
     }
 
     fn collect_sensor_requirements(&self) -> (BTreeSet<String>, BTreeSet<String>, bool) {
@@ -602,9 +604,13 @@ impl RunningSupervisor {
         self.persist_if_changed()?;
 
         for dispatch in dispatches.values() {
-            self.run_module_once(dispatch)?;
+            let retryable = self.run_module_once(dispatch)?;
             if let Some(trigger) = self.triggers.get_mut(&dispatch.trigger_id) {
-                trigger.mark_dispatched(&dispatch.incident_id);
+                if retryable {
+                    trigger.rearm_pending(&dispatch.incident_id);
+                } else {
+                    trigger.mark_dispatched(&dispatch.incident_id);
+                }
             }
         }
         self.update_module_next_wakes();

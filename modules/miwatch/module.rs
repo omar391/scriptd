@@ -1,10 +1,17 @@
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, HashMap};
+use std::error::Error;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration as StdDuration, Instant};
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
@@ -30,6 +37,12 @@ const DEFAULT_XIAOMI_ACCOUNT_BASE_URL: &str = "https://account.xiaomi.com";
 const XIAOMI_ACCOUNT_SERVICE_LOGIN_PATH: &str = "/pass/serviceLogin";
 const CURL_STATUS_MARKER: &str = "__SCRIPTD_HTTP_STATUS__";
 const EMULATOR_COLLECTOR_DEX: &str = "/data/local/tmp/miwatch-collector.dex";
+const DEFAULT_ADB_SERVER_PORT: u16 = 5037;
+const DEFAULT_XIAOMI_AVD: &str = "codex_mygp";
+const EMULATOR_BOOT_TIMEOUT_SECONDS: u64 = 120;
+const PROCESS_POLL_INTERVAL: StdDuration = StdDuration::from_millis(50);
+const COMMAND_STOP_GRACE: StdDuration = StdDuration::from_secs(1);
+const PROCESS_STOP_GRACE: StdDuration = StdDuration::from_secs(10);
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -332,8 +345,28 @@ pub enum RemoteCallOutcome {
     Ambiguous { reason: String },
 }
 
+#[derive(Debug)]
+struct RetryableRemoteError(String);
+
+impl std::fmt::Display for RetryableRemoteError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl Error for RetryableRemoteError {}
+
+fn retryable_remote_error(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(RetryableRemoteError(message.into()))
+}
+
+fn is_retryable_remote_error(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<RetryableRemoteError>().is_some()
+}
+
 pub trait RemoteRebooter {
-    fn reboot(&mut self) -> Result<RemoteCallOutcome>;
+    fn prepare(&mut self) -> Result<()>;
+    fn dispatch(&mut self) -> Result<RemoteCallOutcome>;
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -360,6 +393,27 @@ fn execute_incident<R: RemoteRebooter>(
         return Ok(TickOutcome::Cooldown);
     }
 
+    let prepared = rebooter.prepare();
+    if let Err(error) = prepared {
+        state.last_incident_id = Some(incident_id.to_string());
+        state.reboot_attempted = false;
+        state.attempt_started_at = None;
+        state.cooldown_until = None;
+        state.last_outcome = Some(
+            if is_retryable_remote_error(&error) {
+                "preparation_retryable"
+            } else {
+                "preparation_failed"
+            }
+            .to_string(),
+        );
+        save_state(state_path, state)?;
+        if is_retryable_remote_error(&error) {
+            return Err(crate::modules::retryable_module_error(error));
+        }
+        return Err(error);
+    }
+
     state.last_incident_id = Some(incident_id.to_string());
     state.attempt_started_at = Some(now.to_rfc3339());
     state.reboot_attempted = true;
@@ -370,16 +424,21 @@ fn execute_incident<R: RemoteRebooter>(
     state.last_outcome = Some("attempt_started".to_string());
     save_state(state_path, state)?;
 
-    let outcome = match rebooter.reboot()? {
-        RemoteCallOutcome::Accepted { status } => {
+    let outcome = match rebooter.dispatch() {
+        Err(_error) => {
+            state.last_outcome = Some("reboot_ambiguous".to_string());
+            save_state(state_path, state)?;
+            return Ok(TickOutcome::RebootAmbiguous);
+        }
+        Ok(RemoteCallOutcome::Accepted { status }) => {
             state.last_outcome = Some("reboot_accepted".to_string());
             TickOutcome::RebootAccepted { status }
         }
-        RemoteCallOutcome::Rejected { status } => {
+        Ok(RemoteCallOutcome::Rejected { status }) => {
             state.last_outcome = Some("reboot_rejected".to_string());
             TickOutcome::RebootRejected { status }
         }
-        RemoteCallOutcome::Ambiguous { .. } => {
+        Ok(RemoteCallOutcome::Ambiguous { .. }) => {
             state.last_outcome = Some("reboot_ambiguous".to_string());
             TickOutcome::RebootAmbiguous
         }
@@ -399,6 +458,233 @@ struct PreparedRequest {
     url: String,
     headers: BTreeMap<String, String>,
     body: Option<String>,
+}
+
+#[derive(Debug)]
+struct CommandOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct CommandTimeout {
+    label: String,
+    timeout: StdDuration,
+}
+
+impl std::fmt::Display for CommandTimeout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} timed out after {:?}",
+            self.label, self.timeout
+        )
+    }
+}
+
+impl Error for CommandTimeout {}
+
+fn configure_process_group(command: &mut Command) {
+    #[cfg(unix)]
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+fn signal_process_group(child: &Child, signal: libc::c_int) {
+    #[cfg(unix)]
+    unsafe {
+        let _ = libc::kill(-(child.id() as libc::pid_t), signal);
+    }
+    #[cfg(not(unix))]
+    let _ = signal;
+}
+
+fn terminate_child(child: &mut Child, grace: StdDuration) {
+    let exited = child.try_wait().ok().flatten().is_some();
+    signal_process_group(child, libc::SIGTERM);
+    if exited {
+        signal_process_group(child, libc::SIGKILL);
+        let _ = child.wait();
+        return;
+    }
+    let deadline = Instant::now() + grace;
+    while Instant::now() < deadline {
+        if child.try_wait().ok().flatten().is_some() {
+            return;
+        }
+        thread::sleep(PROCESS_POLL_INTERVAL);
+    }
+    signal_process_group(child, libc::SIGKILL);
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn run_command_with_timeout(
+    mut command: Command,
+    input: Option<&[u8]>,
+    timeout: StdDuration,
+    label: &str,
+) -> Result<CommandOutput> {
+    configure_process_group(&mut command);
+    let mut child = command.spawn().with_context(|| format!("spawn {label}"))?;
+
+    let stdout_reader = child.stdout.take().map(|mut pipe| {
+        thread::spawn(move || {
+            let mut output = Vec::new();
+            pipe.read_to_end(&mut output).map(|_| output)
+        })
+    });
+    let stderr_reader = child.stderr.take().map(|mut pipe| {
+        thread::spawn(move || {
+            let mut output = Vec::new();
+            pipe.read_to_end(&mut output).map(|_| output)
+        })
+    });
+    let stdin_writer = if let Some(input) = input {
+        let mut stdin = match child.stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                terminate_child(&mut child, COMMAND_STOP_GRACE);
+                return Err(anyhow::anyhow!("{label} did not expose stdin"));
+            }
+        };
+        let input = input.to_vec();
+        Some(thread::spawn(move || stdin.write_all(&input)))
+    } else {
+        None
+    };
+
+    fn join_output(
+        reader: Option<JoinHandle<io::Result<Vec<u8>>>>,
+        stream: &str,
+    ) -> Result<Vec<u8>> {
+        let Some(reader) = reader else {
+            return Ok(Vec::new());
+        };
+        reader
+            .join()
+            .map_err(|_| anyhow::anyhow!("read {stream} output thread panicked"))?
+            .with_context(|| format!("read {stream} output"))
+    }
+
+    fn join_stdin(writer: Option<JoinHandle<io::Result<()>>>, label: &str) -> Result<()> {
+        let Some(writer) = writer else {
+            return Ok(());
+        };
+        writer
+            .join()
+            .map_err(|_| anyhow::anyhow!("write {label} input thread panicked"))?
+            .with_context(|| format!("write {label} input"))
+    }
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            // A command is allowed to create descendants, so close any inherited
+            // output pipes before joining the readers. The process group belongs
+            // exclusively to this command.
+            signal_process_group(&child, libc::SIGTERM);
+            signal_process_group(&child, libc::SIGKILL);
+            let _ = join_stdin(stdin_writer, label);
+            let stdout = join_output(stdout_reader, "stdout")?;
+            let stderr = join_output(stderr_reader, "stderr")?;
+            return Ok(CommandOutput {
+                status,
+                stdout,
+                stderr,
+            });
+        }
+        if Instant::now() >= deadline {
+            terminate_child(&mut child, COMMAND_STOP_GRACE);
+            let _ = join_stdin(stdin_writer, label);
+            let _ = join_output(stdout_reader, "stdout");
+            let _ = join_output(stderr_reader, "stderr");
+            return Err(anyhow::Error::new(CommandTimeout {
+                label: label.to_string(),
+                timeout,
+            }));
+        }
+        thread::sleep(PROCESS_POLL_INTERVAL);
+    }
+}
+
+#[derive(Debug)]
+struct OwnedProcess {
+    child: Child,
+    label: String,
+    stopped: bool,
+}
+
+impl OwnedProcess {
+    fn spawn(mut command: Command, label: &str) -> Result<Self> {
+        configure_process_group(&mut command);
+        let child = command.spawn().with_context(|| format!("spawn {label}"))?;
+        Ok(Self {
+            child,
+            label: label.to_string(),
+            stopped: false,
+        })
+    }
+
+    fn exited(&mut self) -> Result<bool> {
+        Ok(self.child.try_wait()?.is_some())
+    }
+
+    fn stop(&mut self) {
+        if self.stopped {
+            return;
+        }
+        self.stopped = true;
+        terminate_child(&mut self.child, PROCESS_STOP_GRACE);
+    }
+}
+
+impl Drop for OwnedProcess {
+    fn drop(&mut self) {
+        if !self.stopped {
+            self.stopped = true;
+            terminate_child(&mut self.child, StdDuration::from_secs(2));
+        }
+    }
+}
+
+fn reserve_tcp_port() -> Result<u16> {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).context("reserve local TCP port")?;
+    Ok(listener.local_addr()?.port())
+}
+
+fn reserve_emulator_ports() -> Result<(u16, u16)> {
+    for console_port in (5554..=5682).step_by(2) {
+        let Ok(console_listener) = TcpListener::bind(("127.0.0.1", console_port)) else {
+            continue;
+        };
+        if let Ok(adb_listener) = TcpListener::bind(("127.0.0.1", console_port + 1)) {
+            drop(adb_listener);
+            drop(console_listener);
+            return Ok((console_port, console_port + 1));
+        }
+    }
+    anyhow::bail!("could not reserve an Android emulator console/ADB port pair")
+}
+
+fn endpoint_is_available(port: u16) -> bool {
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    TcpStream::connect_timeout(&address, StdDuration::from_millis(100)).is_ok()
+}
+
+fn command_output_text(output: &CommandOutput) -> String {
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+fn timeout_for(seconds: u64) -> StdDuration {
+    StdDuration::from_secs(seconds.max(1))
 }
 
 fn sha1_base64(parts: &[&str]) -> String {
@@ -911,15 +1197,30 @@ fn run_curl(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = command.spawn().context("run remote Mi WiFi request")?;
-    child
-        .stdin
-        .take()
-        .context("open curl configuration input")?
-        .write_all(config.as_bytes())?;
-    let output = child
-        .wait_with_output()
-        .context("wait for remote Mi WiFi request")?;
+    let output = match run_command_with_timeout(
+        command,
+        Some(config.as_bytes()),
+        timeout_for(timeout_seconds),
+        "remote Mi WiFi request",
+    ) {
+        Ok(output) => output,
+        Err(error) if side_effect => {
+            return Ok(HttpResponse {
+                status: 0,
+                headers: BTreeMap::new(),
+                body: format!(
+                    "ambiguous transport failure: {}",
+                    redact_text_with_tokens(&error.to_string(), tokens)
+                ),
+            });
+        }
+        Err(error) => {
+            return Err(retryable_remote_error(format!(
+                "remote authentication request failed: {}",
+                redact_text_with_tokens(&error.to_string(), tokens)
+            )));
+        }
+    };
     if !output.status.success() {
         let error = String::from_utf8_lossy(&output.stderr);
         if side_effect {
@@ -932,14 +1233,21 @@ fn run_curl(
                 ),
             });
         }
-        anyhow::bail!(
+        return Err(retryable_remote_error(format!(
             "remote authentication request failed: {}",
             redact_text_with_tokens(&error, tokens)
-        );
+        )));
     }
 
     let raw = String::from_utf8_lossy(&output.stdout);
     let Some((raw_response, status)) = raw.rsplit_once(CURL_STATUS_MARKER) else {
+        if side_effect {
+            return Ok(HttpResponse {
+                status: 0,
+                headers: BTreeMap::new(),
+                body: "ambiguous response without HTTP status".to_string(),
+            });
+        }
         anyhow::bail!("remote request returned no HTTP status");
     };
     let status = status
@@ -1010,6 +1318,14 @@ pub struct ConfiguredRemoteClient {
     token_file: PathBuf,
     repo_root: Option<PathBuf>,
     env: HashMap<String, String>,
+    prepared: Option<PreparedRemoteCall>,
+}
+
+#[derive(Debug)]
+struct PreparedRemoteCall {
+    request: PreparedRequest,
+    success_statuses: Vec<u16>,
+    tokens: SessionTokens,
 }
 
 impl ConfiguredRemoteClient {
@@ -1020,6 +1336,7 @@ impl ConfiguredRemoteClient {
             token_file,
             repo_root: None,
             env: HashMap::new(),
+            prepared: None,
         }
     }
 
@@ -1075,6 +1392,30 @@ impl ConfiguredRemoteClient {
         crate::paths::write_private_atomic(&self.token_file, &data)
     }
 
+    fn session_file_needs_collection(&self) -> bool {
+        let metadata = match fs::symlink_metadata(&self.token_file) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+            Err(_) => return false,
+        };
+        if metadata.file_type().is_symlink() {
+            return false;
+        }
+        let Ok(raw) = fs::read_to_string(&self.token_file) else {
+            return false;
+        };
+        let Ok(tokens) = serde_json::from_str::<SessionTokens>(&raw) else {
+            return false;
+        };
+        tokens.access_token.trim().is_empty()
+            && tokens
+                .service_token
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty()
+            && tokens.pass_token.as_deref().unwrap_or_default().is_empty()
+    }
+
     fn refresh(&self, tokens: &mut SessionTokens) -> Result<()> {
         let Some(template) = &self.config.remote.refresh else {
             anyhow::bail!("Mi WiFi access token expired and no refresh request is configured");
@@ -1090,10 +1431,11 @@ impl ConfiguredRemoteClient {
         let request = prepare_request(template, tokens)?;
         let response = run_curl(&request, false, tokens, self.config.remote.timeout_seconds)?;
         if !template.success_statuses().contains(&response.status) {
-            anyhow::bail!(
-                "Mi WiFi token refresh rejected with HTTP {}",
-                response.status
-            );
+            return Err(remote_http_error(
+                "Mi WiFi token refresh",
+                response.status,
+                None,
+            ));
         }
         let payload: Value =
             serde_json::from_str(&response.body).context("parse Mi WiFi token refresh response")?;
@@ -1135,11 +1477,7 @@ impl ConfiguredRemoteClient {
         tokens: &mut SessionTokens,
     ) -> Result<()> {
         if Self::can_refresh_xiaomi(tokens) {
-            match self.refresh_xiaomi(profile, tokens) {
-                Ok(()) => return Ok(()),
-                Err(error) if !self.can_collect_xiaomi() => return Err(error),
-                Err(_) => {}
-            }
+            return self.refresh_xiaomi(profile, tokens);
         }
         if !self.can_collect_xiaomi() {
             anyhow::bail!(
@@ -1164,10 +1502,11 @@ impl ConfiguredRemoteClient {
             self.config.remote.timeout_seconds,
         )?;
         if !(200..300).contains(&login_response.status) {
-            anyhow::bail!(
-                "Mi WiFi service-token refresh rejected with HTTP {}",
-                login_response.status
-            );
+            return Err(remote_http_error(
+                "Mi WiFi service-token refresh",
+                login_response.status,
+                None,
+            ));
         }
         let login_payload = xiaomi_login_payload(&login_response.body)?;
         if login_payload
@@ -1201,10 +1540,11 @@ impl ConfiguredRemoteClient {
             self.config.remote.timeout_seconds,
         )?;
         if !(200..300).contains(&exchange_response.status) {
-            anyhow::bail!(
-                "Mi WiFi service-token exchange rejected with HTTP {}",
-                exchange_response.status
-            );
+            return Err(remote_http_error(
+                "Mi WiFi service-token exchange",
+                exchange_response.status,
+                None,
+            ));
         }
         let service_token = exchange_response
             .headers
@@ -1258,36 +1598,58 @@ impl ConfiguredRemoteClient {
         }
         if !(200..300).contains(&response.status) {
             let detail = redact_text_with_tokens(&response.body, tokens);
-            anyhow::bail!(
-                "Mi WiFi authenticated preflight rejected with HTTP {}: {}",
+            return Err(remote_http_error(
+                "Mi WiFi authenticated preflight",
                 response.status,
-                if detail.is_empty() {
-                    "no response detail"
-                } else {
-                    detail.as_str()
-                }
-            );
+                (!detail.is_empty()).then_some(detail.as_str()),
+            ));
         }
         Ok(response.status)
     }
 }
 
-impl RemoteRebooter for ConfiguredRemoteClient {
-    fn reboot(&mut self) -> Result<RemoteCallOutcome> {
+fn retryable_http_status(status: u16) -> bool {
+    matches!(status, 408 | 429 | 500..=599)
+}
+
+fn remote_http_error(context: &str, status: u16, detail: Option<&str>) -> anyhow::Error {
+    let message = match detail {
+        Some(detail) => format!("{context} rejected with HTTP {status}: {detail}"),
+        None => format!("{context} rejected with HTTP {status}"),
+    };
+    if retryable_http_status(status) {
+        retryable_remote_error(message)
+    } else {
+        anyhow::anyhow!(message)
+    }
+}
+
+impl ConfiguredRemoteClient {
+    pub fn reboot(&mut self) -> Result<RemoteCallOutcome> {
+        self.prepare()?;
+        self.dispatch()
+    }
+
+    fn prepare(&mut self) -> Result<()> {
         if !self.config.verified_remote_api {
             anyhow::bail!(
                 "Mi WiFi remote API is disabled until static and dynamic evidence verifies the request profile"
             );
         }
+        self.prepared = None;
         let xiaomi_profile = self.config.remote.xiaomi.clone();
         let mut tokens = match self.load_tokens() {
             Ok(tokens) => tokens,
-            Err(_error) if xiaomi_profile.is_some() && self.can_collect_xiaomi() => {
+            Err(_error)
+                if xiaomi_profile.is_some()
+                    && self.can_collect_xiaomi()
+                    && self.session_file_needs_collection() =>
+            {
                 self.collect_xiaomi_session(xiaomi_profile.as_ref().expect("profile"))?
             }
             Err(error) => return Err(error),
         };
-        let (mut request, success_statuses) = if let Some(profile) = xiaomi_profile.as_ref() {
+        let (request, success_statuses) = if let Some(profile) = xiaomi_profile.as_ref() {
             if tokens.expires_at.is_none() || Self::token_is_expired(&tokens) {
                 self.refresh_or_collect_xiaomi(profile, &mut tokens)?;
             }
@@ -1312,10 +1674,33 @@ impl RemoteRebooter for ConfiguredRemoteClient {
             )
         };
 
+        self.prepared = Some(PreparedRemoteCall {
+            request,
+            success_statuses,
+            tokens,
+        });
+        Ok(())
+    }
+
+    fn dispatch(&mut self) -> Result<RemoteCallOutcome> {
+        let prepared = self
+            .prepared
+            .take()
+            .context("Mi WiFi reboot request was not prepared")?;
+        let PreparedRemoteCall {
+            mut request,
+            success_statuses,
+            mut tokens,
+        } = prepared;
+        let xiaomi_profile = self.config.remote.xiaomi.clone();
         let mut response = run_curl(&request, true, &tokens, self.config.remote.timeout_seconds)?;
         if response.status == 401 {
             if let Some(profile) = xiaomi_profile.as_ref() {
-                self.refresh_or_collect_xiaomi(profile, &mut tokens)?;
+                if let Err(error) = self.refresh_or_collect_xiaomi(profile, &mut tokens) {
+                    return Ok(RemoteCallOutcome::Ambiguous {
+                        reason: redact_text_with_tokens(&error.to_string(), &tokens),
+                    });
+                }
                 request = prepare_xiaomi_request(profile, &tokens)?;
                 response = run_curl(&request, true, &tokens, self.config.remote.timeout_seconds)?;
             }
@@ -1333,6 +1718,16 @@ impl RemoteRebooter for ConfiguredRemoteClient {
         Ok(RemoteCallOutcome::Rejected {
             status: response.status,
         })
+    }
+}
+
+impl RemoteRebooter for ConfiguredRemoteClient {
+    fn prepare(&mut self) -> Result<()> {
+        ConfiguredRemoteClient::prepare(self)
+    }
+
+    fn dispatch(&mut self) -> Result<RemoteCallOutcome> {
+        ConfiguredRemoteClient::dispatch(self)
     }
 }
 
@@ -1427,7 +1822,9 @@ pub fn verify_remote(context: &mut ModuleContext) -> Result<()> {
     let client = ConfiguredRemoteClient::with_context(config, context);
     let mut tokens = match client.load_tokens() {
         Ok(tokens) => tokens,
-        Err(_) if client.can_collect_xiaomi() => client.collect_xiaomi_session(&profile)?,
+        Err(_error) if client.can_collect_xiaomi() && client.session_file_needs_collection() => {
+            client.collect_xiaomi_session(&profile)?
+        }
         Err(error) => return Err(error),
     };
     if tokens.expires_at.is_none() || ConfiguredRemoteClient::token_is_expired(&tokens) {
@@ -1511,6 +1908,19 @@ impl ConfiguredRemoteClient {
             .get("ADB")
             .cloned()
             .unwrap_or_else(|| "adb".to_string());
+        let emulator = self
+            .env
+            .get("EMULATOR")
+            .or_else(|| self.env.get("ANDROID_EMULATOR"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                let bundled = sdk_root.join("emulator/emulator");
+                if bundled.is_file() {
+                    bundled
+                } else {
+                    PathBuf::from("emulator")
+                }
+            });
         for required in [&android_jar, &d8] {
             if !required.is_file() {
                 anyhow::bail!(
@@ -1530,6 +1940,7 @@ impl ConfiguredRemoteClient {
         fs::create_dir(temp_root.join("dex"))?;
         let result = collect_session_from_emulator(
             &adb,
+            &emulator,
             &javac,
             &d8,
             &android_jar,
@@ -1537,6 +1948,7 @@ impl ConfiguredRemoteClient {
             &temp_root,
             java_home.as_deref(),
             self.env.get("PATH").map(String::as_str),
+            self.config.remote.timeout_seconds,
         )
         .and_then(|mut tokens| {
             if !ConfiguredRemoteClient::can_refresh_xiaomi(&tokens) {
@@ -1569,9 +1981,186 @@ impl ConfiguredRemoteClient {
     }
 }
 
+#[derive(Debug)]
+enum AdbServerOwnership {
+    Existing,
+    Owned(OwnedProcess),
+}
+
+#[derive(Debug)]
+struct EmulatorSession {
+    adb: String,
+    server_port: Option<u16>,
+    serial: String,
+    server: AdbServerOwnership,
+    emulator: Option<OwnedProcess>,
+}
+
+impl EmulatorSession {
+    fn connect_or_start(
+        adb: &str,
+        emulator: &Path,
+        avd: &str,
+        timeout: StdDuration,
+    ) -> Result<Self> {
+        if endpoint_is_available(DEFAULT_ADB_SERVER_PORT) {
+            if let Some(serial) = find_existing_avd(adb, avd, timeout) {
+                return Ok(Self {
+                    adb: adb.to_string(),
+                    server_port: None,
+                    serial,
+                    server: AdbServerOwnership::Existing,
+                    emulator: None,
+                });
+            }
+        }
+
+        let server_port = reserve_tcp_port()?;
+        let server_endpoint = format!("tcp:127.0.0.1:{server_port}");
+        let mut server_command = Command::new(adb);
+        server_command
+            .args(["-L", server_endpoint.as_str(), "server", "nodaemon"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut server = OwnedProcess::spawn(server_command, "private miwatch adb server")?;
+        wait_for_endpoint(&mut server, server_port, timeout)?;
+
+        let (console_port, adb_port) = reserve_emulator_ports()?;
+        let serial = format!("emulator-{adb_port}");
+        let ports = format!("{console_port},{adb_port}");
+        let mut emulator_command = Command::new(emulator);
+        emulator_command
+            .args([
+                "-avd",
+                avd,
+                "-no-window",
+                "-no-audio",
+                "-no-boot-anim",
+                "-no-snapshot",
+                "-no-snapshot-save",
+                "-ports",
+                ports.as_str(),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let emulator_process = OwnedProcess::spawn(emulator_command, "owned miwatch emulator")?;
+        let mut session = Self {
+            adb: adb.to_string(),
+            server_port: Some(server_port),
+            serial,
+            server: AdbServerOwnership::Owned(server),
+            emulator: Some(emulator_process),
+        };
+        session.wait_for_boot(StdDuration::from_secs(EMULATOR_BOOT_TIMEOUT_SECONDS))?;
+        Ok(session)
+    }
+
+    fn adb<I, S>(&self, args: I, timeout: StdDuration, label: &str) -> Result<CommandOutput>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        if let Some(server_port) = self.server_port {
+            if !endpoint_is_available(server_port) {
+                anyhow::bail!("owned miwatch adb server is no longer available");
+            }
+        }
+        run_adb_command(
+            &self.adb,
+            self.server_port,
+            Some(&self.serial),
+            args,
+            timeout,
+            label,
+        )
+    }
+
+    fn wait_for_boot(&mut self, timeout: StdDuration) -> Result<()> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(emulator) = self.emulator.as_mut() {
+                if emulator.exited()? {
+                    anyhow::bail!("owned miwatch emulator exited before boot completed");
+                }
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                anyhow::bail!("miwatch emulator did not boot before the deadline");
+            }
+            let probe_timeout = (deadline - now).min(StdDuration::from_secs(5));
+            if let Ok(output) = self.adb(
+                ["shell", "getprop", "sys.boot_completed"],
+                probe_timeout,
+                "probe miwatch emulator boot",
+            ) {
+                if output.status.success()
+                    && String::from_utf8_lossy(&output.stdout)
+                        .lines()
+                        .any(|line| line.trim() == "1")
+                {
+                    return Ok(());
+                }
+            }
+            thread::sleep(PROCESS_POLL_INTERVAL.max(StdDuration::from_millis(250)));
+        }
+    }
+
+    fn ensure_root(&self, timeout: StdDuration) -> Result<()> {
+        let root = self.adb(["root"], timeout, "restart miwatch emulator adb root")?;
+        if !root.status.success() {
+            anyhow::bail!(
+                "miwatch emulator adb root failed: {}",
+                command_error_text(&root)
+            );
+        }
+        let ready = self.adb(
+            ["wait-for-device"],
+            timeout,
+            "wait for rooted miwatch emulator",
+        )?;
+        if !ready.status.success() {
+            anyhow::bail!("miwatch emulator did not return after adb root");
+        }
+        let identity = self.adb(
+            ["shell", "id"],
+            timeout,
+            "check miwatch emulator adb identity",
+        )?;
+        if !identity.status.success()
+            || !String::from_utf8_lossy(&identity.stdout).contains("uid=0")
+        {
+            anyhow::bail!("miwatch emulator collector requires an adb-root AVD");
+        }
+        Ok(())
+    }
+
+    fn cleanup(&mut self) {
+        if self.emulator.is_some() {
+            let _ = self.adb(
+                ["emu", "kill"],
+                StdDuration::from_secs(5),
+                "stop owned miwatch emulator",
+            );
+            if let Some(mut emulator) = self.emulator.take() {
+                emulator.stop();
+            }
+        }
+        if let AdbServerOwnership::Owned(server) = &mut self.server {
+            server.stop();
+        }
+    }
+}
+
+impl Drop for EmulatorSession {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn collect_session_from_emulator(
     adb: &str,
+    emulator: &Path,
     javac: &Path,
     d8: &Path,
     android_jar: &Path,
@@ -1579,26 +2168,38 @@ fn collect_session_from_emulator(
     temp_root: &Path,
     java_home: Option<&str>,
     inherited_path: Option<&str>,
+    timeout_seconds: u64,
 ) -> Result<SessionTokens> {
+    let helper_timeout = timeout_for(timeout_seconds);
     let classes = temp_root.join("classes");
     let dex_dir = temp_root.join("dex");
-    let compile = Command::new(javac)
-        .args([
-            "-source",
-            "8",
-            "-target",
-            "8",
-            "-classpath",
-            &android_jar.to_string_lossy(),
-            "-d",
-            &classes.to_string_lossy(),
-            &collector_source.to_string_lossy(),
-        ])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .context("compile miwatch emulator collector")?;
-    if !compile.success() {
+    let android_jar_arg = android_jar.to_string_lossy().into_owned();
+    let classes_arg = classes.to_string_lossy().into_owned();
+    let collector_source_arg = collector_source.to_string_lossy().into_owned();
+    let compile = run_command_with_timeout(
+        {
+            let mut command = Command::new(javac);
+            command
+                .args([
+                    "-source",
+                    "8",
+                    "-target",
+                    "8",
+                    "-classpath",
+                    android_jar_arg.as_str(),
+                    "-d",
+                    classes_arg.as_str(),
+                    collector_source_arg.as_str(),
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            command
+        },
+        None,
+        helper_timeout,
+        "compile miwatch emulator collector",
+    )?;
+    if !compile.status.success() {
         anyhow::bail!("miwatch emulator collector compilation failed");
     }
 
@@ -1612,6 +2213,7 @@ fn collect_session_from_emulator(
     if class_files.is_empty() {
         anyhow::bail!("miwatch emulator collector produced no class files");
     }
+    let dex_dir_arg = dex_dir.to_string_lossy().into_owned();
     let mut dex_command = Command::new(d8);
     if let Some(java_home) = java_home {
         dex_command.env("JAVA_HOME", java_home);
@@ -1620,62 +2222,171 @@ fn collect_session_from_emulator(
     }
     dex_command.args([
         "--lib",
-        &android_jar.to_string_lossy(),
+        android_jar_arg.as_str(),
         "--output",
-        &dex_dir.to_string_lossy(),
+        dex_dir_arg.as_str(),
     ]);
     dex_command.args(class_files.iter().map(|path| path.as_os_str()));
-    let dex = dex_command
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .context("build miwatch emulator collector dex")?;
-    if !dex.success() {
+    dex_command.stdout(Stdio::null()).stderr(Stdio::null());
+    let dex = run_command_with_timeout(
+        dex_command,
+        None,
+        helper_timeout,
+        "build miwatch emulator collector dex",
+    )?;
+    if !dex.status.success() {
         anyhow::bail!("miwatch emulator collector dex build failed");
     }
     let dex_path = dex_dir.join("classes.dex");
 
-    run_adb(adb, ["wait-for-device"])?;
-    run_adb(adb, ["root"])?;
-    run_adb(adb, ["wait-for-device"])?;
-    let identity = Command::new(adb)
-        .args(["shell", "id"])
-        .output()
-        .context("check miwatch emulator adb identity")?;
-    if !String::from_utf8_lossy(&identity.stdout).contains("uid=0") {
-        anyhow::bail!("miwatch emulator collector requires an adb-root AVD");
-    }
-    run_adb(
+    let mut session = EmulatorSession::connect_or_start(
         adb,
-        ["push", &dex_path.to_string_lossy(), EMULATOR_COLLECTOR_DEX],
+        emulator,
+        DEFAULT_XIAOMI_AVD,
+        StdDuration::from_secs(EMULATOR_BOOT_TIMEOUT_SECONDS),
     )?;
+    let result = (|| {
+        session.ensure_root(helper_timeout)?;
+        let dex_path_arg = dex_path.to_string_lossy().into_owned();
+        let push = session.adb(
+            ["push", dex_path_arg.as_str(), EMULATOR_COLLECTOR_DEX],
+            helper_timeout,
+            "push miwatch emulator collector",
+        );
+        let push = match push {
+            Ok(push) => push,
+            Err(error) => {
+                let _ = session.adb(
+                    ["shell", "rm", "-f", EMULATOR_COLLECTOR_DEX],
+                    helper_timeout,
+                    "remove miwatch emulator collector after push failure",
+                );
+                return Err(error);
+            }
+        };
+        if !push.status.success() {
+            let _ = session.adb(
+                ["shell", "rm", "-f", EMULATOR_COLLECTOR_DEX],
+                helper_timeout,
+                "remove miwatch emulator collector after push rejection",
+            );
+            anyhow::bail!("adb failed while pushing the miwatch emulator collector");
+        }
 
-    let command =
-        format!("CLASSPATH={EMULATOR_COLLECTOR_DEX} app_process64 /system/bin MiwatchCollector");
-    let output = Command::new(adb).args(["exec-out", &command]).output();
-    let _ = Command::new(adb)
-        .args(["shell", "rm", "-f", EMULATOR_COLLECTOR_DEX])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    let output = output.context("run miwatch emulator collector")?;
-    if !output.status.success() {
-        anyhow::bail!("miwatch emulator collector failed; complete Xiaomi login first");
-    }
-    serde_json::from_slice(&output.stdout).context("parse miwatch emulator collector JSON")
+        let command = format!(
+            "CLASSPATH={EMULATOR_COLLECTOR_DEX} app_process64 /system/bin MiwatchCollector"
+        );
+        let output = session.adb(
+            ["exec-out", command.as_str()],
+            helper_timeout,
+            "run miwatch emulator collector",
+        );
+        let _ = session.adb(
+            ["shell", "rm", "-f", EMULATOR_COLLECTOR_DEX],
+            helper_timeout,
+            "remove miwatch emulator collector",
+        );
+        let output = output?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "miwatch emulator collector failed; complete Xiaomi login first: {}",
+                command_error_text(&output)
+            );
+        }
+        serde_json::from_slice(&output.stdout).context("parse miwatch emulator collector JSON")
+    })();
+    session.cleanup();
+    result
 }
 
-fn run_adb<const N: usize>(adb: &str, args: [&str; N]) -> Result<()> {
-    let status = Command::new(adb)
-        .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .context("run adb for miwatch emulator collector")?;
-    if !status.success() {
-        anyhow::bail!("adb failed during miwatch emulator collection");
+fn find_existing_avd(adb: &str, avd: &str, timeout: StdDuration) -> Option<String> {
+    let devices = run_adb_command(
+        adb,
+        None,
+        None,
+        ["devices"],
+        timeout,
+        "inspect existing miwatch adb devices",
+    )
+    .ok()?;
+    if !devices.status.success() {
+        return None;
     }
-    Ok(())
+    devices
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| std::str::from_utf8(line).ok())
+        .filter_map(|line| line.trim().split_once('\t'))
+        .filter(|(_, state)| state.trim() == "device")
+        .find_map(|(serial, _)| {
+            let output = run_adb_command(
+                adb,
+                None,
+                Some(serial),
+                ["emu", "avd", "name"],
+                timeout,
+                "identify existing miwatch emulator",
+            )
+            .ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            let output_text = String::from_utf8_lossy(&output.stdout).into_owned();
+            let name = output_text
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty() && *line != "OK")?;
+            (name == avd).then(|| serial.to_string())
+        })
+}
+
+fn wait_for_endpoint(server: &mut OwnedProcess, port: u16, timeout: StdDuration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if server.exited()? {
+            anyhow::bail!("private miwatch adb server exited before becoming ready");
+        }
+        if endpoint_is_available(port) {
+            return Ok(());
+        }
+        thread::sleep(PROCESS_POLL_INTERVAL);
+    }
+    anyhow::bail!("private miwatch adb server did not become ready before the deadline")
+}
+
+fn run_adb_command<I, S>(
+    adb: &str,
+    server_port: Option<u16>,
+    serial: Option<&str>,
+    args: I,
+    timeout: StdDuration,
+    label: &str,
+) -> Result<CommandOutput>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let mut command = Command::new(adb);
+    if let Some(server_port) = server_port {
+        command.arg("-P").arg(server_port.to_string());
+    }
+    if let Some(serial) = serial {
+        command.arg("-s").arg(serial);
+    }
+    command
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    run_command_with_timeout(command, None, timeout, label)
+}
+
+fn command_error_text(output: &CommandOutput) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if stderr.is_empty() {
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    } else {
+        stderr
+    }
 }
 
 pub fn setup(_context: &mut ModuleContext) -> Result<()> {
@@ -1768,7 +2479,11 @@ mod tests {
     }
 
     impl RemoteRebooter for FakeRebooter {
-        fn reboot(&mut self) -> Result<RemoteCallOutcome> {
+        fn prepare(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn dispatch(&mut self) -> Result<RemoteCallOutcome> {
             self.calls += 1;
             Ok(self.outcome.clone())
         }
@@ -1781,7 +2496,11 @@ mod tests {
     }
 
     impl RemoteRebooter for PersistCheckingRebooter {
-        fn reboot(&mut self) -> Result<RemoteCallOutcome> {
+        fn prepare(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        fn dispatch(&mut self) -> Result<RemoteCallOutcome> {
             self.calls += 1;
             let persisted = load_state(&self.state_path).expect("persisted attempt state");
             assert!(persisted.reboot_attempted);
@@ -1789,6 +2508,25 @@ mod tests {
             if self.fail_after_observation {
                 anyhow::bail!("simulated crash boundary");
             }
+            Ok(RemoteCallOutcome::Accepted { status: 200 })
+        }
+    }
+
+    struct RetryablePreparationRebooter {
+        prepare_calls: usize,
+        dispatch_calls: usize,
+    }
+
+    impl RemoteRebooter for RetryablePreparationRebooter {
+        fn prepare(&mut self) -> Result<()> {
+            self.prepare_calls += 1;
+            Err(retryable_remote_error(
+                "temporary authentication transport failure",
+            ))
+        }
+
+        fn dispatch(&mut self) -> Result<RemoteCallOutcome> {
+            self.dispatch_calls += 1;
             Ok(RemoteCallOutcome::Accepted { status: 200 })
         }
     }
@@ -1906,6 +2644,50 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    fn write_executable_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.join(name);
+        fs::write(&path, body).expect("write test helper script");
+        let mut permissions = fs::metadata(&path)
+            .expect("read test helper script metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&path, permissions).expect("make test helper executable");
+        path
+    }
+
+    #[cfg(unix)]
+    fn wait_for_process_gone(pid: u32) {
+        let deadline = Instant::now() + StdDuration::from_secs(3);
+        while Instant::now() < deadline {
+            let alive = unsafe { libc::kill(pid as libc::pid_t, 0) == 0 };
+            if !alive {
+                return;
+            }
+            thread::sleep(StdDuration::from_millis(25));
+        }
+        assert!(
+            !unsafe { libc::kill(pid as libc::pid_t, 0) == 0 },
+            "pid {pid} remained alive"
+        );
+    }
+
+    #[cfg(unix)]
+    fn wait_for_pid_file(path: &Path) -> u32 {
+        let deadline = Instant::now() + StdDuration::from_secs(2);
+        while Instant::now() < deadline {
+            if let Ok(pid) = fs::read_to_string(path) {
+                if let Ok(pid) = pid.trim().parse() {
+                    return pid;
+                }
+            }
+            thread::sleep(StdDuration::from_millis(25));
+        }
+        panic!("test helper did not write pid file {}", path.display());
+    }
+
     #[test]
     fn legacy_module_policy_requires_top_level_trigger_migration() {
         let config: WatchdogConfig = serde_yaml::from_str(
@@ -1996,15 +2778,18 @@ failure_threshold: 3
             calls: 0,
             fail_after_observation: true,
         };
-        assert!(execute_incident(
-            &mut state,
-            &config(),
-            "miwatch-outage:7",
-            now,
-            &state_path,
-            &mut first,
-        )
-        .is_err());
+        assert_eq!(
+            execute_incident(
+                &mut state,
+                &config(),
+                "miwatch-outage:7",
+                now,
+                &state_path,
+                &mut first,
+            )
+            .unwrap(),
+            TickOutcome::RebootAmbiguous
+        );
         assert_eq!(first.calls, 1);
 
         let mut restored = load_state(&state_path).expect("persisted incident state");
@@ -2026,6 +2811,162 @@ failure_threshold: 3
             TickOutcome::AlreadyAttempted
         );
         assert_eq!(second.calls, 0);
+    }
+
+    #[test]
+    fn retryable_preparation_does_not_latch_incident_attempt() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("watchdog-state.json");
+        let now = Utc::now();
+        let mut state = WatchdogState::default();
+        let mut rebooter = RetryablePreparationRebooter {
+            prepare_calls: 0,
+            dispatch_calls: 0,
+        };
+
+        let error = execute_incident(
+            &mut state,
+            &config(),
+            "miwatch-outage:9",
+            now,
+            &state_path,
+            &mut rebooter,
+        )
+        .expect_err("transient preparation should be returned to the supervisor");
+
+        assert!(crate::modules::is_retryable_module_error(&error));
+        assert_eq!(rebooter.prepare_calls, 1);
+        assert_eq!(rebooter.dispatch_calls, 0);
+        assert!(!state.reboot_attempted);
+        assert_eq!(state.last_outcome.as_deref(), Some("preparation_retryable"));
+        assert!(state.cooldown_until.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn helper_process_timeout_is_bounded() {
+        let dir = tempdir().unwrap();
+        let pid_file = dir.path().join("descendant.pid");
+        let command_text = format!(
+            "sleep 30 & echo $! > '{}' ; wait",
+            pid_file.to_string_lossy()
+        );
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", command_text.as_str()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let started = Instant::now();
+        let error =
+            run_command_with_timeout(command, None, StdDuration::from_millis(150), "test helper")
+                .expect_err("sleeping helper must time out");
+
+        assert!(error.downcast_ref::<CommandTimeout>().is_some());
+        assert!(started.elapsed() < StdDuration::from_secs(5));
+        wait_for_process_gone(wait_for_pid_file(&pid_file));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_process_drop_kills_descendants() {
+        let dir = tempdir().unwrap();
+        let pid_file = dir.path().join("owned-descendant.pid");
+        let command_text = format!(
+            "sleep 30 & echo $! > '{}' ; wait",
+            pid_file.to_string_lossy()
+        );
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", command_text.as_str()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let process = OwnedProcess::spawn(command, "test owned process").unwrap();
+        let descendant_pid = wait_for_pid_file(&pid_file);
+
+        drop(process);
+
+        wait_for_process_gone(descendant_pid);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_private_adb_startup_reaps_owned_server() {
+        let port = reserve_tcp_port().unwrap();
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "sleep 30"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut server = OwnedProcess::spawn(command, "private ADB server under test").unwrap();
+        let server_pid = server.child.id();
+
+        let error = wait_for_endpoint(&mut server, port, StdDuration::from_millis(200))
+            .expect_err("private ADB startup should time out");
+
+        assert!(error.to_string().contains("did not become ready"));
+        drop(server);
+        wait_for_process_gone(server_pid);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_survives_adb_kill_failure_and_stops_owned_emulator() {
+        let dir = tempdir().unwrap();
+        let marker = dir.path().join("adb-kill.marker");
+        let adb = write_executable_script(
+            dir.path(),
+            "failing-adb",
+            &format!(
+                "#!/bin/sh\necho invoked > '{}'; exit 1\n",
+                marker.to_string_lossy()
+            ),
+        );
+        let mut emulator_command = Command::new("/bin/sh");
+        emulator_command
+            .args(["-c", "sleep 30"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let emulator = OwnedProcess::spawn(emulator_command, "owned emulator under test").unwrap();
+        let emulator_pid = emulator.child.id();
+        let mut session = EmulatorSession {
+            adb: adb.to_string_lossy().to_string(),
+            server_port: None,
+            serial: "emulator-5555".to_string(),
+            server: AdbServerOwnership::Existing,
+            emulator: Some(emulator),
+        };
+
+        session.cleanup();
+
+        assert!(marker.is_file());
+        assert!(session.emulator.is_none());
+        wait_for_process_gone(emulator_pid);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_does_not_touch_preexisting_adb_or_emulator() {
+        let dir = tempdir().unwrap();
+        let marker = dir.path().join("preexisting.marker");
+        let adb = write_executable_script(
+            dir.path(),
+            "must-not-run-adb",
+            &format!(
+                "#!/bin/sh\necho invoked > '{}'; exit 1\n",
+                marker.to_string_lossy()
+            ),
+        );
+        let mut session = EmulatorSession {
+            adb: adb.to_string_lossy().to_string(),
+            server_port: None,
+            serial: "emulator-5555".to_string(),
+            server: AdbServerOwnership::Existing,
+            emulator: None,
+        };
+
+        session.cleanup();
+
+        assert!(!marker.exists());
     }
 
     #[test]
@@ -2518,6 +3459,56 @@ failure_threshold: 3
             BASE64.encode([8_u8; 32])
         );
         assert!(stored.expires_at.unwrap_or_default() > Utc::now().timestamp());
+    }
+
+    #[test]
+    fn direct_refresh_transport_failure_is_not_replaced_by_emulator_collection() {
+        let server = spawn_mock_server(vec![MockResponse {
+            status: Some(503),
+            body: "{}".to_string(),
+            headers: Vec::new(),
+        }]);
+        let dir = tempdir().unwrap();
+        let token_file = dir.path().join("xiaomi-session.json");
+        fs::write(
+            &token_file,
+            serde_json::to_vec(&SessionTokens {
+                service_token: Some("service-old".to_string()),
+                ssecurity: Some(BASE64.encode([7_u8; 32])),
+                expires_at: Some(1),
+                user_id: Some("user-1".to_string()),
+                pass_token: Some("pass-secret".to_string()),
+                router_private_id: Some("router-private-123".to_string()),
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut config = config();
+        config.verified_remote_api = true;
+        config.token_file = token_file.to_string_lossy().to_string();
+        config.remote.xiaomi = Some(XiaomiRemoteConfig {
+            base_url: format!("http://{}", server.address),
+            account_base_url: format!("http://{}", server.address),
+            user_agent: "Android APP/com.xiaomi.router APPV/5.9.0".to_string(),
+            success_statuses: vec![200],
+        });
+
+        let context = crate::modules::module_context(
+            "miwatch",
+            dir.path().to_path_buf(),
+            dir.path().to_path_buf(),
+            dir.path().join("logs"),
+        );
+        let mut client = ConfiguredRemoteClient::with_context(config, &context);
+        let error = client
+            .reboot()
+            .expect_err("transient direct refresh should be surfaced");
+
+        assert!(is_retryable_remote_error(&error));
+        assert!(error.to_string().contains("HTTP 503"));
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
     }
 
     #[test]

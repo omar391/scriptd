@@ -375,6 +375,19 @@ impl TriggerRuntime {
         }
     }
 
+    pub fn rearm_pending(&mut self, incident_id: &str) {
+        if self.state.phase != TriggerPhase::Pending
+            || self.state.incident_id.as_deref() != Some(incident_id)
+        {
+            return;
+        }
+        self.state.phase = TriggerPhase::Armed;
+        self.state.match_count = 0;
+        self.state.match_started_at = None;
+        self.state.reset_count = 0;
+        self.state.reset_started_at = None;
+    }
+
     pub fn suppress_pending(&mut self) {
         let Some(incident_id) = self.state.incident_id.clone() else {
             return;
