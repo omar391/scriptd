@@ -22,6 +22,9 @@ pub(crate) struct MbrewConfig {
     #[serde(rename = "homebrew_bin")]
     #[schemars(length(min = 1))]
     homebrew_bin: String,
+    #[serde(default, rename = "trusted_taps")]
+    #[schemars(inner(length(min = 1)), extend("uniqueItems" = true))]
+    trusted_taps: Vec<String>,
     #[serde(rename = "sudoers_path")]
     #[schemars(length(min = 1))]
     sudoers_path: String,
@@ -38,6 +41,7 @@ impl Default for MbrewConfig {
         Self {
             askpass_path: "~/Library/Application Support/scriptd/mbrew/brew_askpass.sh".to_string(),
             homebrew_bin: "/opt/homebrew/bin/brew".to_string(),
+            trusted_taps: Vec::new(),
             sudoers_path: "/etc/sudoers.d/homebrew".to_string(),
             sudoers_timeout_path: "/etc/sudoers.d/homebrew_timeout".to_string(),
             sudo_timeout_hours: 2,
@@ -204,6 +208,96 @@ fn command_for_brew(config: &MbrewConfig, args: &[&str]) -> anyhow::Result<(Stri
     Ok(command)
 }
 
+fn brew_failure(stderr: &str, fallback: &str) -> String {
+    if stderr.trim().is_empty() {
+        fallback.to_string()
+    } else {
+        stderr.trim().to_string()
+    }
+}
+
+fn installed_brew_taps(config: &MbrewConfig) -> anyhow::Result<BTreeSet<String>> {
+    let (stdout, stderr, status) = command_for_brew(config, &["tap"])?;
+    if status != 0 {
+        bail!(
+            "brew tap listing failed: {}",
+            brew_failure(&stderr, "brew tap failed")
+        );
+    }
+    Ok(stdout
+        .lines()
+        .map(str::trim)
+        .filter(|tap| !tap.is_empty())
+        .map(ToString::to_string)
+        .collect())
+}
+
+fn trust_configured_taps(config: &MbrewConfig, logger: &ModuleLogger) -> anyhow::Result<()> {
+    if config.trusted_taps.is_empty() {
+        return Ok(());
+    }
+
+    let installed = installed_brew_taps(config)?;
+    for tap in &config.trusted_taps {
+        if !installed.contains(tap) {
+            logger.warn(&format!(
+                "configured trusted tap {tap} is not installed; skipping trust"
+            ));
+            continue;
+        }
+
+        let (stdout, stderr, status) = command_for_brew(config, &["trust", "--tap", tap])?;
+        if status != 0 {
+            bail!(
+                "brew trust --tap {tap} failed: {}",
+                brew_failure(&stderr, "brew trust failed")
+            );
+        }
+        if !stdout.trim().is_empty() {
+            logger.info(stdout.trim());
+        }
+        if !stderr.trim().is_empty() {
+            logger.warn(stderr.trim());
+        }
+    }
+    Ok(())
+}
+
+fn untrusted_homebrew_entries(output: &str) -> Vec<String> {
+    const PREFIX: &str = "Skipping ";
+    const SUFFIX: &str = " because it is not trusted";
+    let mut entries = Vec::new();
+
+    for line in output.lines() {
+        let Some(start) = line.find(PREFIX) else {
+            continue;
+        };
+        let rest = &line[start + PREFIX.len()..];
+        let Some(end) = rest.find(SUFFIX) else {
+            continue;
+        };
+        let entry = rest[..end].trim();
+        if !entry.is_empty() && !entries.iter().any(|existing| existing == entry) {
+            entries.push(entry.to_string());
+        }
+    }
+
+    entries
+}
+
+fn reject_untrusted_homebrew_entries(update_out: &str, update_err: &str) -> anyhow::Result<()> {
+    let output = format!("{update_out}\n{update_err}");
+    let entries = untrusted_homebrew_entries(&output);
+    if entries.is_empty() {
+        return Ok(());
+    }
+
+    bail!(
+        "brew update skipped untrusted entries: {}. Add only reviewed whole taps to mbrew settings.trusted_taps; trust formulae, casks, or commands with the matching brew trust option, then rerun",
+        entries.join(", ")
+    );
+}
+
 pub(crate) fn validate_config(config: &MbrewConfig) -> anyhow::Result<()> {
     for (name, value) in [
         ("askpass_path", config.askpass_path.as_str()),
@@ -215,6 +309,20 @@ pub(crate) fn validate_config(config: &MbrewConfig) -> anyhow::Result<()> {
     }
     if config.sudo_timeout_hours == 0 {
         anyhow::bail!("mbrew sudo_timeout_hours must be greater than zero");
+    }
+    for tap in &config.trusted_taps {
+        let mut parts = tap.split('/');
+        let owner = parts.next().unwrap_or_default();
+        let repository = parts.next().unwrap_or_default();
+        let valid_component = |value: &str| {
+            !value.is_empty()
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        };
+        if parts.next().is_some() || !valid_component(owner) || !valid_component(repository) {
+            anyhow::bail!("mbrew trusted_taps entries must use owner/repository form: {tap}");
+        }
     }
     Ok(())
 }
@@ -695,6 +803,7 @@ fn brew_maintenance(
     logger: &ModuleLogger,
 ) -> anyhow::Result<BrewMaintenanceOutcome> {
     ensure_askpass(config, logger)?;
+    trust_configured_taps(config, logger)?;
     let (update_out, update_err, status) = command_for_brew(config, &["update"])?;
     if status != 0 {
         bail!(
@@ -706,6 +815,10 @@ fn brew_maintenance(
             }
         );
     }
+    if !update_err.trim().is_empty() {
+        logger.warn(update_err.trim());
+    }
+    reject_untrusted_homebrew_entries(&update_out, &update_err)?;
     logger.info(if update_out.trim().is_empty() {
         "brew update completed"
     } else {
@@ -998,6 +1111,112 @@ mod tests {
         assert_eq!(metrics["failedCasks"], serde_json::json!("broken-cask"));
         assert!(maintenance_message(&state).contains("deferred casks: running-cask"));
         assert!(maintenance_message(&state).contains("failed casks: broken-cask"));
+    }
+
+    #[test]
+    fn untrusted_homebrew_entries_are_deduplicated() {
+        let output = "Warning: Skipping oven-sh/bun because it is not trusted.\nWarning: Skipping oven-sh/bun because it is not trusted.\nWarning: Skipping user/tap/tool because it is not trusted.";
+        assert_eq!(
+            untrusted_homebrew_entries(output),
+            vec!["oven-sh/bun".to_string(), "user/tap/tool".to_string()]
+        );
+    }
+
+    #[test]
+    fn validate_config_rejects_non_tap_trust_targets() {
+        let mut config = MbrewConfig::default();
+        config.trusted_taps = vec!["not-a-tap".to_string()];
+        let error = validate_config(&config).expect_err("invalid tap should be rejected");
+        assert!(error.to_string().contains("owner/repository"));
+    }
+
+    fn write_trust_brew(
+        path: &Path,
+        log: &Path,
+        update_warning: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let update = update_warning
+            .map(|warning| format!("printf '%s\\n' '{warning}' >&2"))
+            .unwrap_or_else(|| "true".to_string());
+        write_script(
+            path,
+            &format!(
+                r#"#!/bin/sh
+echo "$@" >> "{log}"
+if [ "$1" = "tap" ]; then
+  printf '%s\n' trusted/tap untrusted/tap
+  exit 0
+fi
+if [ "$1" = "trust" ] && [ "$2" = "--tap" ]; then exit 0; fi
+if [ "$1" = "update" ]; then
+  {update}
+  exit 0
+fi
+if [ "$1" = "upgrade" ] && [ "$2" = "--formula" ]; then exit 0; fi
+if [ "$1" = "outdated" ] && [ "$2" = "--cask" ] && [ "$3" = "--quiet" ]; then exit 0; fi
+if [ "$1" = "cleanup" ]; then exit 0; fi
+echo unsupported-command >&2
+exit 1
+"#,
+                log = log.to_string_lossy(),
+                update = update,
+            ),
+        )
+    }
+
+    #[test]
+    fn brew_maintenance_trusts_only_configured_installed_taps_before_update() -> anyhow::Result<()>
+    {
+        let root = tempdir()?;
+        let brew = root.path().join("brew");
+        let log = root.path().join("brew.log");
+        let askpass = root.path().join("askpass.sh");
+        write_trust_brew(&brew, &log, None)?;
+        fs::write(&askpass, "#!/bin/sh\nexit 1\n")?;
+        let mut config = default_config(root.path(), &brew, &askpass);
+        config.trusted_taps = vec!["trusted/tap".to_string()];
+
+        brew_maintenance(
+            &config,
+            &ModuleLogger::new(root.path().to_path_buf(), "mbrew", false),
+        )?;
+
+        let log = fs::read_to_string(log)?;
+        let commands: Vec<&str> = log.lines().collect();
+        assert_eq!(commands[0], "tap");
+        assert_eq!(commands[1], "trust --tap trusted/tap");
+        assert_eq!(commands[2], "update");
+        assert!(!log.contains("--force"));
+        assert!(!log.contains("trust --tap untrusted/tap"));
+        Ok(())
+    }
+
+    #[test]
+    fn brew_maintenance_rejects_untrusted_update_entries() -> anyhow::Result<()> {
+        let root = tempdir()?;
+        let brew = root.path().join("brew");
+        let log = root.path().join("brew.log");
+        let askpass = root.path().join("askpass.sh");
+        write_trust_brew(
+            &brew,
+            &log,
+            Some("Warning: Skipping untrusted/tap because it is not trusted."),
+        )?;
+        fs::write(&askpass, "#!/bin/sh\nexit 1\n")?;
+        let config = default_config(root.path(), &brew, &askpass);
+
+        let error = brew_maintenance(
+            &config,
+            &ModuleLogger::new(root.path().to_path_buf(), "mbrew", false),
+        )
+        .expect_err("untrusted entries must stop maintenance");
+
+        assert!(error.to_string().contains("untrusted/tap"));
+        assert!(error.to_string().contains("trusted_taps"));
+        let log = fs::read_to_string(log)?;
+        assert!(log.contains("update"));
+        assert!(!log.contains("upgrade --formula"));
+        Ok(())
     }
 
     fn write_safe_cask_brew(path: &Path, upgrade_status: i32) -> anyhow::Result<()> {

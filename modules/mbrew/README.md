@@ -12,6 +12,15 @@ Cask safety
 - Failed upgrades are reported for retry; `mbrew` does not force, uninstall, or
   reinstall casks automatically.
 
+Trust policy
+- `settings.trusted_taps` is an explicit allowlist for third-party taps.
+- Before `brew update`, `mbrew` runs `brew trust --tap` only for allowlisted taps
+  that are currently installed.
+- If Homebrew still reports an untrusted entry, the run fails and names it; new
+  taps are never trusted implicitly.
+- Whole-tap trust permits current and future formulae, casks, and commands from
+  that tap, so only list taps that have been reviewed and approved.
+
 Files
 - `module.rs` — Rust plugin implementation.
 - `module.yaml` — the single module manifest/config file.

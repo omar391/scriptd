@@ -24,6 +24,15 @@
         "sudoers_timeout_path": {
           "minLength": 1,
           "type": "string"
+        },
+        "trusted_taps": {
+          "default": [],
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
         }
       },
       "required": [

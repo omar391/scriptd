@@ -9,6 +9,16 @@ module:
 settings:
   askpass_path: ~/Library/Application Support/scriptd/mbrew/brew_askpass.sh
   homebrew_bin: /opt/homebrew/bin/brew
+  trusted_taps:
+    - dhruv-anand-aintech/tap
+    - oven-sh/bun
+    - romankurnovskii/awesome-brew
+    - steipete/tap
+    - tinygo-org/tools
+    - localsend/localsend
+    - mhaeuser/mhaeuser
+    - domt4/autoupdate
+    - homebrew/autoupdate
   sudoers_path: /etc/sudoers.d/homebrew
   sudoers_timeout_path: /etc/sudoers.d/homebrew_timeout
   sudo_timeout_hours: 2
