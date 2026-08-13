@@ -264,7 +264,7 @@ See [`modules/mcpu/README.md`](./modules/mcpu/README.md).
 - Mode: `task`
 - Default: enabled
 - Default schedule: daily at 00:00 Asia/Dhaka, with one immediate catch-up when overdue
-- Purpose: runs `brew update`, formula upgrades, cask upgrades, repair fallback flow, and `brew cleanup`
+- Purpose: runs `brew update`, formula upgrades, non-interrupting per-cask upgrades, and `brew cleanup`; running or unverifiable casks are deferred for a later run
 - Setup: stores a sudo password in Keychain, writes an askpass helper, and installs sudoers rules
 
 See [`modules/mbrew/README.md`](./modules/mbrew/README.md).

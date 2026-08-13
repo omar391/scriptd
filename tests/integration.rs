@@ -73,29 +73,39 @@ fn create_fake_brew_stack(fake_bin: &Path, brew_log: &Path) -> anyhow::Result<()
         &format!(
             r#"#!/bin/sh
 echo "$@" >> "{log}"
-case "$1 $2 $3" in
-  "update  ")
+if [ "$1" = "update" ]; then
     echo updated
     exit 0
-    ;;
-  "upgrade --formula ")
+fi
+if [ "$1" = "upgrade" ] && [ "$2" = "--formula" ]; then
     echo formula-upgrades
     exit 0
-    ;;
-  "upgrade --cask ")
+fi
+if [ "$1" = "outdated" ] && [ "$2" = "--cask" ] && [ "$3" = "--quiet" ]; then
+    echo demo-cask
+    exit 0
+fi
+if [ "$1" = "info" ] && [ "$2" = "--cask" ] && [ "$3" = "--json=v2" ]; then
+    printf '%s\n' '{{"casks":[{{"token":"demo-cask","artifacts":[{{"app":["Demo.app"],"target":"/Applications/Demo.app"}}]}}]}}'
+    exit 0
+fi
+if [ "$1" = "upgrade" ] && [ "$2" = "--cask" ] && [ "$3" = "--no-quit" ] && [ "$4" = "demo-cask" ]; then
     echo cask-upgrades
     exit 0
-    ;;
-  "cleanup  ")
+fi
+if [ "$1" = "cleanup" ]; then
     echo cleaned
     exit 0
-    ;;
-esac
+fi
 echo unsupported brew "$@" >&2
 exit 1
 "#,
             log = brew_log.to_string_lossy()
         ),
+    )?;
+    fake_bin_script(
+        &fake_bin.join("osascript"),
+        "#!/bin/sh\nprintf '%s\\n' '[]'\nexit 0\n",
     )?;
     fake_bin_script(
         &fake_bin.join("security"),
@@ -515,7 +525,10 @@ fn integration_run_mbrew_uses_fake_brew_security_and_sudo_boundary() {
     let log = fs::read_to_string(&brew_log).unwrap();
     assert!(log.contains("update"));
     assert!(log.contains("upgrade --formula"));
-    assert!(log.contains("upgrade --cask"));
+    assert!(log.contains("upgrade --cask --no-quit demo-cask"));
+    assert!(!log.contains("--force"));
+    assert!(!log.contains("uninstall"));
+    assert!(!log.contains("install"));
     assert!(log.contains("cleanup"));
     assert!(root.path().join("brew_askpass.sh").exists());
 }
@@ -942,19 +955,13 @@ fn integration_repository_configuration_migrates_all_modules_to_global_triggers(
     let cpu = &service["modules"]["mcpu"]["triggers"]["sample"];
     let wifi = &service["modules"]["mwifi"]["triggers"]["sample"];
     let watchdog = &service["modules"]["miwatch"]["triggers"]["outage"];
-    assert_eq!(
-        brew["when"]["schedule"]["daily_at"].as_str(),
-        Some("00:00")
-    );
+    assert_eq!(brew["when"]["schedule"]["daily_at"].as_str(), Some("00:00"));
     assert_eq!(
         brew["when"]["schedule"]["timezone"].as_str(),
         Some("Asia/Dhaka")
     );
     assert_eq!(cpu["when"]["schedule"]["every_minutes"].as_u64(), Some(1));
-    assert_eq!(
-        wifi["when"]["schedule"]["every_minutes"].as_u64(),
-        Some(5)
-    );
+    assert_eq!(wifi["when"]["schedule"]["every_minutes"].as_u64(), Some(5));
     assert_eq!(
         watchdog["when"]["all"][0]["schedule"]["every_seconds"].as_u64(),
         Some(30)
