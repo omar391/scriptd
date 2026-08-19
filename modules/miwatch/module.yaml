@@ -7,7 +7,7 @@ module:
   mode: task
 
 settings:
-  cooldown_seconds: 1800
+  cooldown_seconds: 300
   state_file: "~/Library/Application Support/scriptd/miwatch_state.json"
   token_file: "~/Library/Application Support/scriptd/miwatch_session.json"
   verified_remote_api: true
