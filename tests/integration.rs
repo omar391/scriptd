@@ -253,7 +253,7 @@ fn write_wifi_module_with_repeater_rules(
     fs::write(
         module_dir.join("module.yaml"),
         format!(
-            "version: 1\nmodule:\n  id: mwifi\n  display_name: Wi-Fi Monitor\n  mode: task\nsettings:\n  min_dwell: 1\n  ping_target: 1.1.1.1\n  ping_count: 3\n  ping_timeout: 1\n  ping_high_latency_ms: 250\n  health_failure_switch_runs: 2\n  band_bonus_2g: 0\n  band_bonus_5g: 35\n  band_bonus_6g: 50\n  preference_top_bonus: 30\n  preference_rank_decay: 5\n  current_sticky_bonus: 25\n  rssi_offset: 100\n  min_switch_score_delta: 10\n  ssids:\n    - Home\n    - Office\n  {}  state_file: {}\n",
+            "version: 1\nmodule:\n  id: mwifi\n  display_name: Wi-Fi Monitor\n  mode: task\nsettings:\n  min_dwell: 1\n  ping_target: 1.1.1.1\n  ping_count: 3\n  ping_timeout: 1\n  ping_high_latency_ms: 250\n  health_failure_switch_runs: 2\n  band_bonus_2g: 0\n  band_bonus_5g: 35\n  band_bonus_6g: 50\n  preference_top_bonus: 30\n  preference_rank_decay: 5\n  current_sticky_bonus: 25\n  rssi_offset: 100\n  min_switch_score_delta: 10\n  prefer_ssids: []\n  ssids:\n    - Home\n    - Office\n  {}  state_file: {}\n",
             repeater_rules_yaml,
             state_file.to_string_lossy()
         ),
@@ -566,6 +566,54 @@ fn integration_run_mwifi_uses_fake_networksetup_and_ping_boundary() {
     assert!(log.contains("-listpreferredwirelessnetworks en0"));
     assert!(log.contains("-setairportnetwork en0 Office"));
 
+    let state_text = fs::read_to_string(&wifi_state).unwrap();
+    let state: Value = serde_json::from_str(&state_text).unwrap();
+    assert_eq!(
+        state.get("lastSsid").and_then(Value::as_str),
+        Some("Office")
+    );
+}
+
+#[test]
+#[serial]
+fn integration_run_mwifi_prefers_configured_ssid_when_available() {
+    let root = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    let fake_bin = root.path().join("fake_bin");
+    fs::create_dir_all(&fake_bin).unwrap();
+    let wifi_log = root.path().join("wifi.log");
+    let wifi_state = root.path().join("mwifi-state.json");
+    create_fake_wifi_stack(&fake_bin, &wifi_log).unwrap();
+    write_modules(root.path());
+    write_wifi_module(root.path(), &wifi_state);
+    let yaml_path = root
+        .path()
+        .join("modules")
+        .join("mwifi")
+        .join("module.yaml");
+    let yaml = fs::read_to_string(&yaml_path).unwrap();
+    fs::write(
+        yaml_path,
+        yaml.replace("prefer_ssids: []", "prefer_ssids:\n    - Office"),
+    )
+    .unwrap();
+    write_service_yaml(root.path(), false, false, false, true);
+
+    let scan_output = "SSID BSSID RSSI CHANNEL SECURITY\nHome 00:11:22:33:44:55 -20 1 WPA2\nOffice 00:11:22:33:44:66 -90 233 WPA3\n";
+    let output = run_scriptd(root.path(), home.path(), &fake_bin)
+        .env("SCRIPTD_MWIFI_SCAN_OUTPUT", scan_output)
+        .arg("run")
+        .arg("mwifi")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = fs::read_to_string(&wifi_log).unwrap();
+    assert!(log.contains("-setairportnetwork en0 Office"));
     let state_text = fs::read_to_string(&wifi_state).unwrap();
     let state: Value = serde_json::from_str(&state_text).unwrap();
     assert_eq!(

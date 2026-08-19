@@ -6,9 +6,10 @@ This is a small macOS better Wi-Fi selector that filters to known SSIDs, scores 
 It prefers the bundled `airport -s` scan output when available and falls back to a lightweight command-based path when needed.
 
 How ranking works
-- If `MWIFI_SSIDS` is set, only those SSIDs are considered.
-- If `MWIFI_SSIDS` is empty, the monitor falls back to the system preferred Wi-Fi network list from `networksetup`.
-- The order of `ssids` is treated as manual priority. If `ssids` is empty, the system preferred network order is used.
+- If `MWIFI_SSIDS` is set, only those SSIDs plus `prefer_ssids` are considered.
+- If `MWIFI_SSIDS` is empty, the monitor falls back to the system preferred Wi-Fi network list from `networksetup`, then prepends `prefer_ssids`.
+- `prefer_ssids` is a hard preference. The first listed SSID that is visible and not in join-failure cooldown is selected immediately, even when score, sticky bonus, dwell, or the system preferred list would keep the current network.
+- The order of `ssids` is treated as manual scoring priority. If `ssids` is empty, the system preferred network order is used for scoring after `prefer_ssids`.
 - Each candidate gets a score from band bonus plus RSSI strength (`rssi + 100`, clamped to `0..100`).
 - A configured repeater candidate is eligible only when every matching rule's parent SSID is visible in the same scan.
 - Logs also include `switchScore`, which excludes the current-network sticky bonus and is the score used for switch decisions.
@@ -39,6 +40,7 @@ Configuration
 - Edit `module.yaml` for the default config, or override values through environment variables.
 - Useful env vars:
   - `MWIFI_SSIDS` — comma-separated SSIDs to manage.
+  - `MWIFI_PREFER_SSIDS` — comma-separated SSIDs that win whenever they are visible.
   - `MWIFI_MIN_DWELL` — minimum seconds to stay on a network after switching (default 180).
   - `MWIFI_PING_TARGET` — host used to check whether the current connection is healthy.
   - `MWIFI_PING_TIMEOUT` — ping timeout in seconds (default 1).
@@ -48,6 +50,7 @@ Configuration
 
 Config file
 - `module.yaml` contains the module manifest plus the typed `settings` object. Example keys:
+  - `settings.prefer_ssids`: SSIDs that always win when visible (overridden by `MWIFI_PREFER_SSIDS` env if set)
   - `settings.ssids`: array of SSID strings (overridden by `MWIFI_SSIDS` env if set)
   - `settings.repeater_rules`: conditional SSID rules; each rule has a regular-expression `pattern` and exact `parent_ssid`
   - `settings.min_dwell`: minimum seconds to stay on a network after switching

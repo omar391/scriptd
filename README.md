@@ -230,8 +230,8 @@ Run `./scriptd.sh start root` after changing config flags to install/update the 
 - Default: disabled
 - Default schedule: every 5 minutes
 - Purpose: scans nearby Wi-Fi networks, scores candidates, and switches to the best allowed SSID
-- Inputs: preferred network list or `ssids` configured in `modules/mwifi/module.yaml`
-- Tuning: dwell time, ping target, manual SSID priority, band bonuses, RSSI offset, switch threshold
+- Inputs: preferred network list, `prefer_ssids`, or `ssids` configured in `modules/mwifi/module.yaml`
+- Tuning: hard-preferred SSIDs, dwell time, ping target, manual SSID priority, band bonuses, RSSI offset, switch threshold
 
 See [`modules/mwifi/README.md`](./modules/mwifi/README.md).
 

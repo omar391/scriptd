@@ -95,6 +95,16 @@
           "minimum": 1,
           "type": "integer"
         },
+        "prefer_ssids": {
+          "default": [],
+          "description": "SSIDs that always win when visible.",
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
         "preference_rank_decay": {
           "default": 5.0,
           "format": "double",

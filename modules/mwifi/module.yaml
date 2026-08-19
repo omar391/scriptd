@@ -21,6 +21,8 @@ settings:
   current_sticky_bonus: 25
   rssi_offset: 100
   min_switch_score_delta: 10
+  prefer_ssids:
+    - knight_riders_5G
   ssids: []
   repeater_rules:
     - pattern: 'knight_riders\b.*'

@@ -117,6 +117,13 @@ pub struct MwifiConfig {
     #[serde(rename = "min_switch_score_delta")]
     pub min_switch_score_delta: f64,
     #[serde(default)]
+    #[schemars(
+        description = "SSIDs that always win when visible.",
+        inner(length(min = 1)),
+        extend("uniqueItems" = true)
+    )]
+    pub prefer_ssids: Vec<String>,
+    #[serde(default)]
     #[schemars(inner(length(min = 1)), extend("uniqueItems" = true))]
     pub ssids: Vec<String>,
     #[serde(default)]
@@ -144,6 +151,7 @@ impl Default for MwifiConfig {
             current_sticky_bonus: 25.0,
             rssi_offset: 100.0,
             min_switch_score_delta: 10.0,
+            prefer_ssids: Vec::new(),
             ssids: Vec::new(),
             repeater_rules: Vec::new(),
             state_file: String::new(),
@@ -191,21 +199,8 @@ pub(crate) fn validate_config(config: &MwifiConfig) -> anyhow::Result<()> {
         anyhow::bail!("mwifi ping_target must not be empty");
     }
     crate::paths::validate_config_path("mwifi state_file", &config.state_file, true)?;
-    if config
-        .ssids
-        .iter()
-        .any(|value| value.trim().is_empty() || value.trim() != value)
-    {
-        anyhow::bail!("mwifi ssids must contain non-empty names without surrounding whitespace");
-    }
-    let unique_ssids = config
-        .ssids
-        .iter()
-        .map(|value| value.to_ascii_lowercase())
-        .collect::<BTreeSet<_>>();
-    if unique_ssids.len() != config.ssids.len() {
-        anyhow::bail!("mwifi ssids must not contain duplicates");
-    }
+    validate_ssid_list("ssids", &config.ssids)?;
+    validate_ssid_list("prefer_ssids", &config.prefer_ssids)?;
     if !config.band_bonus_2g.is_finite()
         || !config.band_bonus_5g.is_finite()
         || !config.band_bonus_6g.is_finite()
@@ -221,16 +216,57 @@ pub(crate) fn validate_config(config: &MwifiConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[allow(dead_code)]
-pub fn resolve_mwifi_config(raw: &MwifiConfig, env: &EnvMap) -> MwifiConfig {
-    let env_ssids = env
-        .get("MWIFI_SSIDS")
-        .unwrap_or_default()
+fn parse_ssid_list(raw: Option<&str>) -> Vec<String> {
+    raw.unwrap_or_default()
         .split(',')
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
-        .collect::<Vec<_>>();
+        .collect()
+}
+
+fn validate_ssid_list(field: &str, values: &[String]) -> anyhow::Result<()> {
+    if values
+        .iter()
+        .any(|value| value.trim().is_empty() || value.trim() != value)
+    {
+        anyhow::bail!("mwifi {field} must contain non-empty names without surrounding whitespace");
+    }
+    let unique = values
+        .iter()
+        .map(|value| value.to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    if unique.len() != values.len() {
+        anyhow::bail!("mwifi {field} must not contain duplicates");
+    }
+    Ok(())
+}
+
+fn merge_ssid_lists(preferred: &[String], rest: &[String]) -> Vec<String> {
+    let mut merged = Vec::with_capacity(preferred.len() + rest.len());
+    for ssid in preferred.iter().chain(rest.iter()) {
+        if !merged.iter().any(|existing| existing == ssid) {
+            merged.push(ssid.clone());
+        }
+    }
+    merged
+}
+
+fn visible_preferred_candidate<'a>(
+    prefer_ssids: &[String],
+    candidates: &'a [CandidateScore],
+) -> Option<&'a CandidateScore> {
+    prefer_ssids.iter().find_map(|ssid| {
+        candidates.iter().find(|candidate| {
+            candidate.network.ssid == *ssid && candidate.join_failure_penalty <= 0.0
+        })
+    })
+}
+
+#[allow(dead_code)]
+pub fn resolve_mwifi_config(raw: &MwifiConfig, env: &EnvMap) -> MwifiConfig {
+    let env_ssids = parse_ssid_list(env.get("MWIFI_SSIDS"));
+    let env_prefer_ssids = parse_ssid_list(env.get("MWIFI_PREFER_SSIDS"));
 
     let state_file = env
         .get("MWIFI_STATE_FILE")
@@ -281,6 +317,11 @@ pub fn resolve_mwifi_config(raw: &MwifiConfig, env: &EnvMap) -> MwifiConfig {
             env.get("MWIFI_MIN_SWITCH_SCORE_DELTA"),
             raw.min_switch_score_delta,
         ),
+        prefer_ssids: if env_prefer_ssids.is_empty() {
+            raw.prefer_ssids.clone()
+        } else {
+            env_prefer_ssids
+        },
         ssids: if env_ssids.is_empty() {
             raw.ssids.clone()
         } else {
@@ -1322,6 +1363,12 @@ pub fn decide_wifi_switch(
         return "stay:".to_string();
     }
     let best = best.expect("candidate exists");
+    if let Some(preferred) = visible_preferred_candidate(&config.prefer_ssids, &ranked) {
+        if preferred.network.ssid != current {
+            return format!("switch:{current}:{}", preferred.network.ssid);
+        }
+        return format!("stay:{current}");
+    }
     let current_candidate = ranked
         .iter()
         .find(|candidate| candidate.network.ssid == current)
@@ -1394,6 +1441,9 @@ fn build_decision_reason(
         let mut parts = rest.splitn(2, ':');
         let _from = parts.next().unwrap_or_default();
         let to = parts.next().unwrap_or_default();
+        if config.prefer_ssids.iter().any(|ssid| ssid == to) {
+            return format!("switching to {to}; configured preferred SSID is available");
+        }
         if health_failure_streak >= config.health_failure_switch_runs && delta >= 10.0 {
             return format!(
                 "switching to {to}; repeated health failures and score delta {} >= 10",
@@ -1675,7 +1725,12 @@ fn setup_candidate_ssids(config: &MwifiConfig, device: &str) -> anyhow::Result<V
     let preferences = preferred_ssids(device)?;
     let mut ssids = Vec::new();
 
-    for ssid in config.ssids.iter().chain(preferences.iter()) {
+    for ssid in config
+        .prefer_ssids
+        .iter()
+        .chain(config.ssids.iter())
+        .chain(preferences.iter())
+    {
         if !ssids.contains(ssid) {
             ssids.push(ssid.clone());
         }
@@ -1694,14 +1749,12 @@ fn setup_candidate_ssids(config: &MwifiConfig, device: &str) -> anyhow::Result<V
 }
 
 #[cfg(test)]
-fn setup_candidate_ssids_from_lists(configured: &[String], preferences: &[String]) -> Vec<String> {
-    let mut ssids = Vec::new();
-    for ssid in configured.iter().chain(preferences.iter()) {
-        if !ssids.contains(ssid) {
-            ssids.push(ssid.clone());
-        }
-    }
-    ssids
+fn setup_candidate_ssids_from_lists(
+    prefer_ssids: &[String],
+    configured: &[String],
+    preferences: &[String],
+) -> Vec<String> {
+    merge_ssid_lists(prefer_ssids, &merge_ssid_lists(configured, preferences))
 }
 
 fn parse_networks(allowed: &[String]) -> Vec<Network> {
@@ -1807,11 +1860,14 @@ pub fn run_once(context: &mut ModuleContext) -> anyhow::Result<Option<ModuleStat
     let now = Utc::now();
     let current = current_ssid(&device)?;
     let preferences = preferred_ssids(&device)?;
-    let allowed = if config.ssids.is_empty() {
-        preferences
-    } else {
-        config.ssids.clone()
-    };
+    let allowed = merge_ssid_lists(
+        &config.prefer_ssids,
+        &if config.ssids.is_empty() {
+            preferences
+        } else {
+            config.ssids.clone()
+        },
+    );
     let scan_allowed = scan_allowlist(&allowed, &repeater_rules);
     let scanned = parse_networks(&scan_allowed);
     let persisted = read_state(&config.state_file);
@@ -2674,6 +2730,7 @@ TestNet              00:99:88:77:66:55 -65 233 WPA3(PSK/AES/AES)\n";
             current_sticky_bonus: 25.0,
             rssi_offset: 100.0,
             min_switch_score_delta: 10.0,
+            prefer_ssids: Vec::new(),
             ssids: Vec::new(),
             repeater_rules: Vec::new(),
             state_file: String::new(),
@@ -2854,7 +2911,11 @@ TestNet              00:99:88:77:66:55 -65 233 WPA3(PSK/AES/AES)\n";
         ];
 
         assert_eq!(
-            setup_candidate_ssids_from_lists(&configured, &preferences),
+            setup_candidate_ssids_from_lists(
+                &["knight_riders_5G".to_string()],
+                &configured,
+                &preferences,
+            ),
             vec![
                 "knight_riders_5G".to_string(),
                 "Yousuf WiFi".to_string(),
@@ -3053,6 +3114,138 @@ TestNet              00:99:88:77:66:55 -65 233 WPA3(PSK/AES/AES)\n";
         assert_eq!(
             resolved.ssids,
             vec!["Office".to_string(), "Lab".to_string()]
+        );
+        assert!(resolved.prefer_ssids.is_empty());
+    }
+
+    fn sample_network(ssid: &str, band: &str, rssi: i64, channel: &str) -> Network {
+        Network {
+            ssid: ssid.to_string(),
+            band: band.to_string(),
+            rssi,
+            channel: channel.to_string(),
+            security: "WPA2".to_string(),
+            ping_ms: None,
+        }
+    }
+
+    #[test]
+    fn wifi_decision_switches_to_configured_preferred_ssid_when_available() {
+        let config = MwifiConfig {
+            prefer_ssids: vec!["knight_riders_5G".to_string()],
+            min_switch_score_delta: 1_000.0,
+            min_dwell_seconds: 180,
+            ..Default::default()
+        };
+        let candidates = vec![
+            build_candidate_score(
+                &sample_network("Yousuf WiFi", "2g", -20, "10"),
+                &config,
+                &["Yousuf WiFi".to_string(), "knight_riders_5G".to_string()],
+                "Yousuf WiFi",
+                0.0,
+            ),
+            with_join_failure_penalty(
+                build_candidate_score(
+                    &sample_network("knight_riders_5G", "5g", -90, "161"),
+                    &config,
+                    &["Yousuf WiFi".to_string(), "knight_riders_5G".to_string()],
+                    "Yousuf WiFi",
+                    0.0,
+                ),
+                0.0,
+            ),
+        ];
+
+        assert_eq!(
+            decide_wifi_switch("Yousuf WiFi", &candidates, &config, false, 0),
+            "switch:Yousuf WiFi:knight_riders_5G"
+        );
+        assert_eq!(
+            build_decision_reason(
+                "switch:Yousuf WiFi:knight_riders_5G",
+                "Yousuf WiFi",
+                &candidates,
+                &config,
+                0,
+            ),
+            "switching to knight_riders_5G; configured preferred SSID is available"
+        );
+    }
+
+    #[test]
+    fn wifi_decision_does_not_force_preferred_ssid_during_join_failure_cooldown() {
+        let config = MwifiConfig {
+            prefer_ssids: vec!["knight_riders_5G".to_string()],
+            min_switch_score_delta: 1_000.0,
+            ..Default::default()
+        };
+        let candidates = vec![
+            build_candidate_score(
+                &sample_network("Yousuf WiFi", "2g", -20, "10"),
+                &config,
+                &["Yousuf WiFi".to_string(), "knight_riders_5G".to_string()],
+                "Yousuf WiFi",
+                0.0,
+            ),
+            with_join_failure_penalty(
+                build_candidate_score(
+                    &sample_network("knight_riders_5G", "5g", -20, "161"),
+                    &config,
+                    &["Yousuf WiFi".to_string(), "knight_riders_5G".to_string()],
+                    "Yousuf WiFi",
+                    0.0,
+                ),
+                JOIN_FAILURE_SCORE_PENALTY,
+            ),
+        ];
+
+        assert_eq!(
+            decide_wifi_switch("Yousuf WiFi", &candidates, &config, true, 0),
+            "stay:Yousuf WiFi"
+        );
+    }
+
+    #[test]
+    fn wifi_candidate_allowlist_keeps_configured_preferred_ssids() {
+        assert_eq!(
+            merge_ssid_lists(
+                &["knight_riders_5G".to_string()],
+                &["Yousuf WiFi".to_string(), "Office".to_string()],
+            ),
+            vec![
+                "knight_riders_5G".to_string(),
+                "Yousuf WiFi".to_string(),
+                "Office".to_string(),
+            ]
+        );
+        assert_eq!(
+            merge_ssid_lists(
+                &["knight_riders_5G".to_string()],
+                &["knight_riders_5G".to_string(), "Office".to_string()],
+            ),
+            vec!["knight_riders_5G".to_string(), "Office".to_string()]
+        );
+    }
+
+    #[test]
+    fn wifi_resolves_prefer_ssids_env_override() {
+        let mut raw = default_wifi_config();
+        raw.prefer_ssids = vec!["Home".to_string()];
+        let resolved = resolve_mwifi_config(
+            &raw,
+            &EnvMap {
+                values: vec![(
+                    "MWIFI_PREFER_SSIDS".to_string(),
+                    "knight_riders_5G, Office".to_string(),
+                )]
+                .into_iter()
+                .collect(),
+            },
+        );
+        assert_eq!(
+            resolved.prefer_ssids,
+            vec!["knight_riders_5G".to_string(), "Office".to_string()]
         );
     }
 
