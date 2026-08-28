@@ -14,6 +14,7 @@
 - Treat `tmp/tasks.md` as the canonical execution ledger for the current worktree; do not land while any item remains incomplete.
 - If `tmp/plan.md` is missing or empty, create or update it before implementation; use Codex Plan mode when available, otherwise write the plan directly.
 - Keep heavy/generated temporary assets outside the repo or inside ignored `tmp/`; never commit `temp`, `tmp`, `_temp`, `_tmp`, `.tmp`, or `.temp` paths.
+- **Git operation consent:** ordinary task completion does not authorize review, commit, merge, push, or landing. Perform those operations only when the user explicitly requests them or a repository rule explicitly requires them for the current task.
 - Run relevant tests/builds/checks before landing.
 - **User-facing messages:** Give one brief what/why/how plan when substantive work starts; repeat only if direction materially changes. Otherwise, message only when user input, approval, or awareness is required—not to narrate routine actions, tool calls, or intermediate progress. Before stopping, concisely report completed work, outcome, relevant checks, and unresolved issues. Reduce only status prose; never reduce reasoning, investigation, tool use, execution, verification, or requested output. Omit logs, diffs, repetition, and obvious context unless needed or requested.
 
