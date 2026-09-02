@@ -3,33 +3,27 @@
 
 # Shared Rules
 
-- **Worktree isolation:** never edit, stage, or commit directly on `main`; use a dedicated task worktree first.
-- Put all code changes in `<repo>/worktrees/<name>/` and switch before editing.
-- Keep the repo-owned `/worktrees/*` path gitignored.
-- Follow any runtime skill's worktree naming, branch naming, or reconcile flow.
-- One worktree = one coherent task.
-- Remove temporary worktrees and branches after landing.
-- Use per-worktree tool envs (`bin/`, `.venv/`, `.codex-rotate/bin/`).
-- Maintain a real, gitignored `<worktree>/tmp/` agent workspace; before editing, ensure `tmp/tasks.md` and `tmp/plan.md` exist and `git check-ignore tmp/tasks.md tmp/plan.md` passes.
-- Treat `tmp/tasks.md` as the canonical execution ledger for the current worktree; do not land while any item remains incomplete.
-- If `tmp/plan.md` is missing or empty, create or update it before implementation; use Codex Plan mode when available, otherwise write the plan directly.
-- Keep heavy/generated temporary assets outside the repo or inside ignored `tmp/`; never commit `temp`, `tmp`, `_temp`, `_tmp`, `.tmp`, or `.temp` paths.
-- **Git operation consent:** ordinary task completion does not authorize review, commit, merge, push, or landing. Perform those operations only when the user explicitly requests them or a repository rule explicitly requires them for the current task.
-- Run relevant tests/builds/checks before landing.
-- **User-facing messages:** Give one brief what/why/how plan when substantive work starts; repeat only if direction materially changes. Otherwise, message only when user input, approval, or awareness is required—not to narrate routine actions, tool calls, or intermediate progress. Before stopping, concisely report completed work, outcome, relevant checks, and unresolved issues. Reduce only status prose; never reduce reasoning, investigation, tool use, execution, verification, or requested output. Omit logs, diffs, repetition, and obvious context unless needed or requested.
+- **Worktree isolation:** Never edit, stage, or commit directly on `main`; switch into a dedicated `<repo>/worktrees/<name>/`, keep `/worktrees/*` ignored, and follow runtime skill naming, branching, and reconcile rules.
+- Keep one coherent task per worktree, use worktree-local tool environments, and remove temporary worktrees and branches after landing.
+- Maintain a real gitignored `<worktree>/tmp/`; before editing, ensure `tmp/tasks.md` and `tmp/plan.md` exist and are ignored, creating or updating them before implementation. Keep `tmp/plan.md` nonempty and `tmp/tasks.md` as the canonical ledger with no incomplete items before landing.
+- Keep heavy or generated scratch assets outside the repository or in ignored `tmp/`; never commit `temp`, `tmp`, `_temp`, `_tmp`, `.tmp`, or `.temp` paths.
+- **Git operation consent:** Routine completion does not authorize review, commit, merge, push, or landing; perform them only when explicitly requested or when a repository rule requires them.
+- Run relevant tests, builds, and checks before landing.
+- **User-facing messages:** At substantive start, briefly state what/why/how. Then communicate only for changed direction or needed input, approval, or awareness. Final reports should state outcome, checks, and unresolved issues; omit routine narration, logs, diffs, and repetition unless needed or requested.
 
 <!-- END rules:spec:common -->
 <!-- BEGIN rules:spec:coding -->
 
 # Coding Baseline
 
-- Default to the `mre` skill: build for the current proven need; choose the highest safe rung: no change, deletion, reuse, platform/stdlib, installed dependency, new code, then new dependency.
-- Keep edits scoped and follow repo idioms.
-- Prefer TDD/BDD: write or update tests before (or alongside) the implementation for behavior changes. Apply SOLID only when it reduces churn.
+- Default to `mre`: solve the proven need with the smallest safe rung—no change, deletion, reuse, platform/stdlib, installed dependency, new code, then new dependency. Keep edits scoped and follow repo idioms.
+- Organize new production code into cohesive, idiomatic modules, packages, classes, or functions with clear ownership. Prefer feature/domain-first folders when no stronger convention exists; avoid flat dumps and generic catch-alls (`utils`, `helpers`, `common`, `misc`). Shared code needs a specific owner and purpose.
+- Give modules narrow public entry points, private internals, acyclic dependencies, and shallow imports. Separate domain/policy logic from UI, transport, persistence, and integrations when they change or test independently.
+- Use SOLID, separation of concerns, Clean Architecture, and established patterns when they reduce coupling or testing cost; do not add speculative layers or abstractions.
+- For touched legacy code, improve boundaries when safe and proportional, never deepen structural debt, and reserve broad restructuring for explicit refactor scope.
+- Prefer TDD/BDD. Follow repo test conventions; otherwise co-locate unit/component tests with their module and place integration/contract/E2E tests in dedicated suites. Keep fixtures/helpers near consumers until shared.
 - **Integration tests must use isolated live environments** (sandboxed databases, test accounts, ephemeral services). Never run integration tests against a production runtime or data store.
-- Optimize for agentic locality: prefer cohesive production files ~300-500 lines; treat 500+ as a smell and 1,000+ as a split candidate in multi-file modules unless generated, declarative, or inherently cohesive.
-- Split by semantic boundary, for example types, I/O, validation, domain logic, UI state/view, CLI parsing/execution, test helpers, or test scenarios.
-- Avoid splits where the pieces must always be read or changed together.
+- Prefer cohesive files ~300–500 lines; review 500+ and consider splitting 1,000+ unless generated, declarative, or inherently cohesive. Split by semantic boundary; keep co-changing code together.
 
 <!-- END rules:spec:coding -->
 <!-- BEGIN rules:local -->
