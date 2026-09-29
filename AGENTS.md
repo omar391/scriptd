@@ -5,18 +5,17 @@
 
 - **Worktree isolation:** Never edit, stage, or commit directly on `main`; switch into a dedicated `<repo>/worktrees/<name>/`, keep `/worktrees/*` ignored, and follow runtime skill naming, branching, and reconcile rules.
 - Keep one coherent task per worktree, use worktree-local tool environments, and remove temporary worktrees and branches after landing.
-- Maintain a real gitignored `<worktree>/tmp/`; before editing, ensure `tmp/tasks.md` and `tmp/plan.md` exist and are ignored, creating or updating them before implementation. Keep `tmp/plan.md` nonempty and `tmp/tasks.md` as the canonical ledger with no incomplete items before landing.
+- Maintain a real gitignored `<worktree>/tmp/` for scratch and task-local state. Managed-goal artifact bundles are owned and initialized by `$goal-prompt-optimizer`; do not create placeholder planning or goal files as a generic worktree preflight.
 - Keep heavy or generated scratch assets outside the repository or in ignored `tmp/`; never commit `temp`, `tmp`, `_temp`, `_tmp`, `.tmp`, or `.temp` paths.
-- **Git operation consent:** Routine completion does not authorize review, commit, merge, push, or landing; perform them only when explicitly requested or when a repository rule requires them.
 - Run relevant tests, builds, and checks before landing.
-- **User-facing messages:** At substantive start, briefly state what/why/how. Then communicate only for changed direction or needed input, approval, or awareness. Final reports should state outcome, checks, and unresolved issues; omit routine narration, logs, diffs, and repetition unless needed or requested.
+- **User-facing messages:** During substantive work, remain silent unless user input or approval is required. Do not announce starts or narrate routine actions, tool calls, or intermediate progress. Final reports should state only the outcome, relevant checks, and unresolved issues. Reduced narration must not reduce reasoning, investigation, execution, or verification.
 
 <!-- END rules:spec:common -->
 <!-- BEGIN rules:spec:coding -->
 
 # Coding Baseline
 
-- Default to `mre`: solve the proven need with the smallest safe rung—no change, deletion, reuse, platform/stdlib, installed dependency, new code, then new dependency. Keep edits scoped and follow repo idioms.
+- Default to `mre`: prefer no code when it safely satisfies the proven need; when existing code must change, make the smallest surgical, coherent change and preserve repo conventions, safeguards, and risk-proportional verification.
 - Organize new production code into cohesive, idiomatic modules, packages, classes, or functions with clear ownership. Prefer feature/domain-first folders when no stronger convention exists; avoid flat dumps and generic catch-alls (`utils`, `helpers`, `common`, `misc`). Shared code needs a specific owner and purpose.
 - Give modules narrow public entry points, private internals, acyclic dependencies, and shallow imports. Separate domain/policy logic from UI, transport, persistence, and integrations when they change or test independently.
 - Use SOLID, separation of concerns, Clean Architecture, and established patterns when they reduce coupling or testing cost; do not add speculative layers or abstractions.
