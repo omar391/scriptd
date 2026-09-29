@@ -3,7 +3,6 @@
 
 # Shared Rules
 
-- **Worktree isolation:** Never edit, stage, or commit directly on `main`; switch into a dedicated `<repo>/worktrees/<name>/`, keep `/worktrees/*` ignored, and follow runtime skill naming, branching, and reconcile rules.
 - Keep one coherent task per worktree, use worktree-local tool environments, and remove temporary worktrees and branches after landing.
 - Maintain a real gitignored `<worktree>/tmp/` for scratch and task-local state. Managed-goal artifact bundles are owned and initialized by `$goal-prompt-optimizer`; do not create placeholder planning or goal files as a generic worktree preflight.
 - Keep heavy or generated scratch assets outside the repository or in ignored `tmp/`; never commit `temp`, `tmp`, `_temp`, `_tmp`, `.tmp`, or `.temp` paths.
