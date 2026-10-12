@@ -148,7 +148,7 @@ mod tests {
         fs::create_dir_all(&dir).expect("create module dir");
         let settings = match module_id {
             "mbrew" => "settings:\n  askpass_path: /tmp/askpass\n  homebrew_bin: /opt/homebrew/bin/brew\n  sudoers_path: /tmp/sudoers\n  sudoers_timeout_path: /tmp/sudoers-timeout\n  sudo_timeout_hours: 2\n",
-            "mcpu" => "settings:\n  cpu_threshold: 50\n  time_limit_seconds: 600\n  exclude_apps: []\n",
+            "mcpu" => "settings:\n  cpu_threshold: 50\n  exclude_apps: []\n",
             "mwifi" => "settings:\n  min_dwell: 1\n  ping_target: 1.1.1.1\n  ping_count: 1\n  ping_timeout: 1\n  ping_high_latency_ms: 250\n  health_failure_switch_runs: 1\n  band_bonus_2g: 0\n  band_bonus_5g: 35\n  band_bonus_6g: 50\n  preference_top_bonus: 30\n  preference_rank_decay: 5\n  current_sticky_bonus: 25\n  rssi_offset: 100\n  min_switch_score_delta: 10\n",
             "miwatch" => "settings: {}\n",
             _ => "settings: {}\n",

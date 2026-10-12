@@ -3,11 +3,9 @@
 
 # Shared Rules
 
-- Keep one coherent task per worktree, use worktree-local tool environments, and remove temporary worktrees and branches after landing.
-- Maintain a real gitignored `<worktree>/tmp/` for scratch and task-local state. Managed-goal artifact bundles are owned and initialized by `$goal-prompt-optimizer`; do not create placeholder planning or goal files as a generic worktree preflight.
+- Keep one coherent task per worktree and use worktree-local tool environments.
+- Maintain a real gitignored `<worktree>/tmp/` for scratch and task-local state; generic setup must not manufacture managed artifacts.
 - Keep heavy or generated scratch assets outside the repository or in ignored `tmp/`; never commit `temp`, `tmp`, `_temp`, `_tmp`, `.tmp`, or `.temp` paths.
-- Run relevant tests, builds, and checks before landing.
-- **User-facing messages:** During substantive work, remain silent unless user input or approval is required. Do not announce starts or narrate routine actions, tool calls, or intermediate progress. Final reports should state only the outcome, relevant checks, and unresolved issues. Reduced narration must not reduce reasoning, investigation, execution, or verification.
 
 <!-- END rules:spec:common -->
 <!-- BEGIN rules:spec:coding -->
@@ -25,6 +23,12 @@
 
 <!-- END rules:spec:coding -->
 <!-- BEGIN rules:local -->
+
+- Keep one coherent task per worktree, and remove temporary worktrees and branches after landing.
+- Managed-goal artifact bundles belong to `$goal-prompt-optimizer`; do not create placeholders during generic setup.
+- Run relevant tests, builds, and checks before landing.
+- During substantive work, remain silent unless user input or approval is required. Final reports state the outcome, actual checks, and unresolved issues.
+
 <!-- END rules:local -->
 
 Load on-demand specs: [`code-review`](~/.agents/skills/agent-md/assets/specs/code-review.md), [`sharia`](~/.agents/skills/agent-md/assets/specs/sharia.md), [`ts`](~/.agents/skills/agent-md/assets/specs/ts.md)

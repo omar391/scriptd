@@ -8,7 +8,6 @@ module:
 
 settings:
   cpu_threshold: 50
-  time_limit_seconds: 600
   exclude_apps:
     - Finder
     - Dock

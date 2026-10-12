@@ -77,7 +77,7 @@ release_binary_is_stale() {
     return 0
   fi
 
-  if find "${ROOT_DIR}/src" "${ROOT_DIR}/modules" -type f -name '*.rs' -newer "${REPO_BIN}" -print -quit 2>/dev/null | grep -q .; then
+  if find "${ROOT_DIR}/src" "${ROOT_DIR}/modules" -type f \( -name '*.rs' -o -name '*.swift' \) -newer "${REPO_BIN}" -print -quit 2>/dev/null | grep -q .; then
     return 0
   fi
 
