@@ -15,7 +15,7 @@ use policy::{
     apply_response, flush_completed, new_pending, DecisionApply, PendingRequest, PolicyFile,
     PolicyStore, UiHeartbeat, UiOwner, MAX_PENDING_REQUESTS,
 };
-use process::{Candidate, CpuSampler, ProcessIdentity, MAX_SAMPLE_GAP};
+use process::{Candidate, CpuSampler, ProcessIdentity, MAX_SAMPLE_GAP, is_cleanup_eligible, launchd_service_pids};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -337,6 +337,29 @@ fn run_once_inner(
             ) {
                 None => {}
                 Some(CleanupAction::Terminate) => {
+                    let service_pids = match process::launchd_service_pids() {
+                        Ok(pids) => pids,
+                        Err(error) => {
+                            reset_tracking(state);
+                            error_message = Some(format!(
+                                "cleanup failed: could not read service PIDs: {error:#}"
+                            ));
+                            continue;
+                        }
+                    };
+                    if let Err(reason) = process::is_cleanup_eligible(
+                        &state.sampler.system,
+                        candidate.identity.pid,
+                        state.sampler.system.process(Pid::from_u32(candidate.identity.pid)).unwrap(),
+                        &service_pids,
+                    ) {
+                        reset_tracking(state);
+                        error_message = Some(format!(
+                            "process is not cleanup-eligible (PID {}): {}",
+                            candidate.identity.pid, reason
+                        ));
+                        continue;
+                    }
                     match send_signal(
                         &candidate,
                         &config.exclude_apps,
@@ -372,6 +395,29 @@ fn run_once_inner(
                     }
                 }
                 Some(CleanupAction::Kill) => {
+                    let service_pids = match process::launchd_service_pids() {
+                        Ok(pids) => pids,
+                        Err(error) => {
+                            reset_tracking(state);
+                            error_message = Some(format!(
+                                "cleanup failed: could not read service PIDs: {error:#}"
+                            ));
+                            continue;
+                        }
+                    };
+                    if let Err(reason) = process::is_cleanup_eligible(
+                        &state.sampler.system,
+                        candidate.identity.pid,
+                        state.sampler.system.process(Pid::from_u32(candidate.identity.pid)).unwrap(),
+                        &service_pids,
+                    ) {
+                        reset_tracking(state);
+                        error_message = Some(format!(
+                            "process is not cleanup-eligible (PID {}): {}",
+                            candidate.identity.pid, reason
+                        ));
+                        continue;
+                    }
                     match send_signal(
                         &candidate,
                         &config.exclude_apps,

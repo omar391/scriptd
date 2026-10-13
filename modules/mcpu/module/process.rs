@@ -303,7 +303,6 @@ fn classify_process_with_evidence<E: ProcessOwnershipEvidence>(
         return Err("protected system or desktop process".to_string());
     }
 
-    verify_process_ownership(system, pid, &info, service_pids, ownership_evidence)?;
 
     let running_code_hash = code_directory_hash_for_pid(pid)
         .map_err(|_| "running executable code identity is unavailable".to_string())?;
@@ -326,10 +325,90 @@ fn classify_process_with_evidence<E: ProcessOwnershipEvidence>(
         name,
         cpu_percent: process.cpu_usage(),
         memory_bytes: process.memory(),
-        reason: "detached CLI process with verified executable identity and no known owner"
+        reason: ownership_reason(&info, service_pids)
             .to_string(),
     })
 }
+
+fn ownership_reason(info: &ProcessInfo, service_pids: &HashSet<u32>) -> String {
+    if service_pids.contains(&info.pid) {
+        return "registered launchd service".to_string();
+    }
+    if info.parent_pid == 1 {
+        if info.process_group == info.pid && info.flags & PROC_FLAG_SLEADER != 0 {
+            return "orphaned session leader".to_string();
+        }
+        return "reparented to launchd".to_string();
+    }
+    "detached CLI process".to_string()
+}
+
+pub(super) fn is_cleanup_eligible(
+    system: &System,
+    pid: u32,
+    process: &sysinfo::Process,
+    service_pids: &HashSet<u32>,
+) -> std::result::Result<(), String> {
+    let current_uid = unsafe { libc::getuid() };
+    let info = process_info(pid).map_err(|_| "process identity is unavailable".to_string())?;
+
+    // Recheck basic identity consistency
+    if info.pid != pid || info.start_seconds != process.start_time() {
+        return Err("process identity changed".to_string());
+    }
+    if info.user_id != current_uid {
+        return Err("process belongs to another user".to_string());
+    }
+
+    // Must be a leaf process (no children)
+    if has_direct_child_process(system, pid) {
+        return Err("process has child workloads".to_string());
+    }
+
+    // Must have no controlling terminal
+    if !has_verified_no_controlling_terminal(info.tty_device, info.tty_process_group, info.flags) {
+        return Err("process has a controlling terminal".to_string());
+    }
+
+    // Must not be a registered service
+    if service_pids.contains(&pid) {
+        return Err("process is a registered service".to_string());
+    }
+
+    // For reparented processes (PPID=1), require stricter conditions
+    let parent_pid = system
+        .process(Pid::from_u32(pid))
+        .and_then(|p| p.parent())
+        .map(Pid::as_u32);
+
+    if parent_pid == Some(1) {
+        // Must be alone in its process group
+        if info.process_group != info.pid {
+            // Check if the group leader still exists
+            if let Some(leader_process) = system.process(Pid::from_u32(info.process_group)) {
+                if leader_process.start_time() == info.start_seconds {
+                    return Err("process group leader is still alive".to_string());
+                }
+            }
+            // Group leader is dead or PID was reused - still unsafe
+            return Err("process is not alone in its process group".to_string());
+        }
+
+        // Verify no surviving group leader could own it
+        let has_surviving_leader = system.processes().values().any(|p| {
+            let p_pid = p.pid().as_u32();
+            p_pid != pid
+                && p_pid == info.process_group
+                && p.start_time() == info.start_seconds
+        });
+        if has_surviving_leader {
+            return Err("process group leader is still alive".to_string());
+        }
+    }
+
+    Ok(())
+}
+
 
 fn verify_process_ownership(
     system: &System,
@@ -1646,7 +1725,6 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn pidversion_bound_signal_rejects_a_different_process_generation() {
-        use std::os::unix::process::ExitStatusExt;
 
         let mut child = Command::new("/bin/sleep")
             .arg("30")
