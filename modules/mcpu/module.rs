@@ -15,7 +15,7 @@ use policy::{
     apply_response, flush_completed, new_pending, DecisionApply, PendingRequest, PolicyFile,
     PolicyStore, UiHeartbeat, UiOwner, MAX_PENDING_REQUESTS,
 };
-use process::{Candidate, CpuSampler, ProcessIdentity, MAX_SAMPLE_GAP, is_cleanup_eligible, launchd_service_pids};
+use process::{Candidate, CpuSampler, ProcessIdentity, MAX_SAMPLE_GAP};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -70,6 +70,11 @@ struct Escalation {
 enum CleanupAction {
     Terminate,
     Kill,
+}
+
+enum SignalFailure {
+    Shared(anyhow::Error),
+    Candidate(anyhow::Error),
 }
 
 #[derive(Default)]
@@ -337,29 +342,6 @@ fn run_once_inner(
             ) {
                 None => {}
                 Some(CleanupAction::Terminate) => {
-                    let service_pids = match process::launchd_service_pids() {
-                        Ok(pids) => pids,
-                        Err(error) => {
-                            reset_tracking(state);
-                            error_message = Some(format!(
-                                "cleanup failed: could not read service PIDs: {error:#}"
-                            ));
-                            continue;
-                        }
-                    };
-                    if let Err(reason) = process::is_cleanup_eligible(
-                        &state.sampler.system,
-                        candidate.identity.pid,
-                        state.sampler.system.process(Pid::from_u32(candidate.identity.pid)).unwrap(),
-                        &service_pids,
-                    ) {
-                        reset_tracking(state);
-                        error_message = Some(format!(
-                            "process is not cleanup-eligible (PID {}): {}",
-                            candidate.identity.pid, reason
-                        ));
-                        continue;
-                    }
                     match send_signal(
                         &candidate,
                         &config.exclude_apps,
@@ -386,38 +368,16 @@ fn run_once_inner(
                             state.last_message = Some(message);
                         }
                         Err(error) => {
-                            reset_tracking(state);
-                            error_message = Some(format!(
-                                "refused or failed SIGTERM for PID {}: {error:#}",
-                                candidate.identity.pid
+                            error_message = Some(record_signal_failure(
+                                state,
+                                candidate.identity.pid,
+                                "SIGTERM",
+                                error,
                             ));
                         }
                     }
                 }
                 Some(CleanupAction::Kill) => {
-                    let service_pids = match process::launchd_service_pids() {
-                        Ok(pids) => pids,
-                        Err(error) => {
-                            reset_tracking(state);
-                            error_message = Some(format!(
-                                "cleanup failed: could not read service PIDs: {error:#}"
-                            ));
-                            continue;
-                        }
-                    };
-                    if let Err(reason) = process::is_cleanup_eligible(
-                        &state.sampler.system,
-                        candidate.identity.pid,
-                        state.sampler.system.process(Pid::from_u32(candidate.identity.pid)).unwrap(),
-                        &service_pids,
-                    ) {
-                        reset_tracking(state);
-                        error_message = Some(format!(
-                            "process is not cleanup-eligible (PID {}): {}",
-                            candidate.identity.pid, reason
-                        ));
-                        continue;
-                    }
                     match send_signal(
                         &candidate,
                         &config.exclude_apps,
@@ -437,10 +397,11 @@ fn run_once_inner(
                             state.last_message = Some(message);
                         }
                         Err(error) => {
-                            reset_tracking(state);
-                            error_message = Some(format!(
-                                "refused or failed SIGKILL for PID {}: {error:#}",
-                                candidate.identity.pid
+                            error_message = Some(record_signal_failure(
+                                state,
+                                candidate.identity.pid,
+                                "SIGKILL",
+                                error,
                             ));
                         }
                     }
@@ -629,16 +590,48 @@ fn send_signal(
     signal: i32,
     policy_lock: &policy::PolicyLock<'_>,
     policy: &PolicyFile,
-) -> Result<()> {
-    send_signal_with_policy_persistence(
-        candidate,
-        signal,
-        || policy_lock.save(policy),
-        |identity| process::verify_current_identity(identity, exclude_apps),
-        |identity, signal| {
-            process::signal_process_generation(identity.pid, identity.pid_version, signal)
+) -> std::result::Result<(), SignalFailure> {
+    policy_lock.save(policy).map_err(|error| {
+        SignalFailure::Shared(error.context("policy storage is not writable before cleanup"))
+    })?;
+    if policy.is_excluded(&candidate.identity.executable)
+        || policy.approval_for(&candidate.identity).is_none()
+    {
+        return Err(SignalFailure::Candidate(anyhow::anyhow!(
+            "cleanup approval is missing, stale, or excluded"
+        )));
+    }
+    process::verify_current_identity(&candidate.identity, exclude_apps).map_err(
+        |error| match error {
+            process::CleanupCheckError::Shared(error) => SignalFailure::Shared(error),
+            process::CleanupCheckError::Candidate(error) => SignalFailure::Candidate(error),
         },
+    )?;
+    process::signal_process_generation(
+        candidate.identity.pid,
+        candidate.identity.pid_version,
+        signal,
     )
+    .map_err(|error| SignalFailure::Candidate(anyhow::Error::from(error)))
+}
+
+fn record_signal_failure(
+    state: &mut McpuState,
+    pid: u32,
+    signal_name: &str,
+    failure: SignalFailure,
+) -> String {
+    match failure {
+        SignalFailure::Shared(error) => {
+            reset_tracking(state);
+            format!("refused or failed {signal_name} for PID {pid}: {error:#}")
+        }
+        SignalFailure::Candidate(error) => {
+            state.tracked.remove(&pid);
+            state.escalations.remove(&pid);
+            format!("refused or failed {signal_name} for PID {pid}: {error:#}")
+        }
+    }
 }
 
 fn send_signal_with<V, S>(candidate: &Candidate, signal: i32, verify: V, send: S) -> Result<()>

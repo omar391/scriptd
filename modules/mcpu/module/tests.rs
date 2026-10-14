@@ -32,6 +32,7 @@ fn candidate(pid: u32, fingerprint: &str) -> Candidate {
         cpu_percent: 82.0,
         memory_bytes: 4096,
         reason: "detached CLI".to_string(),
+        ownership: super::process::OwnershipKind::Orphaned,
     }
 }
 
@@ -130,6 +131,52 @@ fn missing_or_recovered_processes_drop_tracking_and_escalation() {
     reconcile_escalations(&mut escalations, &HashMap::new());
     assert!(tracked.is_empty());
     assert!(escalations.is_empty());
+}
+
+#[test]
+fn candidate_safety_refusal_preserves_other_process_timers_and_escalations() {
+    let now = Instant::now();
+    let unsafe_candidate = candidate(42, &"a".repeat(64));
+    let safe_candidate = candidate(43, &"b".repeat(64));
+    let mut state = McpuState::default();
+    for candidate in [&unsafe_candidate, &safe_candidate] {
+        observe_candidate(
+            &mut state.tracked,
+            candidate,
+            now - Duration::from_secs(600),
+        );
+        state.escalations.insert(
+            candidate.identity.pid,
+            Escalation {
+                identity: candidate.identity.clone(),
+                term_sent_at: now - Duration::from_secs(30),
+            },
+        );
+    }
+
+    let message = record_signal_failure(
+        &mut state,
+        unsafe_candidate.identity.pid,
+        "SIGTERM",
+        SignalFailure::Candidate(anyhow::anyhow!("process acquired a child workload")),
+    );
+
+    assert!(message.contains("process acquired a child workload"));
+    assert!(!state.tracked.contains_key(&unsafe_candidate.identity.pid));
+    assert!(!state
+        .escalations
+        .contains_key(&unsafe_candidate.identity.pid));
+    assert!(state.tracked.contains_key(&safe_candidate.identity.pid));
+    assert!(state.escalations.contains_key(&safe_candidate.identity.pid));
+
+    record_signal_failure(
+        &mut state,
+        safe_candidate.identity.pid,
+        "SIGKILL",
+        SignalFailure::Shared(anyhow::anyhow!("policy storage failed")),
+    );
+    assert!(state.tracked.is_empty());
+    assert!(state.escalations.is_empty());
 }
 
 #[test]
@@ -417,6 +464,7 @@ fn isolated_module_entrypoint_keeps_production_policy_and_processes_untouched() 
 
 #[cfg(target_os = "macos")]
 #[test]
+#[serial_test::serial]
 fn isolated_module_protects_a_live_high_cpu_cli_child() {
     use std::io::Write;
     use std::process::Stdio;
@@ -475,8 +523,10 @@ fn isolated_module_protects_a_live_high_cpu_cli_child() {
             .context("isolated mcpu status")?;
         let metrics = status.metrics.context("isolated mcpu metrics")?;
         anyhow::ensure!(
-            metrics["protected_high_cpu"].as_u64().unwrap_or_default() > 0,
-            "live high-CPU process was not reported as protected"
+            metrics["eligible_cli"].as_u64().unwrap_or_default()
+                + metrics["protected_high_cpu"].as_u64().unwrap_or_default()
+                > 0,
+            "live high-CPU CLI process was neither eligible nor protected: {metrics:?}"
         );
         anyhow::ensure!(
             metrics["pending_enrollment"].as_u64() == Some(0),

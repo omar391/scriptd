@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path};
@@ -56,6 +56,19 @@ pub(super) struct Candidate {
     pub cpu_percent: f32,
     pub memory_bytes: u64,
     pub reason: String,
+    pub ownership: OwnershipKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum OwnershipKind {
+    Orphaned,
+    LaunchdOwned,
+    ActiveOwner,
+}
+
+struct OwnershipAssessment {
+    kind: OwnershipKind,
+    reason: String,
 }
 
 #[derive(Debug)]
@@ -101,6 +114,18 @@ impl CpuSampler {
     }
 
     pub fn sample(&mut self, exclude_apps: &[String], configured_threshold: f32) -> Snapshot {
+        self.sample_with_service_query(exclude_apps, configured_threshold, launchd_service_pids)
+    }
+
+    fn sample_with_service_query<F>(
+        &mut self,
+        exclude_apps: &[String],
+        configured_threshold: f32,
+        query_service_pids: F,
+    ) -> Snapshot
+    where
+        F: FnOnce() -> Result<HashSet<u32>>,
+    {
         let now = Instant::now();
         let wall_now = SystemTime::now();
         let previous = self.previous.take();
@@ -133,7 +158,38 @@ impl CpuSampler {
             };
         }
 
-        let service_pids = match launchd_service_pids() {
+        let mut candidates = Vec::new();
+        let mut protected_high_cpu = 0;
+        let processes = self
+            .system
+            .processes()
+            .iter()
+            .filter(|(_, process)| process.cpu_usage() > configured_threshold.max(CPU_THRESHOLD))
+            .filter_map(|(pid, process)| {
+                if exclude_apps.iter().any(|excluded| {
+                    excluded.eq_ignore_ascii_case(&process.name().to_string_lossy())
+                }) {
+                    protected_high_cpu += 1;
+                    None
+                } else {
+                    Some((*pid, process))
+                }
+            })
+            .collect::<Vec<_>>();
+
+        if processes.is_empty() {
+            return Snapshot {
+                at: now,
+                wall_at: wall_now,
+                warmed: true,
+                discontinuity: false,
+                candidates,
+                protected_high_cpu,
+                protection_error: None,
+            };
+        }
+
+        let service_pids = match query_service_pids() {
             Ok(pids) => pids,
             Err(error) => {
                 return Snapshot {
@@ -142,31 +198,13 @@ impl CpuSampler {
                     warmed: true,
                     discontinuity: false,
                     candidates: Vec::new(),
-                    protected_high_cpu: 0,
+                    protected_high_cpu,
                     protection_error: Some(error.to_string()),
                 };
             }
         };
 
-        let mut candidates = Vec::new();
-        let mut protected_high_cpu = 0;
-        let processes = self
-            .system
-            .processes()
-            .iter()
-            .filter(|(_, process)| process.cpu_usage() > configured_threshold.max(CPU_THRESHOLD))
-            .map(|(pid, process)| (*pid, process))
-            .collect::<Vec<_>>();
-
         for (pid, process) in processes {
-            let name = process.name().to_string_lossy().into_owned();
-            if exclude_apps
-                .iter()
-                .any(|excluded| excluded.eq_ignore_ascii_case(&name))
-            {
-                protected_high_cpu += 1;
-                continue;
-            }
             match classify_process(&self.system, pid.as_u32(), process, &service_pids) {
                 Ok(candidate) => candidates.push(candidate),
                 Err(_) => protected_high_cpu += 1,
@@ -188,25 +226,94 @@ impl CpuSampler {
 pub(super) fn verify_current_identity(
     expected: &ProcessIdentity,
     exclude_apps: &[String],
-) -> Result<()> {
+) -> std::result::Result<(), CleanupCheckError> {
+    verify_current_identity_inner(expected, exclude_apps, || {}, || {}, || {})
+}
+
+#[derive(Debug)]
+pub(super) enum CleanupCheckError {
+    Shared(anyhow::Error),
+    Candidate(anyhow::Error),
+}
+
+fn verify_current_identity_inner<F, G, H>(
+    expected: &ProcessIdentity,
+    exclude_apps: &[String],
+    after_executable_verification: F,
+    after_initial_process_group_snapshot: G,
+    after_final_process_group_snapshot: H,
+) -> std::result::Result<(), CleanupCheckError>
+where
+    F: FnOnce(),
+    G: FnOnce(),
+    H: FnOnce(),
+{
     let mut system = System::new_all();
     system.refresh_processes(ProcessesToUpdate::All, true);
-    let pid = Pid::from_u32(expected.pid);
+    let service_pids = launchd_service_pids().map_err(CleanupCheckError::Shared)?;
     let process = system
-        .process(pid)
-        .context("process exited before signal")?;
-    let service_pids = launchd_service_pids()?;
+        .process(Pid::from_u32(expected.pid))
+        .context("process exited before signal")
+        .map_err(CleanupCheckError::Candidate)?;
     let current = classify_process(&system, expected.pid, process, &service_pids)
-        .map_err(anyhow::Error::msg)?;
+        .map_err(|error| CleanupCheckError::Candidate(anyhow::Error::msg(error)))?;
     if current.identity != *expected {
-        anyhow::bail!("process identity or executable fingerprint changed");
+        return Err(CleanupCheckError::Candidate(anyhow::anyhow!(
+            "process identity or executable fingerprint changed"
+        )));
     }
     if exclude_apps
         .iter()
         .any(|excluded| excluded.eq_ignore_ascii_case(&current.name))
     {
-        anyhow::bail!("process is explicitly excluded by name");
+        return Err(CleanupCheckError::Candidate(anyhow::anyhow!(
+            "process is explicitly excluded by name"
+        )));
     }
+
+    // Tests use this boundary to model a process acquiring a child while code
+    // signature verification is in progress.
+    after_executable_verification();
+
+    // Code-signature verification can invoke external tooling. Refresh process
+    // and service evidence after that work, then avoid another expensive
+    // executable verification before the final child check.
+    system.refresh_processes(ProcessesToUpdate::All, true);
+    let service_pids = launchd_service_pids().map_err(CleanupCheckError::Shared)?;
+    let process = system
+        .process(Pid::from_u32(expected.pid))
+        .context("process exited during immediate cleanup verification")
+        .map_err(CleanupCheckError::Candidate)?;
+    let fresh_info = process_info(expected.pid).map_err(CleanupCheckError::Candidate)?;
+    if fresh_info.pid_version != expected.pid_version
+        || fresh_info.start_seconds != expected.start_seconds
+        || fresh_info.start_microseconds != expected.start_microseconds
+        || fresh_info.user_id != expected.user_id
+        || process.start_time() != expected.start_seconds
+        || process
+            .exe()
+            .and_then(|path| path.canonicalize().ok())
+            .is_none_or(|path| path.to_string_lossy() != expected.executable)
+    {
+        return Err(CleanupCheckError::Candidate(anyhow::anyhow!(
+            "process identity or executable changed during cleanup verification"
+        )));
+    }
+    if exclude_apps
+        .iter()
+        .any(|excluded| excluded.eq_ignore_ascii_case(&process.name().to_string_lossy()))
+    {
+        return Err(CleanupCheckError::Candidate(anyhow::anyhow!(
+            "process became explicitly excluded by name"
+        )));
+    }
+    is_cleanup_eligible_after_process_group_snapshot(
+        &mut system,
+        expected,
+        &service_pids,
+        after_initial_process_group_snapshot,
+        after_final_process_group_snapshot,
+    )?;
     Ok(())
 }
 
@@ -303,7 +410,6 @@ fn classify_process_with_evidence<E: ProcessOwnershipEvidence>(
         return Err("protected system or desktop process".to_string());
     }
 
-
     let running_code_hash = code_directory_hash_for_pid(pid)
         .map_err(|_| "running executable code identity is unavailable".to_string())?;
     let verified_file = verified_code_identity_for_file(&canonical)
@@ -311,6 +417,8 @@ fn classify_process_with_evidence<E: ProcessOwnershipEvidence>(
     if running_code_hash != verified_file.code_directory_hash {
         return Err("running executable does not match the on-disk binary".to_string());
     }
+    let ownership =
+        verify_enrollment_ownership(system, pid, &info, service_pids, ownership_evidence)?;
     Ok(Candidate {
         identity: ProcessIdentity {
             pid,
@@ -325,152 +433,323 @@ fn classify_process_with_evidence<E: ProcessOwnershipEvidence>(
         name,
         cpu_percent: process.cpu_usage(),
         memory_bytes: process.memory(),
-        reason: ownership_reason(&info, service_pids)
-            .to_string(),
+        reason: ownership.reason,
+        ownership: ownership.kind,
     })
 }
 
-fn ownership_reason(info: &ProcessInfo, service_pids: &HashSet<u32>) -> String {
-    if service_pids.contains(&info.pid) {
-        return "registered launchd service".to_string();
-    }
-    if info.parent_pid == 1 {
-        if info.process_group == info.pid && info.flags & PROC_FLAG_SLEADER != 0 {
-            return "orphaned session leader".to_string();
-        }
-        return "reparented to launchd".to_string();
-    }
-    "detached CLI process".to_string()
+fn is_cleanup_eligible(
+    system: &mut System,
+    expected: &ProcessIdentity,
+    service_pids: &HashSet<u32>,
+) -> std::result::Result<(), CleanupCheckError> {
+    is_cleanup_eligible_after_process_group_snapshot(system, expected, service_pids, || {}, || {})
 }
 
-pub(super) fn is_cleanup_eligible(
-    system: &System,
-    pid: u32,
-    process: &sysinfo::Process,
+fn is_cleanup_eligible_after_process_group_snapshot<G, H>(
+    system: &mut System,
+    expected: &ProcessIdentity,
     service_pids: &HashSet<u32>,
-) -> std::result::Result<(), String> {
+    after_initial_process_group_snapshot: G,
+    after_final_process_group_snapshot: H,
+) -> std::result::Result<(), CleanupCheckError>
+where
+    G: FnOnce(),
+    H: FnOnce(),
+{
     let current_uid = unsafe { libc::getuid() };
-    let info = process_info(pid).map_err(|_| "process identity is unavailable".to_string())?;
+    let info = process_info(expected.pid).map_err(|error| {
+        candidate_cleanup_error(format!("process identity is unavailable: {error}"))
+    })?;
 
-    // Recheck basic identity consistency
-    if info.pid != pid || info.start_seconds != process.start_time() {
-        return Err("process identity changed".to_string());
+    let sampled_process = system
+        .process(Pid::from_u32(expected.pid))
+        .ok_or_else(|| candidate_cleanup_error("process is absent from the cleanup snapshot"))?;
+    if info.pid != expected.pid
+        || info.pid_version != expected.pid_version
+        || info.start_seconds != expected.start_seconds
+        || info.start_microseconds != expected.start_microseconds
+        || sampled_process.start_time() != expected.start_seconds
+    {
+        return Err(candidate_cleanup_error(
+            "process generation changed during cleanup checks",
+        ));
     }
-    if info.user_id != current_uid {
-        return Err("process belongs to another user".to_string());
+    if info.user_id != current_uid || info.user_id != expected.user_id {
+        return Err(candidate_cleanup_error("process belongs to another user"));
     }
-
-    // Must be a leaf process (no children)
-    if has_direct_child_process(system, pid) {
-        return Err("process has child workloads".to_string());
+    if system
+        .process(Pid::from_u32(expected.pid))
+        .and_then(|current| current.parent())
+        .map(Pid::as_u32)
+        != Some(info.parent_pid)
+    {
+        return Err(candidate_cleanup_error(
+            "process parent changed during cleanup checks",
+        ));
     }
-
-    // Must have no controlling terminal
     if !has_verified_no_controlling_terminal(info.tty_device, info.tty_process_group, info.flags) {
-        return Err("process has a controlling terminal".to_string());
+        return Err(candidate_cleanup_error(
+            "process has a controlling terminal",
+        ));
+    }
+    if info.flags & PROC_FLAG_SLEADER != 0 {
+        return Err(candidate_cleanup_error("process is a session leader"));
+    }
+    if info.process_group == expected.pid {
+        return Err(candidate_cleanup_error(
+            "process is a surviving process-group leader",
+        ));
+    }
+    if service_pids.contains(&expected.pid) {
+        return Err(candidate_cleanup_error("process is a registered service"));
+    }
+    let ownership = verify_enrollment_ownership(
+        system,
+        expected.pid,
+        &info,
+        service_pids,
+        &LiveProcessOwnershipEvidence,
+    )
+    .map_err(candidate_cleanup_error)?;
+    if ownership.kind != OwnershipKind::Orphaned {
+        return Err(candidate_cleanup_error(
+            "process no longer has a verified orphaned ownership state",
+        ));
     }
 
-    // Must not be a registered service
-    if service_pids.contains(&pid) {
-        return Err("process is a registered service".to_string());
+    let process_groups = process_group_snapshot().map_err(|error| {
+        CleanupCheckError::Shared(error.context("process-group membership is unverifiable"))
+    })?;
+    verify_singleton_process_group(expected.pid, info.process_group, &process_groups)?;
+    after_initial_process_group_snapshot();
+
+    // `ps` is an external process and the process-group snapshot can take long
+    // enough for process state to change. Refresh process and service evidence
+    // after it, then make the child check the final safety predicate.
+    let fresh_service_pids = launchd_service_pids()
+        .map_err(|error| CleanupCheckError::Shared(error.context("refresh launchd services")))?;
+    system.refresh_processes(ProcessesToUpdate::All, true);
+    let fresh_process = system.process(Pid::from_u32(expected.pid)).ok_or_else(|| {
+        candidate_cleanup_error("process exited during final cleanup revalidation")
+    })?;
+    let fresh_info = process_info(expected.pid).map_err(|_| {
+        candidate_cleanup_error("process identity is unavailable during final cleanup revalidation")
+    })?;
+    if fresh_info.pid_version != expected.pid_version
+        || fresh_info.start_seconds != expected.start_seconds
+        || fresh_info.start_microseconds != expected.start_microseconds
+        || fresh_info.user_id != expected.user_id
+        || fresh_process.start_time() != expected.start_seconds
+        || system
+            .process(Pid::from_u32(expected.pid))
+            .and_then(|current| current.parent())
+            .map(Pid::as_u32)
+            != Some(fresh_info.parent_pid)
+    {
+        return Err(candidate_cleanup_error(
+            "process identity changed during final cleanup revalidation",
+        ));
+    }
+    verify_final_process_group(expected.pid, info.process_group, &fresh_info)?;
+    if fresh_service_pids.contains(&expected.pid) {
+        return Err(candidate_cleanup_error(
+            "process became a registered service during cleanup verification",
+        ));
+    }
+    let fresh_ownership = verify_enrollment_ownership(
+        system,
+        expected.pid,
+        &fresh_info,
+        &fresh_service_pids,
+        &LiveProcessOwnershipEvidence,
+    )
+    .map_err(candidate_cleanup_error)?;
+    if fresh_ownership.kind != OwnershipKind::Orphaned {
+        return Err(candidate_cleanup_error(
+            "process no longer has a verified orphaned ownership state",
+        ));
+    }
+    if has_direct_child_process(system, expected.pid) {
+        return Err(candidate_cleanup_error("process has child workloads"));
     }
 
-    // For reparented processes (PPID=1), require stricter conditions
-    let parent_pid = system
-        .process(Pid::from_u32(pid))
-        .and_then(|p| p.parent())
-        .map(Pid::as_u32);
+    // Service and ownership queries can take long enough for another orphan
+    // to join the candidate's group. Take a second, final group snapshot after
+    // those queries, then bind it to a fresh process identity before signaling.
+    system.refresh_processes(ProcessesToUpdate::All, true);
+    if has_direct_child_process(system, expected.pid) {
+        return Err(candidate_cleanup_error("process has child workloads"));
+    }
+    let final_process_groups = process_group_snapshot().map_err(|error| {
+        CleanupCheckError::Shared(error.context("final process-group membership is unverifiable"))
+    })?;
+    after_final_process_group_snapshot();
+    let final_info = process_info(expected.pid).map_err(|_| {
+        candidate_cleanup_error("process identity is unavailable after final group snapshot")
+    })?;
+    if final_info.pid != expected.pid
+        || final_info.pid_version != expected.pid_version
+        || final_info.start_seconds != expected.start_seconds
+        || final_info.start_microseconds != expected.start_microseconds
+        || final_info.user_id != expected.user_id
+        || system
+            .process(Pid::from_u32(expected.pid))
+            .is_none_or(|current| current.start_time() != expected.start_seconds)
+        || system
+            .process(Pid::from_u32(expected.pid))
+            .and_then(|current| current.parent())
+            .map(Pid::as_u32)
+            != Some(final_info.parent_pid)
+    {
+        return Err(candidate_cleanup_error(
+            "process identity changed after final group snapshot",
+        ));
+    }
+    verify_final_process_group(expected.pid, info.process_group, &final_info)?;
+    verify_singleton_process_group(
+        expected.pid,
+        final_info.process_group,
+        &final_process_groups,
+    )?;
 
-    if parent_pid == Some(1) {
-        // Must be alone in its process group
-        if info.process_group != info.pid {
-            // Check if the group leader still exists
-            if let Some(leader_process) = system.process(Pid::from_u32(info.process_group)) {
-                if leader_process.start_time() == info.start_seconds {
-                    return Err("process group leader is still alive".to_string());
-                }
-            }
-            // Group leader is dead or PID was reused - still unsafe
-            return Err("process is not alone in its process group".to_string());
-        }
-
-        // Verify no surviving group leader could own it
-        let has_surviving_leader = system.processes().values().any(|p| {
-            let p_pid = p.pid().as_u32();
-            p_pid != pid
-                && p_pid == info.process_group
-                && p.start_time() == info.start_seconds
-        });
-        if has_surviving_leader {
-            return Err("process group leader is still alive".to_string());
-        }
+    // The final `ps` above is external and can outlast a child-state sample.
+    // Refresh the process snapshot after it and keep the leaf predicate last;
+    // no external query follows this check before the signal adapter runs.
+    system.refresh_processes(ProcessesToUpdate::All, true);
+    let final_process = system
+        .process(Pid::from_u32(expected.pid))
+        .ok_or_else(|| candidate_cleanup_error("process exited during final child revalidation"))?;
+    if final_process.start_time() != expected.start_seconds
+        || final_process.parent().map(Pid::as_u32) != Some(final_info.parent_pid)
+    {
+        return Err(candidate_cleanup_error(
+            "process identity changed during final child revalidation",
+        ));
+    }
+    if has_direct_child_process(system, expected.pid) {
+        return Err(candidate_cleanup_error("process has child workloads"));
     }
 
     Ok(())
 }
 
+fn verify_singleton_process_group(
+    expected_pid: u32,
+    verified_group: u32,
+    process_groups: &HashMap<u32, u32>,
+) -> std::result::Result<(), CleanupCheckError> {
+    if process_groups.get(&expected_pid) != Some(&verified_group) {
+        return Err(candidate_cleanup_error(
+            "process group changed during cleanup verification",
+        ));
+    }
+    let members = process_groups
+        .iter()
+        .filter_map(|(pid, group)| (*group == verified_group).then_some(*pid))
+        .collect::<Vec<_>>();
+    if members.as_slice() != [expected_pid] {
+        return Err(candidate_cleanup_error(
+            "process is not alone in its process group",
+        ));
+    }
+    if process_groups.get(&verified_group) == Some(&verified_group) {
+        return Err(candidate_cleanup_error(
+            "process group still has a surviving group leader",
+        ));
+    }
+    Ok(())
+}
 
-fn verify_process_ownership(
+fn verify_final_process_group(
+    expected_pid: u32,
+    verified_group: u32,
+    fresh_info: &ProcessInfo,
+) -> std::result::Result<(), CleanupCheckError> {
+    if fresh_info.pid != expected_pid {
+        return Err(candidate_cleanup_error(
+            "process identity changed during final process-group verification",
+        ));
+    }
+    if fresh_info.process_group != verified_group {
+        return Err(candidate_cleanup_error(
+            "process group changed after membership verification",
+        ));
+    }
+    if fresh_info.process_group == expected_pid || fresh_info.flags & PROC_FLAG_SLEADER != 0 {
+        return Err(candidate_cleanup_error(
+            "process became a session or process-group leader during cleanup verification",
+        ));
+    }
+    if !has_verified_no_controlling_terminal(
+        fresh_info.tty_device,
+        fresh_info.tty_process_group,
+        fresh_info.flags,
+    ) {
+        return Err(candidate_cleanup_error(
+            "process acquired a controlling terminal during cleanup verification",
+        ));
+    }
+    Ok(())
+}
+
+fn candidate_cleanup_error(message: impl Into<String>) -> CleanupCheckError {
+    CleanupCheckError::Candidate(anyhow::Error::msg(message.into()))
+}
+
+fn process_group_snapshot() -> Result<HashMap<u32, u32>> {
+    let output = Command::new("/bin/ps")
+        .args(["-A", "-o", "pid=,pgid="])
+        .output()
+        .context("read the current process-group table")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "ps could not read process groups: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let mut groups = HashMap::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() != 2 {
+            anyhow::bail!("ps returned a malformed process-group row");
+        }
+        let pid = fields[0]
+            .parse::<u32>()
+            .context("parse process PID from ps output")?;
+        let group = fields[1]
+            .parse::<u32>()
+            .context("parse process group from ps output")?;
+        if pid == 0 || group == 0 || groups.insert(pid, group).is_some() {
+            anyhow::bail!("ps returned an invalid or duplicate process-group row");
+        }
+    }
+    if groups.is_empty() {
+        anyhow::bail!("ps returned an empty process-group table");
+    }
+    Ok(groups)
+}
+
+fn verify_enrollment_ownership(
     system: &System,
     pid: u32,
     sampled_identity: &ProcessInfo,
     service_pids: &HashSet<u32>,
     ownership_evidence: &impl ProcessOwnershipEvidence,
-) -> std::result::Result<(), String> {
+) -> std::result::Result<OwnershipAssessment, String> {
     let current_uid = unsafe { libc::getuid() };
-    let process_group = sampled_identity.process_group;
-    if has_direct_child_process(system, pid) {
-        return Err("process has child workloads and cannot be signaled alone".to_string());
-    }
-    if system.process(Pid::from_u32(pid)).is_some() {
-        let parent_pid = ownership_evidence.parent_pid(system, pid);
-        let launchd_unique_id = parent_pid.and_then(|parent_pid| {
-            ownership_evidence
-                .verified_launchd_parent_unique_id(system, service_pids, parent_pid)
-                .map(|unique_id| (parent_pid, unique_id))
-        });
-        if let Some((launchd_pid, launchd_unique_id)) = launchd_unique_id {
-            let process = ownership_evidence.process_info(pid).map_err(|_| {
-                "process identity is unavailable during ownership verification".to_string()
-            })?;
-            if process.pid == sampled_identity.pid
-                && process.pid_version == sampled_identity.pid_version
-                && process.unique_id == sampled_identity.unique_id
-                && process.parent_unique_id == sampled_identity.parent_unique_id
-                && process.parent_pid == sampled_identity.parent_pid
-                && process.start_seconds == sampled_identity.start_seconds
-                && process.start_microseconds == sampled_identity.start_microseconds
-                && process.user_id == sampled_identity.user_id
-                && process.process_group == sampled_identity.process_group
-                && process.flags == sampled_identity.flags
-                && has_verified_no_controlling_terminal(
-                    process.tty_device,
-                    process.tty_process_group,
-                    process.flags,
-                )
-                && is_verified_unmanaged_launchd_child(
-                    &process,
-                    launchd_pid,
-                    launchd_unique_id,
-                    service_pids,
-                )
-            {
-                return Ok(());
-            }
-            return Err(
-                "process origin is a service or cannot be distinguished from reparenting"
-                    .to_string(),
-            );
-        }
-    }
     let mut current = pid;
     for _ in 0..MAX_ANCESTRY_DEPTH {
         let Some(process) = system.process(Pid::from_u32(current)) else {
             return Err("process ancestry is incomplete".to_string());
         };
-        let info = ownership_evidence
-            .process_info(current)
-            .map_err(|_| "process ancestry identity is unavailable".to_string())?;
+        let info = if current == pid {
+            sampled_identity.clone()
+        } else {
+            ownership_evidence
+                .process_info(current)
+                .map_err(|_| "process ancestry identity is unavailable".to_string())?
+        };
         if info.pid != current || info.start_seconds != process.start_time() {
             return Err("process ancestry changed during verification".to_string());
         }
@@ -479,15 +758,14 @@ fn verify_process_ownership(
                 || info.start_microseconds != sampled_identity.start_microseconds
                 || info.user_id != sampled_identity.user_id
                 || info.parent_pid != sampled_identity.parent_pid
+                || info.unique_id != sampled_identity.unique_id
+                || info.parent_unique_id != sampled_identity.parent_unique_id
                 || info.process_group != sampled_identity.process_group)
         {
             return Err("process identity changed during ancestry verification".to_string());
         }
         if info.user_id != current_uid {
             return Err("process ancestry belongs to another user".to_string());
-        }
-        if info.process_group != process_group {
-            return Err("process ancestry crosses a process-group boundary".to_string());
         }
         if !has_verified_no_controlling_terminal(
             info.tty_device,
@@ -500,7 +778,7 @@ fn verify_process_ownership(
             return Err("process tree is registered with launchd".to_string());
         }
         let name = process.name().to_string_lossy();
-        if name.trim().is_empty() || is_protected_owner_name(&name) {
+        if name.trim().is_empty() || (current != pid && is_protected_owner_name(&name)) {
             return Err("process tree has a protected or unknown owner".to_string());
         }
         let executable = process
@@ -517,35 +795,55 @@ fn verify_process_ownership(
 
         let parent = ownership_evidence
             .parent_pid(system, current)
-            .ok_or_else(|| "process parent is unavailable".to_string())?;
+            .ok_or_else(|| "process parent is unavailable or unverifiable".to_string())?;
         if info.parent_pid != parent {
             return Err("process ancestry disagrees across identity sources".to_string());
         }
         if parent == 1 {
-            return Err(
-                "process ownership is unverifiable after reparenting to launchd".to_string(),
-            );
+            let launchd_unique_id = ownership_evidence
+                .verified_launchd_parent_unique_id(system, service_pids, parent)
+                .ok_or_else(|| "launchd parent identity is unavailable".to_string())?;
+            if current != pid {
+                return Ok(OwnershipAssessment {
+                    kind: OwnershipKind::ActiveOwner,
+                    reason: format!("active background owner PID {current} ({name}) remains"),
+                });
+            }
+            let (kind, reason) = if info.parent_unique_id == launchd_unique_id {
+                (
+                    OwnershipKind::LaunchdOwned,
+                    "unregistered process launched by launchd".to_string(),
+                )
+            } else {
+                (
+                    OwnershipKind::Orphaned,
+                    if info.flags & PROC_FLAG_SLEADER != 0 {
+                        "orphaned session leader reparented to launchd".to_string()
+                    } else {
+                        "orphaned and reparented to launchd".to_string()
+                    },
+                )
+            };
+            return Ok(OwnershipAssessment { kind, reason });
         }
         if parent < 1 {
             return Err("process ancestry has an invalid root".to_string());
         }
+        let parent_process = system
+            .process(Pid::from_u32(parent))
+            .ok_or_else(|| "process parent is unavailable from the fresh snapshot".to_string())?;
+        let parent_info = ownership_evidence
+            .process_info(parent)
+            .map_err(|_| "process parent identity is unavailable".to_string())?;
+        if parent_info.pid != parent || parent_info.start_seconds != parent_process.start_time() {
+            return Err("process parent generation changed during verification".to_string());
+        }
+        if info.parent_unique_id != parent_info.unique_id {
+            return Err("process parent generation does not match the live owner".to_string());
+        }
         current = parent;
     }
     Err("process ancestry exceeds the verification limit".to_string())
-}
-
-fn is_verified_unmanaged_launchd_child(
-    process: &ProcessInfo,
-    launchd_pid: u32,
-    launchd_unique_id: u64,
-    service_pids: &HashSet<u32>,
-) -> bool {
-    process.pid > 1
-        && process.parent_pid == launchd_pid
-        && process.parent_unique_id == launchd_unique_id
-        && process.process_group == process.pid
-        && process.flags & PROC_FLAG_SLEADER != 0
-        && !service_pids.contains(&process.pid)
 }
 
 fn verified_launchd_parent_unique_id(
@@ -1217,109 +1515,915 @@ pub(super) fn signal_process_generation(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
-    fn verified_unmanaged_launchd_child_has_a_reachable_ownership_path() {
-        let launchd_unique_id = 100;
-        let mut candidate = ProcessInfo {
+    fn idle_warmed_sample_skips_launchd_service_query() {
+        let query_count = AtomicUsize::new(0);
+        let mut sampler = CpuSampler::default();
+        let _ = sampler.sample_with_service_query(&[], f32::MAX, || {
+            query_count.fetch_add(1, Ordering::Relaxed);
+            Ok(HashSet::new())
+        });
+
+        let snapshot = sampler.sample_with_service_query(&[], f32::MAX, || {
+            query_count.fetch_add(1, Ordering::Relaxed);
+            Ok(HashSet::new())
+        });
+
+        assert!(snapshot.warmed);
+        assert!(snapshot.candidates.is_empty());
+        assert_eq!(query_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn final_process_group_revalidation_rejects_session_changes_after_snapshot() {
+        let verified_group = 41;
+        let changed_session = ProcessInfo {
             pid: 42,
-            parent_pid: 1,
-            parent_unique_id: launchd_unique_id,
             process_group: 42,
             flags: PROC_FLAG_SLEADER,
             ..ProcessInfo::default()
         };
+        assert!(verify_final_process_group(42, verified_group, &changed_session).is_err());
 
-        assert!(is_verified_unmanaged_launchd_child(
-            &candidate,
-            1,
-            launchd_unique_id,
-            &HashSet::new()
-        ));
-
-        candidate.parent_unique_id += 1;
-        assert!(!is_verified_unmanaged_launchd_child(
-            &candidate,
-            1,
-            launchd_unique_id,
-            &HashSet::new()
-        ));
-        candidate.parent_unique_id = launchd_unique_id;
-        assert!(!is_verified_unmanaged_launchd_child(
-            &candidate,
-            1,
-            launchd_unique_id,
-            &HashSet::from([candidate.pid])
-        ));
-        candidate.flags = 0;
-        assert!(!is_verified_unmanaged_launchd_child(
-            &candidate,
-            1,
-            launchd_unique_id,
-            &HashSet::new()
-        ));
+        let changed_group = ProcessInfo {
+            pid: 42,
+            process_group: 43,
+            ..ProcessInfo::default()
+        };
+        assert!(verify_final_process_group(42, verified_group, &changed_group).is_err());
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn verified_cli_candidate_reaches_enrollment_and_cleanup_revalidation() {
+    #[serial_test::serial]
+    fn child_forked_during_executable_verification_prevents_signal() {
+        use std::process::{Child, Stdio};
+
+        struct Fixture {
+            launcher: Child,
+            worker_pid: u32,
+            stop_path: std::path::PathBuf,
+        }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::write(&self.stop_path, b"stop");
+                if let Ok(identity) = process_info(self.worker_pid) {
+                    let _ = signal_process_generation(
+                        self.worker_pid,
+                        identity.pid_version,
+                        libc::SIGTERM,
+                    );
+                }
+                let _ = self.launcher.wait();
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("isolated verification-race fixture");
+        let source = temp.path().join("verification-race.c");
+        let executable = temp.path().join("verification-race");
+        let worker_pid_path = temp.path().join("worker.pid");
+        let child_pid_path = temp.path().join("child.pid");
+        let fork_path = temp.path().join("fork");
+        let stop_path = temp.path().join("stop");
+        std::fs::write(
+            &source,
+            br#"#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+static void save_pid(const char *path) {
+    FILE *file = fopen(path, "w");
+    if (file == NULL) _exit(11);
+    fprintf(file, "%d\n", getpid());
+    fclose(file);
+}
+int main(int argc, char **argv) {
+    if (argc != 5) return 2;
+    if (fork() > 0) return 0;
+    if (setsid() < 0) _exit(3);
+    if (fork() > 0) return 0;
+    save_pid(argv[1]);
+    int spawned = 0;
+    volatile uint64_t counter = 0;
+    for (;;) {
+        counter++;
+        if ((counter & 0xfffff) == 0) {
+            if (access(argv[4], F_OK) == 0) return 0;
+            if (!spawned && access(argv[2], F_OK) == 0) {
+                pid_t child = fork();
+                if (child < 0) _exit(4);
+                if (child == 0) {
+                    if (setpgid(0, 0) != 0) _exit(5);
+                    save_pid(argv[3]);
+                    while (access(argv[4], F_OK) != 0) usleep(10000);
+                    _exit(0);
+                }
+                spawned = 1;
+            }
+        }
+    }
+}
+"#,
+        )
+        .expect("write synthetic process source");
+        let compile = Command::new("/usr/bin/clang")
+            .arg(&source)
+            .arg("-o")
+            .arg(&executable)
+            .output()
+            .expect("compile synthetic process fixture");
+        assert!(
+            compile.status.success(),
+            "clang failed: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let sign = Command::new("/usr/bin/codesign")
+            .args(["--force", "--sign", "-"])
+            .arg(&executable)
+            .output()
+            .expect("ad-hoc sign synthetic process fixture");
+        assert!(
+            sign.status.success(),
+            "codesign failed: {}",
+            String::from_utf8_lossy(&sign.stderr)
+        );
+
+        let mut launcher = Command::new(&executable)
+            .arg(&worker_pid_path)
+            .arg(&fork_path)
+            .arg(&child_pid_path)
+            .arg(&stop_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start detached synthetic worker");
+        assert!(launcher.wait().expect("reap fixture launcher").success());
+        let worker_pid = (0..100)
+            .find_map(|_| {
+                std::fs::read_to_string(&worker_pid_path)
+                    .ok()
+                    .and_then(|value| value.trim().parse::<u32>().ok())
+                    .or_else(|| {
+                        std::thread::sleep(Duration::from_millis(20));
+                        None
+                    })
+            })
+            .expect("read detached worker PID");
+        let fixture = Fixture {
+            launcher,
+            worker_pid,
+            stop_path: stop_path.clone(),
+        };
+
+        let result = (|| -> Result<()> {
+            let mut system = System::new_all();
+            let mut candidate = None;
+            let mut classification_error = None;
+            for _ in 0..100 {
+                system.refresh_processes(ProcessesToUpdate::All, true);
+                if let Some(process) = system.process(Pid::from_u32(worker_pid)) {
+                    match classify_process(&system, worker_pid, process, &launchd_service_pids()?) {
+                        Ok(found) => {
+                            candidate = Some(found);
+                            break;
+                        }
+                        Err(error) => classification_error = Some(error),
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let candidate = candidate.context(format!(
+                "classify isolated orphaned worker: {classification_error:?}"
+            ))?;
+            anyhow::ensure!(candidate.ownership == OwnershipKind::Orphaned);
+            let signals = std::cell::Cell::new(0);
+            let result = super::super::send_signal_with(
+                &candidate,
+                libc::SIGTERM,
+                |identity| {
+                    verify_current_identity_inner(
+                        identity,
+                        &[],
+                        || {
+                            std::fs::write(&fork_path, b"fork").expect("trigger child creation");
+                            for _ in 0..100 {
+                                if child_pid_path.exists() {
+                                    return;
+                                }
+                                std::thread::sleep(Duration::from_millis(10));
+                            }
+                            panic!("synthetic worker did not create its child");
+                        },
+                        || {},
+                        || {},
+                    )
+                    .map_err(|error| anyhow::anyhow!("{error:?}"))
+                },
+                |_, _| {
+                    signals.set(signals.get() + 1);
+                    Ok(())
+                },
+            );
+            anyhow::ensure!(
+                result.is_err(),
+                "candidate with a new child passed revalidation"
+            );
+            anyhow::ensure!(signals.get() == 0, "unsafe candidate received a signal");
+            Ok(())
+        })();
+        drop(fixture);
+        result.expect("revalidate child relationships after executable verification");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[serial_test::serial]
+    fn child_spawned_during_final_group_snapshot_withholds_signal() {
+        use std::process::{Child, Stdio};
+
+        struct Fixture {
+            launcher: Child,
+            worker_pid: Option<u32>,
+            child_pid: Option<u32>,
+            stop_path: std::path::PathBuf,
+        }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::write(&self.stop_path, b"stop");
+                for pid in [self.worker_pid, self.child_pid].into_iter().flatten() {
+                    if let Ok(identity) = process_info(pid) {
+                        let _ = signal_process_generation(pid, identity.pid_version, libc::SIGTERM);
+                    }
+                }
+                let _ = self.launcher.wait();
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("isolated final-child-check fixture");
+        let source = temp.path().join("final-child-check.c");
+        let executable = temp.path().join("final-child-check");
+        let leader_pid_path = temp.path().join("leader.pid");
+        let worker_pid_path = temp.path().join("worker.pid");
+        let spawn_child_path = temp.path().join("spawn-child");
+        let child_pid_path = temp.path().join("child.pid");
+        let stop_path = temp.path().join("stop");
+        std::fs::write(
+            &source,
+            br#"#include <stdio.h>
+#include <unistd.h>
+static void save_pid(const char *path) {
+    FILE *file = fopen(path, "w");
+    if (file == NULL) _exit(11);
+    fprintf(file, "%d\n", getpid());
+    fclose(file);
+}
+static void wait_for_stop(const char *path) {
+    for (;;) {
+        if (access(path, F_OK) == 0) _exit(0);
+        usleep(10000);
+    }
+}
+int main(int argc, char **argv) {
+    if (argc != 6) return 2;
+    if (fork() > 0) return 0;
+    if (setsid() < 0) _exit(3);
+    save_pid(argv[1]);
+    if (fork() > 0) return 0;
+    save_pid(argv[2]);
+    int forked = 0;
+    for (;;) {
+        if (access(argv[5], F_OK) == 0) return 0;
+        if (!forked && access(argv[3], F_OK) == 0) {
+            forked = 1;
+            pid_t child = fork();
+            if (child < 0) _exit(4);
+            if (child == 0) {
+                if (setpgid(0, 0) < 0) _exit(5);
+                save_pid(argv[4]);
+                wait_for_stop(argv[5]);
+            }
+        }
+        usleep(10000);
+    }
+}
+"#,
+        )
+        .expect("write synthetic final-child-check process");
+        let compile = Command::new("/usr/bin/clang")
+            .args(["-O2", "-o"])
+            .arg(&executable)
+            .arg(&source)
+            .output()
+            .expect("compile synthetic final-child-check process");
+        assert!(
+            compile.status.success(),
+            "clang failed: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let sign = Command::new("/usr/bin/codesign")
+            .args(["--force", "--sign", "-", "--timestamp=none"])
+            .arg(&executable)
+            .output()
+            .expect("sign synthetic final-child-check process");
+        assert!(
+            sign.status.success(),
+            "codesign failed: {}",
+            String::from_utf8_lossy(&sign.stderr)
+        );
+
+        let launcher = Command::new(&executable)
+            .arg(&leader_pid_path)
+            .arg(&worker_pid_path)
+            .arg(&spawn_child_path)
+            .arg(&child_pid_path)
+            .arg(&stop_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start synthetic final-child-check fixture");
+        let mut fixture = Fixture {
+            launcher,
+            worker_pid: None,
+            child_pid: None,
+            stop_path: stop_path.clone(),
+        };
+        assert!(fixture
+            .launcher
+            .wait()
+            .expect("reap fixture launcher")
+            .success());
+        let read_pid = |path: &std::path::Path| {
+            (0..100).find_map(|_| {
+                std::fs::read_to_string(path)
+                    .ok()
+                    .and_then(|value| value.trim().parse::<u32>().ok())
+                    .or_else(|| {
+                        std::thread::sleep(Duration::from_millis(20));
+                        None
+                    })
+            })
+        };
+        let worker_pid = read_pid(&worker_pid_path).expect("read synthetic worker PID");
+        fixture.worker_pid = Some(worker_pid);
+        let leader_pid = read_pid(&leader_pid_path).expect("read synthetic group leader PID");
+
+        let result = (|| -> Result<()> {
+            let mut system = System::new_all();
+            let mut candidate = None;
+            let mut classification_error = None;
+            for _ in 0..100 {
+                system.refresh_processes(ProcessesToUpdate::All, true);
+                if let Some(process) = system.process(Pid::from_u32(worker_pid)) {
+                    match classify_process(&system, worker_pid, process, &launchd_service_pids()?) {
+                        Ok(found) => {
+                            candidate = Some(found);
+                            break;
+                        }
+                        Err(error) => classification_error = Some(error),
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let candidate = candidate.context(format!(
+                "classify isolated orphaned worker: {classification_error:?}"
+            ))?;
+            anyhow::ensure!(candidate.ownership == OwnershipKind::Orphaned);
+            let before = process_info(worker_pid)?;
+            anyhow::ensure!(before.process_group == leader_pid);
+            anyhow::ensure!(before.process_group != worker_pid);
+            anyhow::ensure!(before.flags & PROC_FLAG_SLEADER == 0);
+            let initial_groups = process_group_snapshot()?;
+            verify_singleton_process_group(worker_pid, before.process_group, &initial_groups)
+                .map_err(|error| anyhow::anyhow!("initial group is not singleton: {error:?}"))?;
+
+            let signals = std::cell::Cell::new(0);
+            let result = super::super::send_signal_with(
+                &candidate,
+                libc::SIGTERM,
+                |identity| {
+                    verify_current_identity_inner(
+                        identity,
+                        &[],
+                        || {},
+                        || {},
+                        || {
+                            std::fs::write(&spawn_child_path, b"spawn")
+                                .expect("request synthetic child during final group snapshot");
+                            for _ in 0..100 {
+                                if child_pid_path.exists() {
+                                    return;
+                                }
+                                std::thread::sleep(Duration::from_millis(10));
+                            }
+                            panic!("synthetic worker did not spawn its separate-group child");
+                        },
+                    )
+                    .map_err(|error| anyhow::anyhow!("{error:?}"))
+                },
+                |_, _| {
+                    signals.set(signals.get() + 1);
+                    Ok(())
+                },
+            );
+            let error =
+                result.expect_err("candidate with a new child passed final cleanup revalidation");
+            anyhow::ensure!(
+                format!("{error:#}").contains("process has child workloads"),
+                "candidate was rejected for an unrelated reason: {error:#}"
+            );
+            let child_pid = read_pid(&child_pid_path).context("read spawned child PID")?;
+            fixture.child_pid = Some(child_pid);
+            let after = process_info(worker_pid)?;
+            let child_info = process_info(child_pid)?;
+            anyhow::ensure!(after.pid_version == before.pid_version);
+            anyhow::ensure!(after.process_group == before.process_group);
+            anyhow::ensure!(after.flags & PROC_FLAG_SLEADER == 0);
+            anyhow::ensure!(child_info.parent_pid == worker_pid);
+            anyhow::ensure!(child_info.process_group == child_pid);
+            anyhow::ensure!(child_info.process_group != after.process_group);
+            anyhow::ensure!(signals.get() == 0, "unsafe synthetic process was signaled");
+            Ok(())
+        })();
+        drop(fixture);
+        result.expect("revalidate child workloads after final process-group query");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[serial_test::serial]
+    fn session_change_after_process_group_snapshot_withholds_signal() {
+        use std::process::{Child, Stdio};
+
+        struct Fixture {
+            launcher: Child,
+            worker_pid: u32,
+            stop_path: std::path::PathBuf,
+        }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::write(&self.stop_path, b"stop");
+                if let Ok(identity) = process_info(self.worker_pid) {
+                    let _ = signal_process_generation(
+                        self.worker_pid,
+                        identity.pid_version,
+                        libc::SIGTERM,
+                    );
+                }
+                let _ = self.launcher.wait();
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("isolated session-race fixture");
+        let source = temp.path().join("session-race.c");
+        let executable = temp.path().join("session-race");
+        let leader_pid_path = temp.path().join("leader.pid");
+        let worker_pid_path = temp.path().join("worker.pid");
+        let change_session_path = temp.path().join("change-session");
+        let session_changed_path = temp.path().join("session-changed");
+        let stop_path = temp.path().join("stop");
+        std::fs::write(
+            &source,
+            br#"#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+static void save_pid(const char *path) {
+    FILE *file = fopen(path, "w");
+    if (file == NULL) _exit(11);
+    fprintf(file, "%d\n", getpid());
+    fclose(file);
+}
+int main(int argc, char **argv) {
+    if (argc != 6) return 2;
+    if (fork() > 0) return 0;
+    if (setsid() < 0) _exit(3);
+    save_pid(argv[1]);
+    if (fork() > 0) return 0;
+    save_pid(argv[2]);
+    for (;;) {
+        if (access(argv[5], F_OK) == 0) return 0;
+        if (access(argv[3], F_OK) == 0 && access(argv[4], F_OK) != 0) {
+            if (setsid() < 0) _exit(4);
+            save_pid(argv[4]);
+        }
+        usleep(10000);
+    }
+}
+"#,
+        )
+        .expect("write synthetic session-race process");
+        let compile = Command::new("/usr/bin/clang")
+            .args(["-O2", "-o"])
+            .arg(&executable)
+            .arg(&source)
+            .output()
+            .expect("compile synthetic session-race process");
+        assert!(
+            compile.status.success(),
+            "clang failed: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let sign = Command::new("/usr/bin/codesign")
+            .args(["--force", "--sign", "-", "--timestamp=none"])
+            .arg(&executable)
+            .output()
+            .expect("sign synthetic session-race process");
+        assert!(
+            sign.status.success(),
+            "codesign failed: {}",
+            String::from_utf8_lossy(&sign.stderr)
+        );
+
+        let mut launcher = Command::new(&executable)
+            .arg(&leader_pid_path)
+            .arg(&worker_pid_path)
+            .arg(&change_session_path)
+            .arg(&session_changed_path)
+            .arg(&stop_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start synthetic session-race process");
+        assert!(launcher.wait().expect("reap fixture launcher").success());
+        let worker_pid = (0..100)
+            .find_map(|_| {
+                std::fs::read_to_string(&worker_pid_path)
+                    .ok()
+                    .and_then(|value| value.trim().parse::<u32>().ok())
+                    .or_else(|| {
+                        std::thread::sleep(Duration::from_millis(20));
+                        None
+                    })
+            })
+            .expect("read synthetic worker PID");
+        let fixture = Fixture {
+            launcher,
+            worker_pid,
+            stop_path,
+        };
+
+        let result = (|| -> Result<()> {
+            let mut system = System::new_all();
+            let mut candidate = None;
+            let mut classification_error = None;
+            for _ in 0..100 {
+                system.refresh_processes(ProcessesToUpdate::All, true);
+                if let Some(process) = system.process(Pid::from_u32(worker_pid)) {
+                    match classify_process(&system, worker_pid, process, &launchd_service_pids()?) {
+                        Ok(found) => {
+                            candidate = Some(found);
+                            break;
+                        }
+                        Err(error) => classification_error = Some(error),
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let candidate = candidate.context(format!(
+                "classify isolated orphaned worker: {classification_error:?}"
+            ))?;
+            anyhow::ensure!(candidate.ownership == OwnershipKind::Orphaned);
+            let before = process_info(worker_pid)?;
+            anyhow::ensure!(before.process_group != worker_pid);
+            anyhow::ensure!(before.flags & PROC_FLAG_SLEADER == 0);
+
+            let signals = std::cell::Cell::new(0);
+            let result = super::super::send_signal_with(
+                &candidate,
+                libc::SIGTERM,
+                |identity| {
+                    verify_current_identity_inner(
+                        identity,
+                        &[],
+                        || {},
+                        || {
+                            std::fs::write(&change_session_path, b"change")
+                                .expect("request synthetic session change");
+                            for _ in 0..100 {
+                                if session_changed_path.exists() {
+                                    return;
+                                }
+                                std::thread::sleep(Duration::from_millis(10));
+                            }
+                            panic!("synthetic process did not become a session leader");
+                        },
+                        || {},
+                    )
+                    .map_err(|error| anyhow::anyhow!("{error:?}"))
+                },
+                |_, _| {
+                    signals.set(signals.get() + 1);
+                    Ok(())
+                },
+            );
+            anyhow::ensure!(
+                result.is_err(),
+                "session change after group snapshot passed cleanup revalidation"
+            );
+            let after = process_info(worker_pid)?;
+            anyhow::ensure!(after.process_group == worker_pid);
+            anyhow::ensure!(after.flags & PROC_FLAG_SLEADER != 0);
+            anyhow::ensure!(signals.get() == 0, "unsafe synthetic process was signaled");
+            Ok(())
+        })();
+        drop(fixture);
+        result.expect("revalidate session and process-group state after its snapshot");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[serial_test::serial]
+    fn process_group_member_joined_after_snapshot_withholds_signal() {
+        use std::process::{Child, Stdio};
+
+        struct Fixture {
+            launcher: Child,
+            worker_pid: Option<u32>,
+            peer_pid: Option<u32>,
+            stop_path: std::path::PathBuf,
+        }
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::write(&self.stop_path, b"stop");
+                for pid in [self.worker_pid, self.peer_pid].into_iter().flatten() {
+                    if let Ok(identity) = process_info(pid) {
+                        let _ = signal_process_generation(pid, identity.pid_version, libc::SIGTERM);
+                    }
+                }
+                let _ = self.launcher.wait();
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("isolated process-group-race fixture");
+        let source = temp.path().join("process-group-race.c");
+        let executable = temp.path().join("process-group-race");
+        let leader_pid_path = temp.path().join("leader.pid");
+        let worker_pid_path = temp.path().join("worker.pid");
+        let peer_pid_path = temp.path().join("peer.pid");
+        let join_group_path = temp.path().join("join-group");
+        let joined_group_path = temp.path().join("joined-group");
+        let stop_path = temp.path().join("stop");
+        std::fs::write(
+            &source,
+            br#"#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+static void save_pid(const char *path) {
+    FILE *file = fopen(path, "w");
+    if (file == NULL) _exit(11);
+    fprintf(file, "%d\n", getpid());
+    fclose(file);
+}
+static void wait_for_stop(const char *path) {
+    for (;;) {
+        if (access(path, F_OK) == 0) _exit(0);
+        usleep(10000);
+    }
+}
+int main(int argc, char **argv) {
+    if (argc != 7) return 2;
+    if (fork() > 0) return 0;
+    if (setsid() < 0) _exit(3);
+    save_pid(argv[1]);
+    pid_t worker = fork();
+    if (worker < 0) _exit(4);
+    if (worker == 0) {
+        save_pid(argv[2]);
+        wait_for_stop(argv[6]);
+    }
+    pid_t peer = fork();
+    if (peer < 0) _exit(5);
+    if (peer == 0) {
+        if (setpgid(0, 0) < 0) _exit(6);
+        save_pid(argv[3]);
+        for (;;) {
+            if (access(argv[6], F_OK) == 0) _exit(0);
+            if (access(argv[4], F_OK) == 0 && access(argv[5], F_OK) != 0) {
+                FILE *leader = fopen(argv[1], "r");
+                long group = 0;
+                if (leader == NULL || fscanf(leader, "%ld", &group) != 1) _exit(7);
+                fclose(leader);
+                if (setpgid(0, (pid_t)group) < 0) _exit(8);
+                FILE *joined = fopen(argv[5], "w");
+                if (joined == NULL) _exit(9);
+                fputs("joined\n", joined);
+                fclose(joined);
+            }
+            usleep(10000);
+        }
+    }
+    return 0;
+}
+"#,
+        )
+        .expect("write synthetic process-group-race process");
+        let compile = Command::new("/usr/bin/clang")
+            .args(["-O2", "-o"])
+            .arg(&executable)
+            .arg(&source)
+            .output()
+            .expect("compile synthetic process-group-race process");
+        assert!(
+            compile.status.success(),
+            "clang failed: {}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let sign = Command::new("/usr/bin/codesign")
+            .args(["--force", "--sign", "-", "--timestamp=none"])
+            .arg(&executable)
+            .output()
+            .expect("sign synthetic process-group-race process");
+        assert!(
+            sign.status.success(),
+            "codesign failed: {}",
+            String::from_utf8_lossy(&sign.stderr)
+        );
+
+        let launcher = Command::new(&executable)
+            .arg(&leader_pid_path)
+            .arg(&worker_pid_path)
+            .arg(&peer_pid_path)
+            .arg(&join_group_path)
+            .arg(&joined_group_path)
+            .arg(&stop_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start synthetic process-group-race fixture");
+        let mut fixture = Fixture {
+            launcher,
+            worker_pid: None,
+            peer_pid: None,
+            stop_path: stop_path.clone(),
+        };
+        assert!(fixture
+            .launcher
+            .wait()
+            .expect("reap fixture launcher")
+            .success());
+        let read_pid = |path: &std::path::Path| {
+            (0..100).find_map(|_| {
+                std::fs::read_to_string(path)
+                    .ok()
+                    .and_then(|value| value.trim().parse::<u32>().ok())
+                    .or_else(|| {
+                        std::thread::sleep(Duration::from_millis(20));
+                        None
+                    })
+            })
+        };
+        let worker_pid = read_pid(&worker_pid_path).expect("read synthetic worker PID");
+        fixture.worker_pid = Some(worker_pid);
+        let peer_pid = read_pid(&peer_pid_path).expect("read synthetic peer PID");
+        fixture.peer_pid = Some(peer_pid);
+        let leader_pid = read_pid(&leader_pid_path).expect("read synthetic session leader PID");
+
+        let result = (|| -> Result<()> {
+            let mut system = System::new_all();
+            let mut candidate = None;
+            let mut classification_error = None;
+            for _ in 0..100 {
+                system.refresh_processes(ProcessesToUpdate::All, true);
+                if let Some(process) = system.process(Pid::from_u32(worker_pid)) {
+                    match classify_process(&system, worker_pid, process, &launchd_service_pids()?) {
+                        Ok(found) => {
+                            candidate = Some(found);
+                            break;
+                        }
+                        Err(error) => classification_error = Some(error),
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            let candidate = candidate.context(format!(
+                "classify isolated orphaned worker: {classification_error:?}"
+            ))?;
+            anyhow::ensure!(candidate.ownership == OwnershipKind::Orphaned);
+            let before = process_info(worker_pid)?;
+            let peer_before = process_info(peer_pid)?;
+            anyhow::ensure!(before.process_group == leader_pid);
+            anyhow::ensure!(before.process_group != worker_pid);
+            anyhow::ensure!(before.flags & PROC_FLAG_SLEADER == 0);
+            anyhow::ensure!(peer_before.process_group == peer_pid);
+            let initial_groups = process_group_snapshot()?;
+            anyhow::ensure!(initial_groups.get(&leader_pid) != Some(&leader_pid));
+            verify_singleton_process_group(worker_pid, before.process_group, &initial_groups)
+                .map_err(|error| anyhow::anyhow!("initial group is not singleton: {error:?}"))?;
+
+            let signals = std::cell::Cell::new(0);
+            let result = super::super::send_signal_with(
+                &candidate,
+                libc::SIGTERM,
+                |identity| {
+                    verify_current_identity_inner(
+                        identity,
+                        &[],
+                        || {},
+                        || {
+                            std::fs::write(&join_group_path, b"join")
+                                .expect("request synthetic peer to join candidate group");
+                            for _ in 0..100 {
+                                if joined_group_path.exists() {
+                                    return;
+                                }
+                                std::thread::sleep(Duration::from_millis(10));
+                            }
+                            panic!("synthetic peer did not join candidate process group");
+                        },
+                        || {},
+                    )
+                    .map_err(|error| anyhow::anyhow!("{error:?}"))
+                },
+                |_, _| {
+                    signals.set(signals.get() + 1);
+                    Ok(())
+                },
+            );
+            let error = result.expect_err(
+                "candidate passed cleanup revalidation after a peer joined its process group",
+            );
+            anyhow::ensure!(
+                format!("{error:#}").contains("process is not alone in its process group"),
+                "candidate was rejected for an unrelated reason: {error:#}"
+            );
+            let after = process_info(worker_pid)?;
+            let peer_after = process_info(peer_pid)?;
+            anyhow::ensure!(after.process_group == before.process_group);
+            anyhow::ensure!(after.pid_version == before.pid_version);
+            anyhow::ensure!(after.flags & PROC_FLAG_SLEADER == 0);
+            anyhow::ensure!(peer_after.process_group == before.process_group);
+            anyhow::ensure!(signals.get() == 0, "unsafe synthetic process was signaled");
+            Ok(())
+        })();
+        drop(fixture);
+        result.expect("revalidate process-group membership after launchd queries");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[serial_test::serial]
+    fn orphaned_nonleader_reaches_enrollment_and_passes_approved_cleanup() {
         use super::super::policy::{Decision, DecisionResponse};
         use std::process::{Child, Stdio};
 
-        struct ModeledLaunchdChild {
-            pid: u32,
-            info: ProcessInfo,
-        }
-        impl ProcessOwnershipEvidence for ModeledLaunchdChild {
-            fn process_info(&self, pid: u32) -> std::result::Result<ProcessInfo, String> {
-                if pid == self.pid {
-                    return Ok(self.info.clone());
-                }
-                super::process_info(pid).map_err(|error| error.to_string())
-            }
-
-            fn parent_pid(&self, system: &System, pid: u32) -> Option<u32> {
-                if pid == self.pid {
-                    Some(self.info.parent_pid)
-                } else {
-                    system
-                        .process(Pid::from_u32(pid))?
-                        .parent()
-                        .map(Pid::as_u32)
-                }
-            }
-
-            fn verified_launchd_parent_unique_id(
-                &self,
-                system: &System,
-                service_pids: &HashSet<u32>,
-                launchd_pid: u32,
-            ) -> Option<u64> {
-                super::verified_launchd_parent_unique_id(system, service_pids, launchd_pid)
-            }
-        }
-
         struct FixtureProcess {
-            child: Child,
+            launcher: Child,
+            worker_pid: u32,
             stop_path: std::path::PathBuf,
         }
         impl Drop for FixtureProcess {
             fn drop(&mut self) {
                 let _ = std::fs::write(&self.stop_path, b"stop");
-                if self.child.try_wait().ok().flatten().is_none() {
-                    let _ = self.child.kill();
+                if let Ok(identity) = process_info(self.worker_pid) {
+                    let _ = signal_process_generation(
+                        self.worker_pid,
+                        identity.pid_version,
+                        libc::SIGTERM,
+                    );
                 }
-                let _ = self.child.wait();
+                let _ = self.launcher.wait();
             }
         }
 
         let temp = tempfile::tempdir().expect("isolated candidate fixture");
         let source = temp.path().join("eligible-cli.c");
         let executable = temp.path().join("eligible-cli");
+        let leader_path = temp.path().join("leader.pid");
+        let worker_path = temp.path().join("worker.pid");
         let stop_path = temp.path().join("stop");
         std::fs::write(
             &source,
-            b"#include <stdint.h>\n#include <unistd.h>\nint main(int argc, char **argv) { if (setsid() < 0) return 2; volatile uint64_t n = 0; for (;;) { n++; if ((n & 0xfffff) == 0 && access(argv[1], F_OK) == 0) return 0; } }\n",
+            br#"#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+static void save_pid(const char *path) {
+    FILE *file = fopen(path, "w");
+    if (file == NULL) _exit(11);
+    fprintf(file, "%d\n", getpid());
+    fclose(file);
+}
+int main(int argc, char **argv) {
+    if (argc != 4) return 2;
+    if (fork() > 0) return 0;
+    if (setsid() < 0) _exit(3);
+    save_pid(argv[1]);
+    pid_t worker = fork();
+    if (worker < 0) _exit(4);
+    if (worker > 0) _exit(0);
+    save_pid(argv[2]);
+    volatile uint64_t counter = 0;
+    for (;;) {
+        counter++;
+        if ((counter & 0xfffff) == 0 && access(argv[3], F_OK) == 0) return 0;
+    }
+}
+"#,
         )
         .expect("write isolated CLI fixture");
         let compile = Command::new("/usr/bin/clang")
@@ -1344,63 +2448,80 @@ mod tests {
             String::from_utf8_lossy(&sign.stderr)
         );
 
-        let child = Command::new(&executable)
+        let mut launcher = Command::new(&executable)
+            .arg(&leader_path)
+            .arg(&worker_path)
             .arg(&stop_path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .expect("start isolated CLI fixture");
-        let fixture = FixtureProcess { child, stop_path };
+        let launcher_status = launcher.wait().expect("reap isolated launcher");
+        assert!(launcher_status.success());
+        for _ in 0..100 {
+            if leader_path.exists() && worker_path.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let leader_pid = std::fs::read_to_string(&leader_path)
+            .expect("read process-group leader PID")
+            .trim()
+            .parse::<u32>()
+            .expect("valid process-group leader PID");
+        let worker_pid = std::fs::read_to_string(&worker_path)
+            .expect("read orphaned worker PID")
+            .trim()
+            .parse::<u32>()
+            .expect("valid orphaned worker PID");
+        let fixture = FixtureProcess {
+            launcher,
+            worker_pid,
+            stop_path,
+        };
         let result = (|| -> anyhow::Result<()> {
             let mut system = System::new_all();
-            system.refresh_processes(ProcessesToUpdate::All, true);
-            let pid = fixture.child.id();
-            for _ in 0..5 {
+            let mut ready = false;
+            for _ in 0..12 {
                 std::thread::sleep(Duration::from_secs(1));
                 system.refresh_processes(ProcessesToUpdate::All, true);
-                if system
-                    .process(Pid::from_u32(pid))
-                    .is_some_and(|process| process.cpu_usage() > CPU_THRESHOLD)
-                {
+                let orphaned = process_info(worker_pid)
+                    .is_ok_and(|info| info.parent_pid == 1 && info.process_group == leader_pid);
+                let leader_exited = process_info(leader_pid).is_err();
+                let high_cpu = system
+                    .process(Pid::from_u32(worker_pid))
+                    .is_some_and(|process| process.cpu_usage() > CPU_THRESHOLD);
+                if orphaned && leader_exited && high_cpu {
+                    ready = true;
                     break;
                 }
             }
+            anyhow::ensure!(
+                ready,
+                "synthetic orphan did not reach the PGID != PID fixture state"
+            );
             let process = system
-                .process(Pid::from_u32(pid))
+                .process(Pid::from_u32(worker_pid))
                 .context("find isolated high-CPU CLI")?;
-            assert!(process.cpu_usage() > CPU_THRESHOLD);
             let service_pids = launchd_service_pids()?;
-            let launchd_unique_id = verified_launchd_parent_unique_id(&system, &service_pids, 1)
-                .context("verify launchd generation for the ownership fixture")?;
-            // Model libproc's complete view of an unmanaged launchd child; the production
-            // ownership verifier still evaluates every field and protection itself.
-            let ownership_evidence = ModeledLaunchdChild {
-                pid,
-                info: ProcessInfo {
-                    pid,
-                    pid_version: 1,
-                    unique_id: u64::from(pid),
-                    parent_unique_id: launchd_unique_id,
-                    parent_pid: 1,
-                    user_id: unsafe { libc::getuid() },
-                    process_group: pid,
-                    flags: PROC_FLAG_SLEADER,
-                    tty_device: NO_TTY_DEVICE,
-                    tty_process_group: 0,
-                    start_seconds: process.start_time(),
-                    start_microseconds: 0,
-                },
-            };
-            let candidate = classify_process_with_evidence(
-                &system,
-                pid,
-                process,
-                &service_pids,
-                &ownership_evidence,
-            )
-            .map_err(anyhow::Error::msg)?;
+            let candidate = classify_process(&system, worker_pid, process, &service_pids)
+                .map_err(anyhow::Error::msg)?;
             assert!(candidate.cpu_percent > CPU_THRESHOLD);
+            assert_eq!(candidate.ownership, OwnershipKind::Orphaned);
+            assert_eq!(candidate.identity.pid, worker_pid);
+            let identity = process_info(worker_pid)?;
+            assert_eq!(identity.process_group, leader_pid);
+            assert_ne!(identity.process_group, worker_pid);
+            assert_eq!(identity.flags & PROC_FLAG_SLEADER, 0);
+            assert!(candidate.reason.contains("reparented to launchd"));
+            let mut registered_service_pids = service_pids.clone();
+            registered_service_pids.insert(worker_pid);
+            anyhow::ensure!(
+                is_cleanup_eligible(&mut system, &candidate.identity, &registered_service_pids,)
+                    .is_err(),
+                "registered service fixture passed cleanup eligibility"
+            );
 
             let now = Instant::now();
             let mut discovery = HashMap::new();
@@ -1425,6 +2546,7 @@ mod tests {
 
             let mut policy = super::super::PolicyFile::default();
             let request = super::super::new_pending(&candidate, chrono::Utc::now().to_rfc3339())?;
+            assert!(request.reason.contains("reparented to launchd"));
             policy
                 .pending
                 .insert(request.request_id.clone(), request.clone());
@@ -1455,7 +2577,7 @@ mod tests {
             );
             assert_eq!(
                 super::super::cleanup_action(
-                    post_approval_tracking.get(&pid),
+                    post_approval_tracking.get(&worker_pid),
                     None,
                     Duration::from_secs(60),
                     approval_start + Duration::from_secs(59),
@@ -1464,7 +2586,7 @@ mod tests {
             );
             assert_eq!(
                 super::super::cleanup_action(
-                    post_approval_tracking.get(&pid),
+                    post_approval_tracking.get(&worker_pid),
                     None,
                     Duration::from_secs(60),
                     approval_start + Duration::from_secs(60),
@@ -1476,53 +2598,45 @@ mod tests {
             let lock = store.lock()?;
             lock.save(&policy)?;
             let persisted = lock.load()?;
+            anyhow::ensure!(
+                persisted.approval_for(&candidate.identity).is_some(),
+                "approval was not durable before cleanup"
+            );
             let signals = std::cell::Cell::new(0);
-            super::super::send_signal_with_policy_persistence(
+            let result = super::super::send_signal_with_policy_persistence(
                 &candidate,
                 libc::SIGTERM,
-                || {
-                    anyhow::ensure!(
-                        persisted.approval_for(&candidate.identity).is_some(),
-                        "approval was not durable before cleanup"
-                    );
-                    lock.save(&persisted)
-                },
+                || lock.save(&persisted),
                 |expected| {
-                    let mut current_system = System::new_all();
-                    current_system.refresh_processes(ProcessesToUpdate::All, true);
-                    let current_process = current_system
-                        .process(Pid::from_u32(expected.pid))
-                        .context("candidate exited before signal revalidation")?;
-                    let current = classify_process_with_evidence(
-                        &current_system,
-                        expected.pid,
-                        current_process,
-                        &service_pids,
-                        &ownership_evidence,
-                    )
-                    .map_err(anyhow::Error::msg)?;
-                    anyhow::ensure!(
-                        current.identity == *expected,
-                        "process identity changed before cleanup"
-                    );
-                    anyhow::ensure!(
-                        persisted.approval_for(&current.identity).is_some(),
-                        "approval no longer matches the candidate"
-                    );
-                    Ok(())
+                    verify_current_identity(expected, &[])
+                        .map_err(|error| anyhow::anyhow!("{error:?}"))
                 },
                 |identity, signal| {
-                    assert_eq!(identity.pid, pid);
+                    assert_eq!(identity.pid, worker_pid);
                     assert_eq!(signal, libc::SIGTERM);
-                    signals.set(signals.get() + 1);
-                    Ok(())
+                    let result =
+                        signal_process_generation(identity.pid, identity.pid_version, signal);
+                    if result.is_ok() {
+                        signals.set(signals.get() + 1);
+                    }
+                    result
                 },
-            )?;
-            assert_eq!(signals.get(), 1);
-            Ok(())
+            );
+            result?;
+            anyhow::ensure!(
+                signals.get() == 1,
+                "safe orphan did not receive one SIGTERM"
+            );
+            for _ in 0..50 {
+                if process_info(worker_pid).is_err() {
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            anyhow::bail!("synthetic orphan did not exit after its verified SIGTERM");
         })();
         drop(fixture);
-        result.expect("exercise isolated candidate enrollment and cleanup flow");
+        result.expect("enroll and clean up a safe synthetic orphan with PGID != PID");
     }
 
     #[test]
@@ -1725,6 +2839,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn pidversion_bound_signal_rejects_a_different_process_generation() {
+        use std::os::unix::process::ExitStatusExt;
 
         let mut child = Command::new("/bin/sleep")
             .arg("30")
@@ -1761,7 +2876,8 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn detached_work_with_a_surviving_owner_and_children_is_protected() {
+    #[serial_test::serial]
+    fn orphaned_and_active_owner_candidates_reach_enrollment_but_are_not_cleaned() {
         use crate::modules::mcpu::send_signal_with;
         use std::io::Write;
 
@@ -2019,8 +3135,8 @@ int main(int argc, char **argv) {
             snapshot
                 .candidates
                 .iter()
-                .all(|candidate| candidate.identity.pid != worker_pid),
-            "a detached workload with a surviving communicating owner must not be enrolled; cpu={fixture_cpu:.1}% protected={} protection_error={:?}",
+                .any(|candidate| candidate.identity.pid == worker_pid),
+            "verified active-owner workloads can reach enrollment; cpu={fixture_cpu:.1}% protected={} protection_error={:?}",
             snapshot.protected_high_cpu,
             snapshot.protection_error
         );
@@ -2030,34 +3146,24 @@ int main(int argc, char **argv) {
             .expect("find synthetic parent with a child");
         assert!(root_process.cpu_usage() > CPU_THRESHOLD);
         assert!(has_direct_child_process(&sampler.system, root_pid));
-        assert!(classify_process(&sampler.system, root_pid, root_process, &service_pids).is_err());
-        assert!(
-            classify_process(&sampler.system, worker_pid, fixture_process, &service_pids).is_err()
-        );
+        let root_candidate =
+            classify_process(&sampler.system, root_pid, root_process, &service_pids)
+                .expect("orphaned process with a child workload reaches enrollment");
+        let worker_candidate =
+            classify_process(&sampler.system, worker_pid, fixture_process, &service_pids)
+                .expect("verified active-owner workload reaches enrollment");
+        assert_eq!(root_candidate.ownership, OwnershipKind::Orphaned);
+        assert_eq!(worker_candidate.ownership, OwnershipKind::ActiveOwner);
 
         let sent = std::cell::Cell::new(0);
-        for pid in [root_pid, worker_pid] {
-            let info = process_info(pid).expect("read protected fixture identity");
-            let candidate = Candidate {
-                identity: ProcessIdentity {
-                    pid,
-                    pid_version: info.pid_version,
-                    start_seconds: info.start_seconds,
-                    start_microseconds: info.start_microseconds,
-                    executable: executable.to_string_lossy().into_owned(),
-                    user_id: info.user_id,
-                    fingerprint: String::new(),
-                    code_directory_hash: String::new(),
-                },
-                name: "tree-cli-fixture".to_string(),
-                cpu_percent: CPU_THRESHOLD + 1.0,
-                memory_bytes: 0,
-                reason: "isolated test candidate".to_string(),
-            };
+        for candidate in [root_candidate, worker_candidate] {
             assert!(send_signal_with(
                 &candidate,
                 libc::SIGTERM,
-                |identity| verify_current_identity(identity, &[]),
+                |identity| {
+                    verify_current_identity(identity, &[])
+                        .map_err(|error| anyhow::anyhow!("{error:?}"))
+                },
                 |_, _| {
                     sent.set(sent.get() + 1);
                     Ok(())
@@ -2068,7 +3174,7 @@ int main(int argc, char **argv) {
         assert_eq!(
             sent.get(),
             0,
-            "protected synthetic processes receive no signal"
+            "unsafe synthetic processes receive no signal"
         );
 
         std::fs::write(&stop_path, b"stop").expect("stop isolated CLI tree");

@@ -126,9 +126,37 @@ fn one_pending_request_deduplicates_the_same_tool_fingerprint() {
         .pending
         .insert(request.request_id.clone(), request.clone());
     assert!(policy.has_pending(&request.identity));
+    let mut second_instance = request.identity.clone();
+    second_instance.pid += 1;
+    second_instance.pid_version += 1;
+    second_instance.start_seconds += 1;
+    assert!(policy.has_pending(&second_instance));
     let mut changed_binary = request.identity.clone();
     changed_binary.fingerprint = "e".repeat(64);
     assert!(!policy.has_pending(&changed_binary));
+}
+
+#[test]
+fn durable_pending_enrollment_survives_a_service_restart_without_the_ui() {
+    let temp = tempfile::tempdir().expect("temporary policy root");
+    let store = PolicyStore::new(temp.path().join("mcpu"));
+    let request = test_request();
+    {
+        let lock = store.lock().expect("lock policy before restart");
+        let mut policy = lock.load().expect("load initial policy");
+        policy
+            .pending
+            .insert(request.request_id.clone(), request.clone());
+        lock.save(&policy).expect("persist pending request");
+    }
+
+    let restarted_store = PolicyStore::new(temp.path().join("mcpu"));
+    let lock = restarted_store
+        .lock()
+        .expect("reopen policy after service restart");
+    let recovered = lock.load().expect("recover durable pending request");
+    assert_eq!(recovered.pending.get(&request.request_id), Some(&request));
+    assert!(recovered.has_pending(&request.identity));
 }
 
 #[test]
@@ -209,6 +237,7 @@ fn add_and_exclude_are_explicit_and_timer_validation_is_fail_closed() {
     );
     assert!(policy.approvals.is_empty());
     assert!(policy.is_excluded(&second.identity.executable));
+    assert!(policy.approval_for(&second.identity).is_none());
 }
 
 #[test]

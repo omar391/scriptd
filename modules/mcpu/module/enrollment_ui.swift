@@ -223,7 +223,7 @@ final class EnrollmentController: NSObject {
         Observed CPU: \(String(format: "%.1f", prompt.cpu_percent))%
         Resident memory: \(ByteCountFormatter.string(fromByteCount: Int64(clamping: prompt.memory_bytes), countStyle: .memory))
         Observed at: \(prompt.observed_at)
-        Why it appears abandoned: \(prompt.reason)
+        Observed ownership: \(prompt.reason)
         """
         let scroll = NSScrollView(frame: NSRect(x: 24, y: 224, width: 672, height: 226))
         scroll.borderType = .bezelBorder
