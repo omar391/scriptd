@@ -551,24 +551,16 @@ impl RunningSupervisor {
         let mut needs_wifi_power = false;
         for trigger in self.triggers.values().filter(|trigger| {
             trigger.enabled()
-                && !trigger.is_pending()
                 && self
                     .modules
                     .get(trigger.module())
                     .is_some_and(|module| module.desired_enabled)
         }) {
-            trigger.config().when.collect_sensor_requirements(
+            trigger.collect_sensor_requirements(
                 &mut ssids,
                 &mut applications,
                 &mut needs_wifi_power,
             );
-            if let FirePolicy::Latched { reset, .. } = &trigger.config().fire {
-                reset.when.collect_sensor_requirements(
-                    &mut ssids,
-                    &mut applications,
-                    &mut needs_wifi_power,
-                );
-            }
         }
         (ssids, applications, needs_wifi_power)
     }

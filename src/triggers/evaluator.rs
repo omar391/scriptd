@@ -204,6 +204,17 @@ impl TriggerRuntime {
         &self.config
     }
 
+    pub(crate) fn collect_sensor_requirements(
+        &self,
+        ssids: &mut BTreeSet<String>,
+        applications: &mut BTreeSet<String>,
+        needs_wifi_power: &mut bool,
+    ) {
+        if let Some(condition) = Self::active_condition(&self.config, &self.state.phase) {
+            condition.collect_sensor_requirements(ssids, applications, needs_wifi_power);
+        }
+    }
+
     pub fn snapshot_state(&self) -> TriggerState {
         let mut state = self.state.clone();
         state.next_schedule_deadlines = self
@@ -229,18 +240,8 @@ impl TriggerRuntime {
         now: DateTime<Utc>,
         sensors: &SensorSnapshot,
     ) -> Option<TriggerDispatch> {
-        if self.state.phase == TriggerPhase::Pending {
-            return None;
-        }
         let evaluating_reset = self.state.phase == TriggerPhase::Latched;
-        let active_condition = if evaluating_reset {
-            match &self.config.fire {
-                FirePolicy::Latched { reset, .. } => &reset.when,
-                FirePolicy::EveryMatch => &self.config.when,
-            }
-        } else {
-            &self.config.when
-        };
+        let active_condition = Self::active_condition(&self.config, &self.state.phase)?;
         let schedules = if evaluating_reset {
             &self.reset_schedules
         } else {
@@ -361,6 +362,20 @@ impl TriggerRuntime {
         }
     }
 
+    fn active_condition<'a>(
+        config: &'a TriggerConfig,
+        phase: &TriggerPhase,
+    ) -> Option<&'a Condition> {
+        match phase {
+            TriggerPhase::Pending => None,
+            TriggerPhase::Latched => match &config.fire {
+                FirePolicy::Latched { reset, .. } => Some(&reset.when),
+                FirePolicy::EveryMatch => Some(&config.when),
+            },
+            TriggerPhase::Armed | TriggerPhase::Matching => Some(&config.when),
+        }
+    }
+
     pub fn mark_dispatched(&mut self, incident_id: &str) {
         if self.state.phase == TriggerPhase::Pending
             && self.state.incident_id.as_deref() == Some(incident_id)
@@ -393,10 +408,6 @@ impl TriggerRuntime {
             return;
         };
         self.mark_dispatched(&incident_id);
-    }
-
-    pub fn is_pending(&self) -> bool {
-        self.state.phase == TriggerPhase::Pending
     }
 
     pub fn pending_dispatch(&self) -> Option<TriggerDispatch> {

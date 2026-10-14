@@ -71,6 +71,73 @@ when:
     )
 }
 
+fn sensor_requirements(runtime: &TriggerRuntime) -> (BTreeSet<String>, BTreeSet<String>, bool) {
+    let mut ssids = BTreeSet::new();
+    let mut applications = BTreeSet::new();
+    let mut needs_wifi_power = false;
+    runtime.collect_sensor_requirements(&mut ssids, &mut applications, &mut needs_wifi_power);
+    (ssids, applications, needs_wifi_power)
+}
+
+#[test]
+fn sensor_requirements_follow_the_active_trigger_phase() {
+    let rule = miwatch_rule();
+    for phase in [TriggerPhase::Armed, TriggerPhase::Matching] {
+        let runtime = TriggerRuntime::new(
+            "miwatch-outage".to_string(),
+            rule.clone(),
+            at(0),
+            Some(TriggerState {
+                phase,
+                match_count: 1,
+                ..TriggerState::default()
+            }),
+        );
+        let (ssids, applications, needs_wifi_power) = sensor_requirements(&runtime);
+
+        assert_eq!(ssids, BTreeSet::from(["knight_riders_5G".to_string()]));
+        assert_eq!(applications, BTreeSet::from(["Codex".to_string()]));
+        assert!(!needs_wifi_power);
+    }
+
+    let latched = TriggerRuntime::new(
+        "miwatch-outage".to_string(),
+        rule.clone(),
+        at(0),
+        Some(TriggerState {
+            phase: TriggerPhase::Latched,
+            generation: 1,
+            ..TriggerState::default()
+        }),
+    );
+    let (ssids, applications, needs_wifi_power) = sensor_requirements(&latched);
+
+    assert_eq!(ssids, BTreeSet::from(["knight_riders_5G".to_string()]));
+    assert!(
+        applications.is_empty(),
+        "latched reset must not sample the inactive process-network condition"
+    );
+    assert!(!needs_wifi_power);
+
+    let pending = TriggerRuntime::new(
+        "miwatch-outage".to_string(),
+        rule,
+        at(90),
+        Some(TriggerState {
+            phase: TriggerPhase::Pending,
+            generation: 1,
+            incident_id: Some("miwatch-outage:1".to_string()),
+            last_fired_at: Some(at(90)),
+            ..TriggerState::default()
+        }),
+    );
+    let (ssids, applications, needs_wifi_power) = sensor_requirements(&pending);
+
+    assert!(ssids.is_empty());
+    assert!(applications.is_empty());
+    assert!(!needs_wifi_power);
+}
+
 #[test]
 fn parser_rejects_empty_boolean_group() {
     let config: TriggerConfig = serde_yaml::from_str(
