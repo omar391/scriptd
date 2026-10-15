@@ -20,7 +20,7 @@ modules:
             timezone: Asia/Dhaka
 
   mcpu:
-    enabled: false
+    enabled: true
     triggers:
       sample:
         fire:
