@@ -518,10 +518,27 @@ fn isolated_module_protects_a_live_high_cpu_cli_child() {
         let mut state = McpuState::default();
 
         let _ = run_once_with_state(&mut context, &mut state, &store)?;
-        std::thread::sleep(Duration::from_secs(2));
-        let status = run_once_with_state(&mut context, &mut state, &store)?
-            .context("isolated mcpu status")?;
-        let metrics = status.metrics.context("isolated mcpu metrics")?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let metrics = loop {
+            if let Some(status) = run_once_with_state(&mut context, &mut state, &store)? {
+                let metrics = status.metrics.context("isolated mcpu metrics")?;
+                if metrics["eligible_cli"].as_u64().unwrap_or_default()
+                    + metrics["protected_high_cpu"].as_u64().unwrap_or_default()
+                    > 0
+                {
+                    break metrics;
+                }
+            }
+            anyhow::ensure!(
+                child.try_wait()?.is_none(),
+                "synthetic CLI child exited before a high-CPU sample was observed"
+            );
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "live high-CPU CLI process was never observed in a ready sample"
+            );
+            std::thread::sleep(Duration::from_millis(250));
+        };
         anyhow::ensure!(
             metrics["eligible_cli"].as_u64().unwrap_or_default()
                 + metrics["protected_high_cpu"].as_u64().unwrap_or_default()

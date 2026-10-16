@@ -313,6 +313,12 @@
       "additionalProperties": false,
       "description": "A Boolean trigger scoped to its parent module.",
       "properties": {
+        "action": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "enabled": {
           "type": "boolean"
         },

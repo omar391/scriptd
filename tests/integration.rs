@@ -81,8 +81,8 @@ if [ "$1" = "upgrade" ] && [ "$2" = "--formula" ]; then
     echo formula-upgrades
     exit 0
 fi
-if [ "$1" = "outdated" ] && [ "$2" = "--cask" ] && [ "$3" = "--quiet" ]; then
-    echo demo-cask
+if [ "$1" = "outdated" ] && [ "$2" = "--cask" ] && [ "$3" = "--greedy-auto-updates" ] && [ "$4" = "--json=v2" ]; then
+    printf '%s\n' '{{"casks":[{{"name":"demo-cask","current_version":"1.0"}}]}}'
     exit 0
 fi
 if [ "$1" = "info" ] && [ "$2" = "--cask" ] && [ "$3" = "--json=v2" ]; then
@@ -316,6 +316,29 @@ fn run_scriptd(root: &Path, home: &Path, fake_bin: &Path) -> SysCommand {
 
 #[test]
 #[serial]
+fn integration_bare_launch_with_redirected_stdio_prints_usage_without_starting_bridge() {
+    let root = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    write_modules(root.path());
+    write_service_yaml(root.path(), true, false, false, false);
+
+    let output = run_scriptd(root.path(), home.path(), root.path())
+        .output()
+        .expect("scriptd launch");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Usage:"));
+    assert!(!stdout.contains("http://127.0.0.1"));
+    assert!(
+        !home
+            .path()
+            .join("Library/Application Support/scriptd")
+            .exists()
+    );
+}
+
+#[test]
+#[serial]
 fn integration_status_is_unreadable_without_state() {
     let root = tempdir().unwrap();
     let home = tempdir().unwrap();
@@ -525,7 +548,7 @@ fn integration_run_mbrew_uses_fake_brew_security_and_sudo_boundary() {
     let log = fs::read_to_string(&brew_log).unwrap();
     assert!(log.contains("update"));
     assert!(log.contains("upgrade --formula"));
-    assert!(log.contains("upgrade --cask --no-quit demo-cask"));
+    assert!(!log.contains("upgrade --cask --no-quit demo-cask"));
     assert!(!log.contains("--force"));
     assert!(!log.contains("uninstall"));
     assert!(!log.contains("install"));
@@ -775,8 +798,7 @@ fn integration_run_one_module_does_not_overwrite_supervisor_state() {
     .unwrap();
     let before = fs::read_to_string(&state_file).unwrap();
 
-    let scan_output =
-        "SSID BSSID RSSI CHANNEL SECURITY\nHome 00:11:22:33:44:55 -90 1 WPA2\nOffice 00:11:22:33:44:66 -20 233 WPA3\n";
+    let scan_output = "SSID BSSID RSSI CHANNEL SECURITY\nHome 00:11:22:33:44:55 -90 1 WPA2\nOffice 00:11:22:33:44:66 -20 233 WPA3\n";
     let output = run_scriptd(root.path(), home.path(), &fake_bin)
         .env("SCRIPTD_MWIFI_SCAN_OUTPUT", scan_output)
         .arg("run")

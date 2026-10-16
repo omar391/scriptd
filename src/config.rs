@@ -56,6 +56,8 @@ pub struct ScopedTriggerConfig {
     pub enabled: bool,
     pub fire: FirePolicy,
     pub when: Condition,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
@@ -227,6 +229,7 @@ impl ServiceConfig {
                     module: module_id.clone(),
                     fire: trigger.fire.clone(),
                     when: trigger.when.clone(),
+                    action: trigger.action.clone(),
                 };
                 config
                     .validate()
@@ -264,6 +267,7 @@ impl ServiceConfig {
                     enabled: trigger.enabled,
                     fire: trigger.fire.clone(),
                     when: trigger.when.clone(),
+                    action: trigger.action.clone(),
                 },
             );
         }

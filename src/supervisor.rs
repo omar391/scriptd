@@ -1,7 +1,10 @@
+use std::collections::VecDeque;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -15,6 +18,8 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::time::{sleep, sleep_until, Instant};
 
 use crate::config::{self, ServiceConfig};
+use crate::control::{self, ControlPaths};
+use crate::execution_lock::ExecutionLock;
 use crate::modules::{
     self, BuiltInModule, ModuleDefinition, ModuleInvocation, ModulesRegistry, TriggerInvocation,
 };
@@ -180,6 +185,39 @@ struct RunningSupervisor {
     wifi_event_watcher: Option<WifiEventWatcher>,
     wifi_event_receiver: Option<UnboundedReceiver<()>>,
     last_state_fingerprint: Option<String>,
+    control_paths: ControlPaths,
+    broker: std::sync::Arc<std::sync::Mutex<crate::broker::Broker>>,
+    control_server: Option<control::ServerHandle>,
+    work: VecDeque<QueuedWork>,
+    inflight: BTreeSet<String>,
+    worker: Option<JoinHandle<ExecOutcome>>,
+}
+
+#[derive(Debug)]
+enum QueuedWork {
+    Trigger(TriggerDispatch),
+    Manual(control::Job),
+}
+
+#[derive(Clone)]
+enum WorkLabel {
+    Trigger {
+        trigger_id: String,
+        incident_id: String,
+        module: String,
+    },
+    Manual {
+        job_id: String,
+        module: String,
+    },
+}
+
+struct ExecOutcome {
+    label: WorkLabel,
+    retryable: bool,
+    uncertain: bool,
+    message: String,
+    error: Option<String>,
 }
 
 fn file_modified_at(path: &Path) -> Result<std::time::SystemTime> {
@@ -293,6 +331,21 @@ impl RunningSupervisor {
 
         let (wifi_sender, wifi_event_receiver) = unbounded_channel();
         let wifi_event_watcher = SensorSuite::spawn_wifi_event_watcher(wifi_sender);
+        let control_paths = control::paths_for(root, &config.state_dir);
+        let caller_uid = control_peer_uid().unwrap_or_else(|_| unsafe { libc::geteuid() });
+        let broker_policy =
+            crate::broker::Policy::load_root_owned(&control_paths.approved_sources, 0, caller_uid)
+                .unwrap_or_else(|error| {
+                    crate::logger::append_warn(
+                        &config.expanded_log_dir().join("scriptd.log"),
+                        &format!("Homebrew broker is unavailable: {error}"),
+                    );
+                    crate::broker::Policy {
+                        owner_uid: caller_uid,
+                        approved_sources: BTreeSet::new(),
+                    }
+                });
+        let broker_audit_path = control_paths.broker_audit.clone();
         let mut supervisor = Self {
             _singleton_lock: singleton_lock,
             root: root.to_path_buf(),
@@ -310,6 +363,15 @@ impl RunningSupervisor {
             wifi_event_watcher,
             wifi_event_receiver: Some(wifi_event_receiver),
             last_state_fingerprint: None,
+            control_paths,
+            broker: std::sync::Arc::new(std::sync::Mutex::new(crate::broker::Broker::with_audit(
+                broker_policy,
+                broker_audit_path,
+            ))),
+            control_server: None,
+            work: VecDeque::new(),
+            inflight: BTreeSet::new(),
+            worker: None,
         };
         supervisor.update_module_next_wakes();
         Ok(supervisor)
@@ -497,54 +559,6 @@ impl RunningSupervisor {
         Ok(())
     }
 
-    fn run_module_once(&mut self, dispatch: &TriggerDispatch) -> Result<bool> {
-        let Some(runtime) = self.modules.get_mut(&dispatch.module) else {
-            return Ok(false);
-        };
-        let mut context = modules::module_context_with_settings(
-            &runtime.id,
-            self.root.clone(),
-            runtime.definition.dir.clone(),
-            self.log_dir.clone(),
-            false,
-            runtime.definition.settings.clone(),
-        );
-        context.invocation = ModuleInvocation::Trigger(TriggerInvocation {
-            trigger_id: dispatch.trigger_id.clone(),
-            incident_id: dispatch.incident_id.clone(),
-            fired_at: dispatch.fired_at,
-        });
-        runtime.status = RuntimeStatus::Running;
-        runtime.message = format!("trigger {} in progress", dispatch.trigger_id);
-        runtime.last_started_at = Some(Local::now().to_rfc3339());
-        runtime.last_error = None;
-
-        let outcome = modules::run_once(&runtime.kind, &mut context);
-        let completed = Local::now().to_rfc3339();
-        runtime.last_exit_at = Some(completed.clone());
-        runtime.last_run_at = Some(completed);
-        runtime.runs = runtime.runs.saturating_add(1);
-        let retryable = match outcome {
-            Ok(status) => {
-                runtime.restarts = 0;
-                runtime.status = RuntimeStatus::Scheduled;
-                runtime.message = status
-                    .and_then(|value| value.message)
-                    .unwrap_or_else(|| format!("trigger {} completed", dispatch.trigger_id));
-                false
-            }
-            Err(error) => {
-                runtime.restarts = runtime.restarts.saturating_add(1);
-                runtime.last_error = Some(error.to_string());
-                runtime.status = RuntimeStatus::Error;
-                runtime.message = format!("trigger {} failed: {error}", dispatch.trigger_id);
-                modules::is_retryable_module_error(&error)
-            }
-        };
-        runtime.refresh_status();
-        Ok(retryable)
-    }
-
     fn collect_sensor_requirements(&self) -> (BTreeSet<String>, BTreeSet<String>, bool) {
         let mut ssids = BTreeSet::new();
         let mut applications = BTreeSet::new();
@@ -595,19 +609,13 @@ impl RunningSupervisor {
         self.update_module_next_wakes();
         self.persist_if_changed()?;
 
-        for dispatch in dispatches.values() {
-            let retryable = self.run_module_once(dispatch)?;
-            if let Some(trigger) = self.triggers.get_mut(&dispatch.trigger_id) {
-                if retryable {
-                    trigger.rearm_pending(&dispatch.incident_id);
-                } else {
-                    trigger.mark_dispatched(&dispatch.incident_id);
-                }
-            }
+        let queued = !dispatches.is_empty();
+        for dispatch in dispatches.into_values() {
+            self.enqueue_trigger(dispatch);
         }
         self.update_module_next_wakes();
         self.persist_if_changed()?;
-        Ok(!dispatches.is_empty())
+        Ok(queued)
     }
 
     fn update_module_next_wakes(&mut self) {
@@ -630,6 +638,13 @@ impl RunningSupervisor {
             let message =
                 format!("configuration reload rejected; retaining last valid triggers: {error}");
             crate::logger::append_warn(&self.log_dir.join("scriptd.log"), &message);
+            let loaded_digest = control::loaded_digest(&self.control_paths);
+            let _ = control::write_status(&self.control_paths, loaded_digest, Some(message));
+        } else {
+            let digest = std::fs::read(&self.config_path)
+                .ok()
+                .map(|bytes| control::digest(&bytes));
+            let _ = control::write_status(&self.control_paths, digest, None);
         }
     }
 
@@ -640,8 +655,13 @@ impl RunningSupervisor {
         let mut sighup = signal(SignalKind::hangup()).context("install SIGHUP handler")?;
 
         loop {
+            self.pump_execution()?;
             self.evaluate_and_dispatch(Utc::now())?;
+            self.pump_execution()?;
             let mut delay = self.next_run_delay(Utc::now());
+            if self.worker.is_some() || !self.work.is_empty() {
+                delay = delay.min(Duration::from_millis(250));
+            }
             if delay == Duration::ZERO {
                 delay = Duration::from_millis(250);
             }
@@ -696,6 +716,189 @@ impl RunningSupervisor {
         }
         self.persist_if_changed()
     }
+
+    fn enqueue_trigger(&mut self, dispatch: TriggerDispatch) {
+        if self.inflight.contains(&dispatch.incident_id) {
+            return;
+        }
+        self.inflight.insert(dispatch.incident_id.clone());
+        self.work.push_back(QueuedWork::Trigger(dispatch));
+    }
+
+    fn pump_execution(&mut self) -> Result<()> {
+        self.poll_worker()?;
+        if control::pending_reload(&self.control_paths)?.is_some() {
+            self.apply_reload();
+        }
+        self.start_next()
+    }
+
+    fn poll_worker(&mut self) -> Result<()> {
+        if !self.worker.as_ref().is_some_and(JoinHandle::is_finished) {
+            return Ok(());
+        }
+        let worker = self.worker.take().expect("finished worker");
+        match worker.join() {
+            Ok(outcome) => self.finish_outcome(outcome),
+            Err(_) => {
+                crate::logger::append_error(
+                    &self.log_dir.join("scriptd.log"),
+                    "module worker thread stopped without an outcome; execution state is unknown",
+                );
+                Ok(())
+            }
+        }
+    }
+
+    fn start_next(&mut self) -> Result<()> {
+        if self.worker.is_some() {
+            return Ok(());
+        }
+        if self.work.is_empty() {
+            if let Some(job) = control::claim_queued(&self.control_paths)?
+                .into_iter()
+                .next()
+            {
+                self.work.push_back(QueuedWork::Manual(job));
+            }
+        }
+        let Some(next) = self.work.pop_front() else {
+            return Ok(());
+        };
+        let label = queued_work_label(&next);
+        let prepared = match self.prepare_work(next) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let message = format!("could not prepare queued execution: {error}");
+                return self.finish_outcome(ExecOutcome {
+                    label,
+                    retryable: false,
+                    uncertain: false,
+                    message: message.clone(),
+                    error: Some(message),
+                });
+            }
+        };
+        self.persist_if_changed()?;
+        let lock_path = control::execution_lock_path(&self.root, &self.control_paths.state_dir);
+        self.worker = Some(std::thread::spawn(move || {
+            execute_caught(label, || execute_prepared(prepared, lock_path))
+        }));
+        Ok(())
+    }
+
+    fn prepare_work(&mut self, work: QueuedWork) -> Result<PreparedRun> {
+        let (module_id, label, invocation, action) = match work {
+            QueuedWork::Trigger(dispatch) => {
+                if let Some(trigger) = self.triggers.get_mut(&dispatch.trigger_id) {
+                    trigger.mark_started(&dispatch.incident_id);
+                }
+                (
+                    dispatch.module.clone(),
+                    WorkLabel::Trigger {
+                        trigger_id: dispatch.trigger_id.clone(),
+                        incident_id: dispatch.incident_id.clone(),
+                        module: dispatch.module.clone(),
+                    },
+                    ModuleInvocation::Trigger(TriggerInvocation {
+                        trigger_id: dispatch.trigger_id,
+                        incident_id: dispatch.incident_id,
+                        fired_at: dispatch.fired_at,
+                        action: dispatch.action.clone(),
+                    }),
+                    dispatch.action,
+                )
+            }
+            QueuedWork::Manual(job) => (
+                job.module.clone(),
+                WorkLabel::Manual {
+                    job_id: job.id,
+                    module: job.module.clone(),
+                },
+                ModuleInvocation::Manual,
+                job.action,
+            ),
+        };
+        let Some(runtime) = self.modules.get_mut(&module_id) else {
+            anyhow::bail!("queued work targets unknown module {module_id}");
+        };
+        let mut context = modules::module_context_with_settings(
+            &runtime.id,
+            self.root.clone(),
+            runtime.definition.dir.clone(),
+            self.log_dir.clone(),
+            false,
+            runtime.definition.settings.clone(),
+        );
+        context.invocation = invocation;
+        context.action = action;
+        context.broker = Some(std::sync::Arc::clone(&self.broker));
+        let kind = runtime.kind;
+        runtime.status = RuntimeStatus::Running;
+        runtime.message = "execution in progress".to_string();
+        runtime.last_started_at = Some(Local::now().to_rfc3339());
+        runtime.last_error = None;
+        Ok(PreparedRun {
+            kind,
+            context,
+            label,
+        })
+    }
+
+    fn finish_outcome(&mut self, outcome: ExecOutcome) -> Result<()> {
+        let module_id = match &outcome.label {
+            WorkLabel::Trigger {
+                module,
+                incident_id,
+                trigger_id,
+            } => {
+                self.inflight.remove(incident_id);
+                if let Some(trigger) = self.triggers.get_mut(trigger_id) {
+                    if outcome.retryable {
+                        trigger.rearm_pending(incident_id);
+                    } else {
+                        trigger.mark_dispatched(incident_id);
+                    }
+                }
+                module.clone()
+            }
+            WorkLabel::Manual { job_id, module } => {
+                let state = if outcome.uncertain {
+                    "interrupted"
+                } else if outcome.error.is_some() {
+                    "failed"
+                } else {
+                    "completed"
+                };
+                let _ = control::finish_job(
+                    &self.control_paths,
+                    job_id,
+                    state,
+                    Some(outcome.message.clone()),
+                );
+                module.clone()
+            }
+        };
+        if let Some(runtime) = self.modules.get_mut(&module_id) {
+            let completed = Local::now().to_rfc3339();
+            runtime.last_exit_at = Some(completed.clone());
+            runtime.last_run_at = Some(completed);
+            runtime.runs = runtime.runs.saturating_add(1);
+            if let Some(error) = outcome.error {
+                runtime.restarts = runtime.restarts.saturating_add(1);
+                runtime.last_error = Some(error);
+                runtime.status = RuntimeStatus::Error;
+            } else {
+                runtime.restarts = 0;
+                runtime.status = RuntimeStatus::Scheduled;
+                runtime.last_error = None;
+            }
+            runtime.message = outcome.message;
+            runtime.refresh_status();
+        }
+        self.update_module_next_wakes();
+        self.persist_if_changed()
+    }
 }
 
 fn validate_persisted_state_origin(
@@ -725,6 +928,68 @@ fn validate_persisted_state_origin(
         );
     }
     Ok(())
+}
+
+struct PreparedRun {
+    kind: BuiltInModule,
+    context: modules::ModuleContext,
+    label: WorkLabel,
+}
+
+fn queued_work_label(work: &QueuedWork) -> WorkLabel {
+    match work {
+        QueuedWork::Trigger(dispatch) => WorkLabel::Trigger {
+            trigger_id: dispatch.trigger_id.clone(),
+            incident_id: dispatch.incident_id.clone(),
+            module: dispatch.module.clone(),
+        },
+        QueuedWork::Manual(job) => WorkLabel::Manual {
+            job_id: job.id.clone(),
+            module: job.module.clone(),
+        },
+    }
+}
+
+fn execute_caught(label: WorkLabel, execute: impl FnOnce() -> ExecOutcome) -> ExecOutcome {
+    catch_unwind(AssertUnwindSafe(execute)).unwrap_or_else(|_| {
+        let message = "module worker panicked; completion is unknown and work will not be replayed";
+        ExecOutcome {
+            label,
+            retryable: false,
+            uncertain: true,
+            message: message.to_string(),
+            error: Some(message.to_string()),
+        }
+    })
+}
+
+fn execute_prepared(mut prepared: PreparedRun, lock_path: PathBuf) -> ExecOutcome {
+    let outcome = match ExecutionLock::acquire(&lock_path) {
+        Ok(_lock) => modules::run_once(&prepared.kind, &mut prepared.context),
+        Err(error) => Err(error),
+    };
+    match outcome {
+        Ok(status) => ExecOutcome {
+            label: prepared.label,
+            retryable: false,
+            uncertain: false,
+            message: status
+                .and_then(|value| value.message)
+                .unwrap_or_else(|| "completed".to_string()),
+            error: None,
+        },
+        Err(error) => {
+            let retryable = modules::is_retryable_module_error(&error);
+            let message = error.to_string();
+            ExecOutcome {
+                label: prepared.label,
+                retryable,
+                uncertain: false,
+                message: message.clone(),
+                error: Some(message),
+            }
+        }
+    }
 }
 
 fn collect_pending_dispatches(
@@ -778,6 +1043,13 @@ fn restored_trigger_state(
     trigger: &crate::triggers::TriggerConfig,
 ) -> crate::triggers::TriggerState {
     let mut state = saved.runtime.clone();
+    if state.phase == crate::triggers::TriggerPhase::Executing {
+        state.phase = crate::triggers::TriggerPhase::Interrupted;
+        state.last_error = Some(
+            "execution started before shutdown; completion is unknown and was not replayed".into(),
+        );
+        return state;
+    }
     let Some(saved_config) = saved.config.as_ref() else {
         state.next_schedule_deadlines.clear();
         state.match_count = 0;
@@ -818,6 +1090,12 @@ fn restored_trigger_state(
                 crate::triggers::TriggerPhase::Armed
             };
         }
+        crate::triggers::TriggerPhase::Executing | crate::triggers::TriggerPhase::Interrupted => {
+            state.phase = crate::triggers::TriggerPhase::Interrupted;
+            state.last_error = Some(
+                "execution state changed with configuration; completion remains unknown".into(),
+            );
+        }
         crate::triggers::TriggerPhase::Armed | crate::triggers::TriggerPhase::Matching => {
             state.phase = crate::triggers::TriggerPhase::Armed;
             state.incident_id = None;
@@ -857,6 +1135,8 @@ pub fn run_supervisor(root: PathBuf) -> Result<()> {
 
 pub fn run_one_module(root: PathBuf, module: &str) -> Result<()> {
     let (config, registry) = read_state_config(&root)?;
+    let _execution =
+        ExecutionLock::acquire(&control::execution_lock_path(&root, &config.state_dir))?;
     let kind = BuiltInModule::kind_from_id(module).context("module not compiled")?;
     let definition = registry
         .get(module)
@@ -882,6 +1162,18 @@ async fn run_supervisor_async(root: PathBuf) -> Result<()> {
     let update_interval = config.self_update_check_interval();
     let singleton_lock = acquire_singleton_lock(&config)?;
     let mut supervisor = RunningSupervisor::build(&root, config, registry, singleton_lock)?;
+    let _ = control::recover_interrupted(&supervisor.control_paths);
+    let uid = control_peer_uid()?;
+    supervisor.control_server = Some(control::spawn_server(
+        supervisor.control_paths.clone(),
+        uid,
+        std::sync::Arc::clone(&supervisor.broker),
+    )?);
+    let digest = std::fs::read(&supervisor.config_path)
+        .ok()
+        .map(|bytes| control::digest(&bytes));
+    let _ = control::write_status(&supervisor.control_paths, digest, None);
+    let _ = control::set_restart_required(&supervisor.control_paths, false);
     if supervisor.watch {
         supervisor.start_watcher()?;
     }
@@ -913,11 +1205,37 @@ async fn run_supervisor_async(root: PathBuf) -> Result<()> {
     supervisor.run_event_loop().await
 }
 
+fn control_peer_uid() -> Result<u32> {
+    let effective_uid = unsafe { libc::geteuid() };
+    if effective_uid != 0 {
+        return Ok(effective_uid);
+    }
+    crate::credentials::console_uid().context("resolve browser user for control socket")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::triggers::{TriggerConfig, TriggerPhase, TriggerState};
     use chrono::TimeZone;
+
+    #[test]
+    fn panicking_worker_finishes_as_unknown_and_is_not_replayed() {
+        let outcome = execute_caught(
+            WorkLabel::Manual {
+                job_id: "manual-1".to_string(),
+                module: "mbrew".to_string(),
+            },
+            || panic!("simulated worker panic"),
+        );
+        assert!(!outcome.retryable);
+        assert!(outcome.uncertain);
+        assert!(outcome
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("completion is unknown")));
+        assert!(matches!(outcome.label, WorkLabel::Manual { job_id, .. } if job_id == "manual-1"));
+    }
 
     #[test]
     fn compatible_reload_restores_a_latched_incident() {

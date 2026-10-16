@@ -111,6 +111,8 @@ pub enum TriggerPhase {
     Armed,
     Matching,
     Pending,
+    Executing,
+    Interrupted,
     Latched,
 }
 
@@ -143,6 +145,7 @@ pub struct TriggerDispatch {
     pub module: String,
     pub incident_id: String,
     pub fired_at: DateTime<Utc>,
+    pub action: Option<String>,
 }
 
 #[derive(Debug)]
@@ -230,7 +233,9 @@ impl TriggerRuntime {
         let schedules = match self.state.phase {
             TriggerPhase::Armed | TriggerPhase::Matching => &self.when_schedules,
             TriggerPhase::Latched => &self.reset_schedules,
-            TriggerPhase::Pending => return None,
+            TriggerPhase::Pending | TriggerPhase::Executing | TriggerPhase::Interrupted => {
+                return None
+            }
         };
         schedules.iter().filter_map(|value| value.next_due).min()
     }
@@ -314,12 +319,7 @@ impl TriggerRuntime {
                 self.state.phase = TriggerPhase::Pending;
                 self.state.incident_id = Some(incident_id.clone());
                 self.state.last_fired_at = Some(now);
-                Some(TriggerDispatch {
-                    trigger_id: self.id.clone(),
-                    module: self.config.module.clone(),
-                    incident_id,
-                    fired_at: now,
-                })
+                Some(self.dispatch_for(incident_id, now))
             }
             FirePolicy::Latched { after, .. } => {
                 if missed_required_pulse {
@@ -352,12 +352,7 @@ impl TriggerRuntime {
                 self.state.phase = TriggerPhase::Pending;
                 self.state.incident_id = Some(incident_id.clone());
                 self.state.last_fired_at = Some(now);
-                Some(TriggerDispatch {
-                    trigger_id: self.id.clone(),
-                    module: self.config.module.clone(),
-                    incident_id,
-                    fired_at: now,
-                })
+                Some(self.dispatch_for(incident_id, now))
             }
         }
     }
@@ -367,7 +362,7 @@ impl TriggerRuntime {
         phase: &TriggerPhase,
     ) -> Option<&'a Condition> {
         match phase {
-            TriggerPhase::Pending => None,
+            TriggerPhase::Pending | TriggerPhase::Executing | TriggerPhase::Interrupted => None,
             TriggerPhase::Latched => match &config.fire {
                 FirePolicy::Latched { reset, .. } => Some(&reset.when),
                 FirePolicy::EveryMatch => Some(&config.when),
@@ -377,8 +372,10 @@ impl TriggerRuntime {
     }
 
     pub fn mark_dispatched(&mut self, incident_id: &str) {
-        if self.state.phase == TriggerPhase::Pending
-            && self.state.incident_id.as_deref() == Some(incident_id)
+        if matches!(
+            self.state.phase,
+            TriggerPhase::Pending | TriggerPhase::Executing
+        ) && self.state.incident_id.as_deref() == Some(incident_id)
         {
             match &self.config.fire {
                 FirePolicy::EveryMatch => {
@@ -390,9 +387,19 @@ impl TriggerRuntime {
         }
     }
 
+    pub fn mark_started(&mut self, incident_id: &str) {
+        if self.state.phase == TriggerPhase::Pending
+            && self.state.incident_id.as_deref() == Some(incident_id)
+        {
+            self.state.phase = TriggerPhase::Executing;
+        }
+    }
+
     pub fn rearm_pending(&mut self, incident_id: &str) {
-        if self.state.phase != TriggerPhase::Pending
-            || self.state.incident_id.as_deref() != Some(incident_id)
+        if !matches!(
+            self.state.phase,
+            TriggerPhase::Pending | TriggerPhase::Executing
+        ) || self.state.incident_id.as_deref() != Some(incident_id)
         {
             return;
         }
@@ -412,12 +419,19 @@ impl TriggerRuntime {
 
     pub fn pending_dispatch(&self) -> Option<TriggerDispatch> {
         (self.state.phase == TriggerPhase::Pending).then_some(())?;
-        Some(TriggerDispatch {
+        let incident_id = self.state.incident_id.clone()?;
+        let fired_at = self.state.last_fired_at?;
+        Some(self.dispatch_for(incident_id, fired_at))
+    }
+
+    fn dispatch_for(&self, incident_id: String, fired_at: DateTime<Utc>) -> TriggerDispatch {
+        TriggerDispatch {
             trigger_id: self.id.clone(),
             module: self.config.module.clone(),
-            incident_id: self.state.incident_id.clone()?,
-            fired_at: self.state.last_fired_at?,
-        })
+            incident_id,
+            fired_at,
+            action: self.config.action.clone(),
+        }
     }
 
     fn normalize_restored_state(&mut self, now: DateTime<Utc>) {

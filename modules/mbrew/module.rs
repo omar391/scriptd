@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
@@ -10,7 +10,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::credentials;
 use crate::modules::{ModuleContext, ModuleHealth, ModuleLogger, ModuleStatus};
-use crate::paths::expand_home;
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -49,6 +48,12 @@ impl Default for MbrewConfig {
     }
 }
 
+impl MbrewConfig {
+    pub(crate) fn homebrew_bin(&self) -> &str {
+        &self.homebrew_bin
+    }
+}
+
 #[derive(Debug, Default)]
 struct MbrewState {
     last_run_at: Option<String>,
@@ -76,7 +81,10 @@ fn run_command(
         }
     }
     if let Some(input) = input {
-        command.stdin(std::process::Stdio::piped());
+        command
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
         let mut child = command.spawn()?;
         if let Some(mut stdin) = child.stdin.take() {
             stdin.write_all(input.as_bytes())?;
@@ -106,8 +114,30 @@ fn keychain_password() -> anyhow::Result<String> {
     Ok(credentials::admin_password()?.unwrap_or_default())
 }
 
+fn homebrew_user_home() -> anyhow::Result<PathBuf> {
+    let uid = if unsafe { libc::geteuid() } == 0 {
+        credentials::console_uid()?
+    } else {
+        unsafe { libc::geteuid() }
+    };
+    if uid == 0 {
+        bail!("Homebrew requires a logged-in non-root user");
+    }
+    credentials::home_dir_for_uid(uid)
+}
+
+fn homebrew_path(raw: &str) -> anyhow::Result<PathBuf> {
+    if raw == "~" {
+        return homebrew_user_home();
+    }
+    if let Some(suffix) = raw.strip_prefix("~/") {
+        return Ok(homebrew_user_home()?.join(suffix));
+    }
+    Ok(PathBuf::from(raw))
+}
+
 fn write_askpass(config: &MbrewConfig, logger: &ModuleLogger) -> anyhow::Result<()> {
-    let path = expand_home(&config.askpass_path);
+    let path = homebrew_path(&config.askpass_path)?;
     if path.exists() {
         return Ok(());
     }
@@ -125,9 +155,12 @@ exit 1\n";
 }
 
 fn ensure_askpass(config: &MbrewConfig, logger: &ModuleLogger) -> anyhow::Result<()> {
-    let path = expand_home(&config.askpass_path);
+    let path = homebrew_path(&config.askpass_path)?;
     if path.exists() {
         return Ok(());
+    }
+    if unsafe { libc::geteuid() } == 0 {
+        bail!("mbrew setup required. run './scriptd.sh config mbrew' as the logged-in user");
     }
     let existing = keychain_password()?;
     if existing.is_empty() {
@@ -136,76 +169,240 @@ fn ensure_askpass(config: &MbrewConfig, logger: &ModuleLogger) -> anyhow::Result
     write_askpass(config, logger)
 }
 
-fn configure_sudo(
+fn install_privilege_broker(
     config: &MbrewConfig,
+    context: &ModuleContext,
     password: &str,
-    logger: &ModuleLogger,
 ) -> anyhow::Result<()> {
-    let user = credentials::current_user();
-    if user.is_empty() {
-        bail!("could not resolve the current user for sudoers setup");
-    }
-    let rules = format!(
-        "{} ALL=(ALL) NOPASSWD: {} upgrade*, {} cleanup\n",
-        user, config.homebrew_bin, config.homebrew_bin
-    );
-    let timeout = format!(
-        "Defaults:{} timestamp_timeout={}\n",
-        user,
-        config.sudo_timeout_hours.saturating_mul(60)
-    );
+    const SUPPORT_DIR: &str = "/Library/Application Support/scriptd";
+    const BRIDGE_PATH: &str = "/Library/Application Support/scriptd/privilege_bridge.rb";
+    const POLICY_PATH: &str = "/Library/Application Support/scriptd/approved-cask-sources.txt";
+    const CLIENT_PATH: &str = "/usr/local/libexec/scriptd-broker";
+    const DAEMON_PLIST: &str = "/Library/LaunchDaemons/com.astronlab.scriptd.broker.plist";
 
-    let rules_path = PathBuf::from(format!("/tmp/mbrew-rules-{}.tmp", std::process::id()));
-    let timeout_path = PathBuf::from(format!("/tmp/mbrew-timeout-{}.tmp", std::process::id()));
-    fs::write(&rules_path, rules)?;
-    fs::write(&timeout_path, timeout)?;
-    run_command(
-        "sudo",
-        &[
-            "-S",
-            "cp",
-            rules_path.to_string_lossy().as_ref(),
-            &config.sudoers_path,
-        ],
-        Some(&format!("{password}\n")),
-        None,
-    )?;
-    run_command(
-        "sudo",
-        &["-S", "chmod", "440", &config.sudoers_path],
-        Some(&format!("{password}\n")),
-        None,
-    )?;
-    run_command(
-        "sudo",
-        &[
-            "-S",
-            "cp",
-            timeout_path.to_string_lossy().as_ref(),
-            &config.sudoers_timeout_path,
-        ],
-        Some(&format!("{password}\n")),
-        None,
-    )?;
-    run_command(
-        "sudo",
-        &["-S", "chmod", "440", &config.sudoers_timeout_path],
-        Some(&format!("{password}\n")),
-        None,
-    )?;
-    let _ = fs::remove_file(rules_path);
-    let _ = fs::remove_file(timeout_path);
-    logger.info("configured sudoers for Homebrew maintenance");
+    validate_config(config)?;
+    let nonce = format!(
+        "{}-{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+    let bridge_stage = std::env::temp_dir().join(format!("scriptd-bridge-{nonce}"));
+    let policy_stage = std::env::temp_dir().join(format!("scriptd-policy-{nonce}"));
+    let plist_stage = std::env::temp_dir().join(format!("scriptd-broker-plist-{nonce}"));
+    let result = (|| {
+        let bridge_source = context.module_dir.join("privilege_bridge.rb");
+        let bridge = fs::read(&bridge_source)
+            .with_context(|| format!("read generic Homebrew bridge {}", bridge_source.display()))?;
+        let current = std::env::current_exe().context("resolve the running scriptd binary")?;
+        let policy = format!("{}\n", config.trusted_taps.join("\n"));
+        let service = crate::config::read_service_config(&context.repo_root)
+            .context("read service identity for the installed privilege broker")?;
+        let plist = broker_daemon_plist(&context.repo_root, &service.label);
+        write_staged_private(&bridge_stage, &bridge)?;
+        write_staged_private(&policy_stage, policy.as_bytes())?;
+        write_staged_private(&plist_stage, plist.as_bytes())?;
+
+        let password = format!("{password}\n");
+        for (args, stdin) in [
+            (
+                vec![
+                    "-S",
+                    "/usr/bin/install",
+                    "-d",
+                    "-o",
+                    "root",
+                    "-g",
+                    "wheel",
+                    "-m",
+                    "755",
+                    SUPPORT_DIR,
+                ],
+                password.as_str(),
+            ),
+            (
+                vec![
+                    "-S",
+                    "/usr/bin/install",
+                    "-d",
+                    "-o",
+                    "root",
+                    "-g",
+                    "wheel",
+                    "-m",
+                    "755",
+                    "/usr/local/libexec",
+                ],
+                password.as_str(),
+            ),
+            (
+                vec![
+                    "-S",
+                    "/usr/bin/install",
+                    "-d",
+                    "-o",
+                    "root",
+                    "-g",
+                    "wheel",
+                    "-m",
+                    "755",
+                    "/Library/LaunchDaemons",
+                ],
+                password.as_str(),
+            ),
+        ] {
+            run_sudo_checked(&args, stdin)?;
+        }
+        let current = current.to_string_lossy().into_owned();
+        let bridge_stage = bridge_stage.to_string_lossy().into_owned();
+        let policy_stage = policy_stage.to_string_lossy().into_owned();
+        let plist_stage = plist_stage.to_string_lossy().into_owned();
+        for args in [
+            vec![
+                "-S",
+                "/usr/bin/install",
+                "-o",
+                "root",
+                "-g",
+                "wheel",
+                "-m",
+                "755",
+                &current,
+                CLIENT_PATH,
+            ],
+            vec![
+                "-S",
+                "/usr/bin/install",
+                "-o",
+                "root",
+                "-g",
+                "wheel",
+                "-m",
+                "644",
+                &bridge_stage,
+                BRIDGE_PATH,
+            ],
+            vec![
+                "-S",
+                "/usr/bin/install",
+                "-o",
+                "root",
+                "-g",
+                "wheel",
+                "-m",
+                "644",
+                &policy_stage,
+                POLICY_PATH,
+            ],
+            vec![
+                "-S",
+                "/usr/bin/install",
+                "-o",
+                "root",
+                "-g",
+                "wheel",
+                "-m",
+                "644",
+                &plist_stage,
+                DAEMON_PLIST,
+            ],
+        ] {
+            run_sudo_checked(&args, &password)?;
+        }
+        // Remove the legacy broad Homebrew upgrade grant so privileged work
+        // can only flow through an authenticated cask job.
+        for path in ["/etc/sudoers.d/homebrew", "/etc/sudoers.d/homebrew_timeout"] {
+            run_sudo_checked(&["-S", "/bin/rm", "-f", path], &password)?;
+        }
+        Ok(())
+    })();
+    let _ = fs::remove_file(&bridge_stage);
+    let _ = fs::remove_file(&policy_stage);
+    let _ = fs::remove_file(&plist_stage);
+    result
+}
+
+fn broker_daemon_plist(repo: &Path, service_label: &str) -> String {
+    let repo = xml_escape(&repo.to_string_lossy());
+    let service_label = xml_escape(service_label);
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>com.astronlab.scriptd.broker</string>\n<key>ProgramArguments</key><array><string>/usr/local/libexec/scriptd-broker</string><string>broker</string><string>serve</string></array>\n<key>RunAtLoad</key><true/>\n<key>EnvironmentVariables</key><dict><key>SCRIPTD_ROOT_DIR</key><string>{repo}</string><key>SCRIPTD_SERVICE_LABEL</key><string>{service_label}</string><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>\n<key>StandardOutPath</key><string>/Library/Logs/scriptd-broker.log</string>\n<key>StandardErrorPath</key><string>/Library/Logs/scriptd-broker.log</string>\n</dict></plist>\n"
+    )
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
+fn write_staged_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
     Ok(())
 }
 
+fn run_sudo_checked(args: &[&str], password: &str) -> anyhow::Result<()> {
+    let (stdout, stderr, status) = run_command("/usr/bin/sudo", args, Some(password), None)?;
+    if status != 0 {
+        bail!(
+            "privilege broker setup command failed with status {status}: {}{}",
+            stderr.trim(),
+            stdout.trim()
+        );
+    }
+    Ok(())
+}
+
+fn build_brew_command(
+    config: &MbrewConfig,
+    args: &[&str],
+    effective_uid: u32,
+    console_uid: Option<u32>,
+) -> anyhow::Result<Command> {
+    let askpass_path = homebrew_path(&config.askpass_path)?;
+    if effective_uid == 0 {
+        let uid = console_uid.context("root-run Homebrew needs a logged-in console user")?;
+        if uid == 0 {
+            bail!("root-run Homebrew refuses to run as root without a console user");
+        }
+        let mut command = Command::new("/usr/bin/sudo");
+        command
+            .args(["-n", "-u"])
+            .arg(format!("#{uid}"))
+            .args(["-H", "--", "/usr/bin/env"])
+            .arg(format!("SUDO_ASKPASS={}", askpass_path.display()))
+            .arg(&config.homebrew_bin)
+            .args(args);
+        Ok(command)
+    } else {
+        let mut command = Command::new(&config.homebrew_bin);
+        command.args(args).env("SUDO_ASKPASS", askpass_path);
+        Ok(command)
+    }
+}
+
 fn command_for_brew(config: &MbrewConfig, args: &[&str]) -> anyhow::Result<(String, String, i32)> {
-    let askpass_path = expand_home(&config.askpass_path);
-    let askpass = askpass_path.to_string_lossy().to_string();
-    let env = [("SUDO_ASKPASS", askpass.as_str())];
-    let command = run_command(&config.homebrew_bin, args, None, Some(&env))
+    let effective_uid = unsafe { libc::geteuid() };
+    let console_uid = (effective_uid == 0)
+        .then(credentials::console_uid)
+        .transpose()?;
+    let output = build_brew_command(config, args, effective_uid, console_uid)?
+        .output()
         .context("brew command failed to execute")?;
-    Ok(command)
+    Ok((
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+        output.status.code().unwrap_or(1),
+    ))
 }
 
 fn brew_failure(stderr: &str, fallback: &str) -> String {
@@ -339,12 +536,26 @@ struct BrewMaintenanceOutcome {
     repaired_casks: Vec<String>,
     deferred_casks: Vec<String>,
     failed_casks: Vec<String>,
+    retryable_casks: BTreeSet<String>,
+    attention_casks: BTreeSet<String>,
+    reasons: BTreeMap<String, String>,
+    cask_error: Option<String>,
+    formula_error: Option<String>,
+    cleanup_error: Option<String>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct CaskRuntimeIdentity {
     bundle_ids: BTreeSet<String>,
     app_paths: BTreeSet<String>,
+    binary_paths: BTreeSet<String>,
+    service_names: BTreeSet<String>,
+    package_receipts: BTreeSet<String>,
+    observation_incomplete: bool,
+}
+
+struct CaskMetadata {
+    identity: CaskRuntimeIdentity,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -528,11 +739,15 @@ fn collect_app_paths(value: &serde_json::Value, app_paths: &mut BTreeSet<String>
     }
 }
 
-fn collect_cask_runtime_identity(value: &serde_json::Value, identity: &mut CaskRuntimeIdentity) {
+fn collect_cask_runtime_identity(
+    value: &serde_json::Value,
+    identity: &mut CaskRuntimeIdentity,
+    bin_dir: &Path,
+) {
     let Some(object) = value.as_object() else {
         if let Some(values) = value.as_array() {
             for value in values {
-                collect_cask_runtime_identity(value, identity);
+                collect_cask_runtime_identity(value, identity, bin_dir);
             }
         }
         return;
@@ -561,6 +776,24 @@ fn collect_cask_runtime_identity(value: &serde_json::Value, identity: &mut CaskR
     if let Some(delete) = object.get("delete") {
         collect_app_paths(delete, &mut identity.app_paths);
     }
+    if object.contains_key("binary") {
+        if let Some(binary) = object.get("binary") {
+            identity.observation_incomplete |=
+                !collect_binary_targets(binary, bin_dir, &mut identity.binary_paths);
+        }
+    }
+    if let Some(service) = object.get("service") {
+        identity.observation_incomplete |=
+            !collect_service_names(service, &mut identity.service_names);
+    }
+    if let Some(launchctl) = object.get("launchctl") {
+        identity.observation_incomplete |=
+            !collect_service_names(launchctl, &mut identity.service_names);
+    }
+    if let Some(pkgutil) = object.get("pkgutil") {
+        identity.observation_incomplete |=
+            !collect_package_receipts(pkgutil, &mut identity.package_receipts);
+    }
     if object
         .get("type")
         .and_then(serde_json::Value::as_str)
@@ -572,20 +805,496 @@ fn collect_cask_runtime_identity(value: &serde_json::Value, identity: &mut CaskR
     }
 
     for value in object.values() {
-        collect_cask_runtime_identity(value, identity);
+        collect_cask_runtime_identity(value, identity, bin_dir);
     }
 }
 
 fn cask_runtime_identity(value: &serde_json::Value) -> anyhow::Result<CaskRuntimeIdentity> {
+    cask_runtime_identity_with_bin_dir(value, Path::new("/opt/homebrew/bin"))
+}
+
+fn homebrew_bin_dir(homebrew_bin: &Path) -> anyhow::Result<PathBuf> {
+    let executable = homebrew_bin
+        .canonicalize()
+        .with_context(|| format!("resolve Homebrew executable {}", homebrew_bin.display()))?;
+    executable
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| anyhow::anyhow!("Homebrew executable has no parent directory"))
+}
+
+fn cask_runtime_identity_with_bin_dir(
+    value: &serde_json::Value,
+    bin_dir: &Path,
+) -> anyhow::Result<CaskRuntimeIdentity> {
     let artifacts = value
         .get("artifacts")
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| anyhow::anyhow!("cask metadata is missing artifacts"))?;
     let mut identity = CaskRuntimeIdentity::default();
     for artifact in artifacts {
-        collect_cask_runtime_identity(artifact, &mut identity);
+        collect_cask_runtime_identity(artifact, &mut identity, bin_dir);
     }
     Ok(identity)
+}
+
+fn collect_binary_targets(
+    value: &serde_json::Value,
+    bin_dir: &Path,
+    paths: &mut BTreeSet<String>,
+) -> bool {
+    match value {
+        serde_json::Value::String(value) => {
+            let value = Path::new(value.trim());
+            if value.as_os_str().is_empty()
+                || value.components().any(|component| {
+                    matches!(component, Component::ParentDir | Component::Prefix(_))
+                })
+            {
+                return false;
+            }
+            let path = if value.is_absolute() {
+                value.to_path_buf()
+            } else {
+                bin_dir.join(value)
+            };
+            let Some(path) = normalize_runtime_path(&path.to_string_lossy()) else {
+                return false;
+            };
+            paths.insert(path);
+            true
+        }
+        serde_json::Value::Array(values) => {
+            let mut valid = !values.is_empty();
+            for value in values {
+                valid &= collect_binary_targets(value, bin_dir, paths);
+            }
+            valid
+        }
+        serde_json::Value::Object(object) => {
+            if let Some(target) = object.get("target") {
+                return collect_binary_targets(target, bin_dir, paths);
+            }
+            let mut found = false;
+            let mut valid = true;
+            for value in object
+                .values()
+                .filter(|value| value.is_array() || value.is_object())
+            {
+                found = true;
+                valid &= collect_binary_targets(value, bin_dir, paths);
+            }
+            found && valid
+        }
+        _ => false,
+    }
+}
+
+fn collect_service_names(value: &serde_json::Value, names: &mut BTreeSet<String>) -> bool {
+    match value {
+        serde_json::Value::String(value) => {
+            let value = value.trim();
+            let valid = !value.is_empty()
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'));
+            if valid {
+                names.insert(value.to_string());
+            }
+            valid
+        }
+        serde_json::Value::Array(values) => {
+            let mut valid = !values.is_empty();
+            for value in values {
+                valid &= collect_service_names(value, names);
+            }
+            valid
+        }
+        serde_json::Value::Object(object) => {
+            if let Some(name) = object.get("name").or_else(|| object.get("service")) {
+                collect_service_names(name, names)
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+fn collect_package_receipts(value: &serde_json::Value, receipts: &mut BTreeSet<String>) -> bool {
+    match value {
+        serde_json::Value::String(value) => {
+            let value = value.trim();
+            let valid = !value.is_empty()
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'));
+            if valid {
+                receipts.insert(value.to_string());
+            }
+            valid
+        }
+        serde_json::Value::Array(values) => {
+            let mut valid = !values.is_empty();
+            for value in values {
+                valid &= collect_package_receipts(value, receipts);
+            }
+            valid
+        }
+        serde_json::Value::Object(object) => {
+            let mut valid = !object.is_empty();
+            for value in object.values() {
+                valid &= collect_package_receipts(value, receipts);
+            }
+            valid
+        }
+        _ => false,
+    }
+}
+
+fn identity_is_known(identity: &CaskRuntimeIdentity) -> bool {
+    !identity.observation_incomplete
+        && (!identity.bundle_ids.is_empty()
+            || !identity.app_paths.is_empty()
+            || !identity.binary_paths.is_empty()
+            || !identity.service_names.is_empty()
+            || !identity.package_receipts.is_empty())
+}
+
+fn executable_is_running(paths: &BTreeSet<String>) -> bool {
+    if paths.is_empty() {
+        return false;
+    }
+    let mut system = sysinfo::System::new();
+    system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    let executables = system
+        .processes()
+        .values()
+        .filter_map(|process| process.exe().map(Path::to_path_buf))
+        .collect::<Vec<_>>();
+    executable_matches(paths, &executables)
+}
+
+fn executable_matches(paths: &BTreeSet<String>, executables: &[PathBuf]) -> bool {
+    let canonical_targets = paths
+        .iter()
+        .map(|path| canonical_executable(Path::new(path)))
+        .collect::<BTreeSet<_>>();
+    executables
+        .iter()
+        .any(|exe| canonical_targets.contains(&canonical_executable(exe)))
+}
+
+fn canonical_executable(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn service_is_running(name: &str) -> anyhow::Result<bool> {
+    service_is_running_with(Path::new("/bin/launchctl"), name)
+}
+
+fn service_is_running_with(program: &Path, name: &str) -> anyhow::Result<bool> {
+    let gui_uid = gui_user_uid()?;
+    let mut observed_missing = false;
+    for target in [format!("gui/{gui_uid}/{name}"), format!("system/{name}")] {
+        let output = std::process::Command::new(program)
+            .args(["print", &target])
+            .output()
+            .with_context(|| format!("launchctl print {target} failed"))?;
+        if output.status.success() {
+            // A loaded service can be relaunched while Homebrew is replacing its files.
+            return Ok(true);
+        } else {
+            let diagnostic = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let lower = diagnostic.to_lowercase();
+            if lower.contains("could not find service") || lower.contains("service not found") {
+                observed_missing = true;
+            } else {
+                bail!(
+                    "could not establish activity for launchd service {target}: {}",
+                    diagnostic.trim()
+                );
+            }
+        }
+    }
+    if observed_missing {
+        Ok(false)
+    } else {
+        bail!("launchctl did not provide a reliable activity result for {name}")
+    }
+}
+
+fn resolve_package_receipts(
+    receipts: &BTreeSet<String>,
+) -> anyhow::Result<(BTreeSet<String>, BTreeSet<String>)> {
+    resolve_package_receipts_with(receipts, Path::new("/usr/sbin/pkgutil"))
+}
+
+fn resolve_package_receipts_with(
+    receipts: &BTreeSet<String>,
+    pkgutil: &Path,
+) -> anyhow::Result<(BTreeSet<String>, BTreeSet<String>)> {
+    resolve_package_receipts_with_tools(receipts, pkgutil, Path::new("/usr/bin/plutil"))
+}
+
+fn resolve_package_receipts_with_tools(
+    receipts: &BTreeSet<String>,
+    pkgutil: &Path,
+    plutil: &Path,
+) -> anyhow::Result<(BTreeSet<String>, BTreeSet<String>)> {
+    let mut paths = BTreeSet::new();
+    let mut services = BTreeSet::new();
+    let pkgutil = pkgutil
+        .to_str()
+        .context("pkgutil executable path is not valid UTF-8")?;
+    let plutil = plutil
+        .to_str()
+        .context("plutil executable path is not valid UTF-8")?;
+
+    for receipt in receipts {
+        let (info_plist, info_stderr, info_status) =
+            run_command(pkgutil, &["--pkg-info-plist", receipt], None, None)
+                .with_context(|| format!("query package receipt location for {receipt}"))?;
+        if info_status != 0 {
+            bail!(
+                "could not establish package receipt location for {receipt}: {}",
+                info_stderr.trim()
+            );
+        }
+        let (info_json, conversion_stderr, conversion_status) = run_command(
+            plutil,
+            &["-convert", "json", "-o", "-", "-"],
+            Some(&info_plist),
+            None,
+        )
+        .with_context(|| format!("decode package receipt location for {receipt}"))?;
+        if conversion_status != 0 {
+            bail!(
+                "could not decode package receipt location for {receipt}: {}",
+                conversion_stderr.trim()
+            );
+        }
+        let info: serde_json::Value = serde_json::from_str(&info_json)
+            .with_context(|| format!("parse package receipt location for {receipt}"))?;
+        let install_root = package_receipt_install_root(&info, receipt)?;
+
+        let (files, stderr, status) = run_command(pkgutil, &["--files", receipt], None, None)
+            .with_context(|| format!("query package receipt files for {receipt}"))?;
+        if status != 0 {
+            bail!(
+                "could not establish installed files for package receipt {receipt}: {}",
+                stderr.trim()
+            );
+        }
+        let mut observed_file = false;
+        for file in files.lines().map(str::trim).filter(|file| !file.is_empty()) {
+            observed_file = true;
+            let relative = Path::new(file);
+            if relative.is_absolute()
+                || relative.components().any(|component| {
+                    matches!(
+                        component,
+                        Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                    )
+                })
+            {
+                bail!("package receipt {receipt} returned an unsafe relative path");
+            }
+            let absolute = install_root.join(relative);
+            let Some(normalized) = normalize_runtime_path(&absolute.to_string_lossy()) else {
+                bail!("package receipt {receipt} returned an invalid installed path");
+            };
+            paths.insert(normalized.clone());
+            let path = Path::new(&normalized);
+            if is_launchd_plist(path) {
+                if !path.exists() {
+                    bail!(
+                        "package receipt {receipt} declares a missing launchd plist at {}",
+                        path.display()
+                    );
+                }
+                if let Some(service) = launchd_plist_label(path)? {
+                    services.insert(service);
+                }
+            }
+        }
+        if !observed_file {
+            bail!("package receipt {receipt} returned no installed files");
+        }
+    }
+    Ok((paths, services))
+}
+
+fn package_receipt_install_root(
+    info: &serde_json::Value,
+    receipt: &str,
+) -> anyhow::Result<PathBuf> {
+    let volume = info
+        .get("volume")
+        .and_then(serde_json::Value::as_str)
+        .context("package receipt has no volume location")?;
+    let location = info
+        .get("install-location")
+        .and_then(serde_json::Value::as_str)
+        .context("package receipt has no install location")?;
+    let volume = validated_receipt_location(volume, "volume")?;
+    let location = validated_receipt_location(location, "install location")?;
+    let volume = volume
+        .canonicalize()
+        .with_context(|| format!("resolve package receipt {receipt} volume"))?;
+    if !volume.is_dir() {
+        bail!("package receipt {receipt} volume is unavailable");
+    }
+    let location_relative = location
+        .strip_prefix("/")
+        .context("package receipt install location must be absolute")?;
+    let install_root = volume
+        .join(location_relative)
+        .canonicalize()
+        .with_context(|| format!("resolve package receipt {receipt} install location"))?;
+    if !install_root.is_dir() || !install_root.starts_with(&volume) {
+        bail!("package receipt {receipt} install location is unavailable or outside its volume");
+    }
+    Ok(install_root)
+}
+
+fn validated_receipt_location(raw: &str, field: &str) -> anyhow::Result<PathBuf> {
+    let path = Path::new(raw);
+    if !path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::CurDir | Component::Prefix(_)
+            )
+        })
+    {
+        bail!("package receipt {field} is not a safe absolute path");
+    }
+    Ok(path.to_path_buf())
+}
+
+fn is_launchd_plist(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension == "plist")
+        && path.components().any(|component| {
+            matches!(
+                component,
+                Component::Normal(name)
+                    if name == "LaunchAgents" || name == "LaunchDaemons"
+            )
+        })
+}
+
+fn launchd_plist_label(path: &Path) -> anyhow::Result<Option<String>> {
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("read receipt-declared launchd plist {}", path.display()))?;
+    let Some(key) = contents.find("<key>Label</key>") else {
+        bail!(
+            "receipt-declared launchd plist {} has no Label",
+            path.display()
+        );
+    };
+    let value = &contents[key + "<key>Label</key>".len()..];
+    let Some(start) = value.find("<string>") else {
+        bail!(
+            "receipt-declared launchd plist {} has an invalid Label",
+            path.display()
+        );
+    };
+    let value = &value[start + "<string>".len()..];
+    let Some(end) = value.find("</string>") else {
+        bail!(
+            "receipt-declared launchd plist {} has an invalid Label",
+            path.display()
+        );
+    };
+    let label = value[..end].trim();
+    if label.is_empty()
+        || !label
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+    {
+        bail!(
+            "receipt-declared launchd plist {} has an invalid Label",
+            path.display()
+        );
+    }
+    Ok(Some(label.to_string()))
+}
+
+fn gui_user_uid() -> anyhow::Result<u32> {
+    let effective_uid = unsafe { libc::geteuid() };
+    if effective_uid != 0 {
+        return Ok(effective_uid);
+    }
+    let uid = credentials::console_uid()?;
+    if uid == 0 {
+        bail!("no logged-in user session is available for service activity checks");
+    }
+    Ok(uid)
+}
+
+fn cask_activity(identity: &CaskRuntimeIdentity) -> anyhow::Result<bool> {
+    if identity.observation_incomplete {
+        bail!("cask metadata contains an unresolved runtime or uninstall identity");
+    }
+    let applications = running_applications()?;
+    if cask_is_running(identity, &applications) || executable_is_running(&identity.binary_paths) {
+        return Ok(true);
+    }
+    let (receipt_paths, receipt_services) = resolve_package_receipts(&identity.package_receipts)?;
+    if executable_is_running(&receipt_paths) {
+        return Ok(true);
+    }
+    for service in identity.service_names.iter().chain(&receipt_services) {
+        if service_is_running(service)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn selectable_cask_names(document: &serde_json::Value) -> Vec<String> {
+    let Some(casks) = document.get("casks").and_then(serde_json::Value::as_array) else {
+        return Vec::new();
+    };
+    casks
+        .iter()
+        .filter_map(|cask| {
+            if cask.get("pinned").and_then(serde_json::Value::as_bool) == Some(true) {
+                return None;
+            }
+            if cask
+                .get("current_version")
+                .and_then(serde_json::Value::as_str)
+                == Some("latest")
+            {
+                return None;
+            }
+            cask.get("name")
+                .or_else(|| cask.get("token"))
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string)
+        })
+        .collect()
+}
+
+fn listed_casks(output: &str) -> Vec<String> {
+    if let Ok(document) = serde_json::from_str::<serde_json::Value>(output.trim()) {
+        if document.get("casks").is_some() || document.get("formulae").is_some() {
+            return selectable_cask_names(&document);
+        }
+    }
+    output
+        .lines()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect()
 }
 
 fn running_applications() -> anyhow::Result<Vec<RunningApplication>> {
@@ -634,14 +1343,16 @@ fn cask_is_running(identity: &CaskRuntimeIdentity, applications: &[RunningApplic
             .as_ref()
             .is_some_and(|bundle_id| identity.bundle_ids.contains(bundle_id))
             || application.path.as_ref().is_some_and(|path| {
+                let running_path = canonical_executable(Path::new(path));
                 identity.app_paths.iter().any(|app_path| {
-                    path == app_path || Path::new(path).starts_with(Path::new(app_path))
+                    let target = canonical_executable(Path::new(app_path));
+                    running_path == target || running_path.starts_with(target)
                 })
             })
     })
 }
 
-fn cask_metadata(config: &MbrewConfig, cask: &str) -> anyhow::Result<Option<CaskRuntimeIdentity>> {
+fn cask_metadata(config: &MbrewConfig, cask: &str) -> anyhow::Result<Option<CaskMetadata>> {
     let (stdout, stderr, status) =
         command_for_brew(config, &["info", "--cask", "--json=v2", cask])?;
     if status != 0 {
@@ -666,8 +1377,201 @@ fn cask_metadata(config: &MbrewConfig, cask: &str) -> anyhow::Result<Option<Cask
         .find(|value| value.get("token").and_then(serde_json::Value::as_str) == Some(cask))
         .or_else(|| (casks.len() == 1).then(|| &casks[0]))
         .ok_or_else(|| anyhow::anyhow!("brew info metadata did not contain cask {cask}"))?;
-    let identity = cask_runtime_identity(metadata)?;
-    Ok((!identity.bundle_ids.is_empty() || !identity.app_paths.is_empty()).then_some(identity))
+    let bin_dir = homebrew_bin_dir(Path::new(&config.homebrew_bin))?;
+    let identity = cask_runtime_identity_with_bin_dir(metadata, &bin_dir)?;
+    Ok(identity_is_known(&identity).then_some(CaskMetadata { identity }))
+}
+
+fn broker_control_call(
+    repo: &Path,
+    op: &str,
+    module: Option<&str>,
+    document: Option<&str>,
+    token: Option<&str>,
+) -> anyhow::Result<crate::control::Response> {
+    use std::time::Duration;
+
+    let uid = credentials::console_uid()?;
+    let id = format!(
+        "broker-{}-{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+    let request = crate::control::Request {
+        v: crate::control::PROTOCOL_VERSION,
+        id,
+        op: op.to_string(),
+        repo: repo.to_string_lossy().into_owned(),
+        document: document.map(str::to_string),
+        module: module.map(str::to_string),
+        yaml: None,
+        base_digest: None,
+        request_id: token.map(str::to_string),
+        bypass: false,
+        action: None,
+        max_lines: None,
+        severity: None,
+        query: None,
+    };
+    let response = crate::control::transact_with_timeout(
+        &crate::control::broker_socket_path(repo, uid),
+        &request,
+        Duration::from_secs(15 * 60 + 10),
+    )?;
+    if !response.ok {
+        bail!(
+            "privilege broker rejected the request: {}",
+            response.message.as_deref().unwrap_or("no reason provided")
+        );
+    }
+    Ok(response)
+}
+
+fn brokered_cask_upgrade(
+    config: &MbrewConfig,
+    cask: &str,
+    identity: &CaskRuntimeIdentity,
+    _broker: &crate::control::SharedBroker,
+) -> anyhow::Result<BrokerUpgradeResult> {
+    let bridge_path = PathBuf::from("/Library/Application Support/scriptd/privilege_bridge.rb");
+    let bridge = match crate::broker::read_root_owned_file(&bridge_path, 0) {
+        Ok(bridge) => bridge,
+        Err(error) => {
+            return Ok(BrokerUpgradeResult::Deferred(format!(
+                "privilege bridge setup is required: {error}"
+            )));
+        }
+    };
+    let repository = std::env::var_os("SCRIPTD_ROOT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(crate::paths::resolve_repo_root);
+    if let Err(error) = crate::control::broker_activation_status(&repository) {
+        return Ok(BrokerUpgradeResult::Deferred(format!(
+            "privilege broker is inactive: {error}"
+        )));
+    }
+    let command_runner = PathBuf::from(&config.homebrew_bin)
+        .parent()
+        .context("Homebrew executable has no parent directory")?
+        .parent()
+        .context("Homebrew prefix could not be resolved")?
+        .join("Library/Homebrew/system_command.rb");
+    let runner = fs::read_to_string(command_runner)
+        .context("could not read Homebrew's SystemCommand runner")?;
+    if !crate::broker::bridge_compatible(&runner) || !bridge.contains("def sudo_prefix") {
+        return Ok(BrokerUpgradeResult::Deferred(
+            "Homebrew privilege bridge compatibility is not verified; elevation is deferred".into(),
+        ));
+    }
+
+    let client = PathBuf::from("/usr/local/libexec/scriptd-broker");
+    if let Err(error) = crate::broker::validate_root_owned_file(&client, 0) {
+        return Ok(BrokerUpgradeResult::Deferred(format!(
+            "root-owned scriptd broker client setup is required: {error}"
+        )));
+    }
+    let grant = match broker_control_call(
+        &repository,
+        "broker_open",
+        Some(cask),
+        Some(&config.homebrew_bin),
+        None,
+    ) {
+        Ok(response) => response
+            .snapshot
+            .ok_or_else(|| anyhow::anyhow!("privilege broker returned no job grant"))?,
+        Err(error) => {
+            return Ok(BrokerUpgradeResult::Deferred(format!(
+                "authenticated privilege broker is unavailable: {error}"
+            )));
+        }
+    };
+    let job_id = grant
+        .get("job_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("privilege broker returned no job id"))?
+        .to_string();
+    let token = grant
+        .get("token")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("privilege broker returned no job capability"))?
+        .to_string();
+    match cask_activity(identity) {
+        Ok(true) => {
+            let _ = broker_control_call(
+                &repository,
+                "broker_complete",
+                Some(&job_id),
+                None,
+                Some(&token),
+            );
+            return Ok(BrokerUpgradeResult::Deferred(
+                "an application or helper from this cask became active before the upgrade".into(),
+            ));
+        }
+        Err(error) => {
+            let _ = broker_control_call(
+                &repository,
+                "broker_complete",
+                Some(&job_id),
+                None,
+                Some(&token),
+            );
+            return Ok(BrokerUpgradeResult::Deferred(format!(
+                "could not reverify cask activity immediately before upgrade: {error}"
+            )));
+        }
+        Ok(false) => {}
+    }
+    let repository = repository
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("scriptd repository path is not valid UTF-8"))?;
+    let response = match broker_control_call(
+        Path::new(repository),
+        "broker_launch",
+        Some(&job_id),
+        None,
+        Some(&token),
+    ) {
+        Ok(response) => response,
+        Err(error) => {
+            let _ = broker_control_call(
+                Path::new(repository),
+                "broker_complete",
+                Some(&job_id),
+                None,
+                Some(&token),
+            );
+            return Ok(BrokerUpgradeResult::Deferred(format!(
+                "helper-launched Homebrew worker was unavailable: {error}"
+            )));
+        }
+    };
+    let snapshot = response
+        .snapshot
+        .context("privilege broker returned no Homebrew worker result")?;
+    let status = snapshot
+        .get("status")
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|status| i32::try_from(status).ok())
+        .context("privilege broker returned an invalid Homebrew worker status")?;
+    let decode_output = |key: &str| -> anyhow::Result<Vec<u8>> {
+        use base64::Engine;
+        let Some(encoded) = snapshot.get(key).and_then(serde_json::Value::as_str) else {
+            return Ok(Vec::new());
+        };
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .with_context(|| format!("privilege broker returned invalid {key}"))
+    };
+    let stdout = String::from_utf8_lossy(&decode_output("stdout")?).into_owned();
+    let stderr = String::from_utf8_lossy(&decode_output("stderr")?).into_owned();
+    Ok(BrokerUpgradeResult::Completed((stdout, stderr, status)))
+}
+
+enum BrokerUpgradeResult {
+    Completed((String, String, i32)),
+    Deferred(String),
 }
 
 fn push_unique(values: &mut Vec<String>, value: &str) {
@@ -683,7 +1587,20 @@ fn defer_cask(
     reason: &str,
 ) {
     push_unique(&mut outcome.deferred_casks, cask);
+    outcome.retryable_casks.insert(cask.to_string());
+    outcome.reasons.insert(cask.to_string(), reason.to_string());
     logger.warn(&format!("Deferring cask {cask}: {reason}"));
+}
+
+fn defer_cask_for_attention(
+    outcome: &mut BrewMaintenanceOutcome,
+    logger: &ModuleLogger,
+    cask: &str,
+    reason: &str,
+) {
+    defer_cask(outcome, logger, cask, reason);
+    outcome.retryable_casks.remove(cask);
+    outcome.attention_casks.insert(cask.to_string());
 }
 
 fn fail_cask(
@@ -693,15 +1610,29 @@ fn fail_cask(
     reason: &str,
 ) {
     push_unique(&mut outcome.failed_casks, cask);
+    outcome.reasons.insert(cask.to_string(), reason.to_string());
+    outcome.attention_casks.insert(cask.to_string());
     logger.error(&format!("Cask {cask} upgrade failed: {reason}"));
 }
 
 fn brew_cask_maintenance(
     config: &MbrewConfig,
     logger: &ModuleLogger,
+    only: Option<&std::collections::BTreeSet<String>>,
 ) -> anyhow::Result<BrewMaintenanceOutcome> {
-    let (outdated_out, outdated_err, outdated_status) =
-        command_for_brew(config, &["outdated", "--cask", "--quiet"])?;
+    brew_cask_maintenance_with_broker(config, logger, only, None)
+}
+
+fn brew_cask_maintenance_with_broker(
+    config: &MbrewConfig,
+    logger: &ModuleLogger,
+    only: Option<&std::collections::BTreeSet<String>>,
+    broker: Option<&crate::control::SharedBroker>,
+) -> anyhow::Result<BrewMaintenanceOutcome> {
+    let (outdated_out, outdated_err, outdated_status) = command_for_brew(
+        config,
+        &["outdated", "--cask", "--greedy-auto-updates", "--json=v2"],
+    )?;
     if outdated_status != 0 {
         bail!(
             "brew outdated cask listing failed: {}",
@@ -713,19 +1644,17 @@ fn brew_cask_maintenance(
         );
     }
 
-    let casks: Vec<String> = outdated_out
-        .lines()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-        .collect();
+    let mut casks = listed_casks(&outdated_out);
+    if let Some(only) = only {
+        casks.retain(|cask| only.contains(cask));
+    }
     let mut outcome = BrewMaintenanceOutcome::default();
 
     for cask in casks {
-        let identity = match cask_metadata(config, &cask) {
-            Ok(Some(identity)) => identity,
+        let metadata = match cask_metadata(config, &cask) {
+            Ok(Some(metadata)) => metadata,
             Ok(None) => {
-                defer_cask(
+                defer_cask_for_attention(
                     &mut outcome,
                     logger,
                     &cask,
@@ -734,38 +1663,34 @@ fn brew_cask_maintenance(
                 continue;
             }
             Err(error) => {
-                defer_cask(&mut outcome, logger, &cask, &error.to_string());
+                defer_cask_for_attention(&mut outcome, logger, &cask, &error.to_string());
                 continue;
             }
         };
 
-        let applications = match running_applications() {
-            Ok(applications) => applications,
-            Err(error) => {
-                defer_cask(
-                    &mut outcome,
-                    logger,
-                    &cask,
-                    &format!("could not verify running applications: {error}"),
-                );
-                continue;
-            }
-        };
-        if cask_is_running(&identity, &applications) {
-            defer_cask(
+        if defer_for_activity(&mut outcome, logger, &cask, &metadata.identity) {
+            continue;
+        }
+        let Some(broker) = broker else {
+            defer_cask_for_attention(
                 &mut outcome,
                 logger,
                 &cask,
-                "an application or helper from this cask is running",
+                "the authenticated scriptd privilege broker is unavailable; cask elevation is not permitted from a direct CLI run",
             );
             continue;
-        }
-
-        // `--no-quit` is defense-in-depth; the identity check above is what
-        // keeps Homebrew from replacing a bundle that is actively in use.
-        let upgrade = command_for_brew(config, &["upgrade", "--cask", "--no-quit", cask.as_str()]);
+        };
+        let upgrade = match brokered_cask_upgrade(config, &cask, &metadata.identity, broker) {
+            Ok(BrokerUpgradeResult::Completed(output)) => Ok(output),
+            Ok(BrokerUpgradeResult::Deferred(reason)) => {
+                defer_cask(&mut outcome, logger, &cask, &reason);
+                continue;
+            }
+            Err(error) => Err(error),
+        };
         match upgrade {
             Ok((stdout, stderr, 0)) => {
+                push_unique(&mut outcome.repaired_casks, &cask);
                 if stdout.trim().is_empty() {
                     logger.info(&format!("Upgraded cask {cask}"));
                 } else {
@@ -790,8 +1715,47 @@ fn brew_cask_maintenance(
     Ok(outcome)
 }
 
+fn defer_for_activity(
+    outcome: &mut BrewMaintenanceOutcome,
+    logger: &ModuleLogger,
+    cask: &str,
+    identity: &CaskRuntimeIdentity,
+) -> bool {
+    match cask_activity(identity) {
+        Ok(false) => false,
+        Ok(true) => {
+            defer_cask(
+                outcome,
+                logger,
+                cask,
+                "an application or helper from this cask is running",
+            );
+            true
+        }
+        Err(error) => {
+            defer_cask(
+                outcome,
+                logger,
+                cask,
+                &format!("could not verify cask activity: {error}"),
+            );
+            true
+        }
+    }
+}
+
 fn run_cleanup(config: &MbrewConfig, logger: &ModuleLogger) -> anyhow::Result<()> {
-    let (cleanup_out, _cleanup_err, _cleanup_status) = command_for_brew(config, &["cleanup"])?;
+    let (cleanup_out, cleanup_err, cleanup_status) = command_for_brew(config, &["cleanup"])?;
+    if cleanup_status != 0 {
+        anyhow::bail!(
+            "{}",
+            if cleanup_err.trim().is_empty() {
+                "brew cleanup returned a nonzero status".to_string()
+            } else {
+                cleanup_err.trim().to_string()
+            }
+        );
+    }
     if !cleanup_out.trim().is_empty() {
         logger.info(cleanup_out.trim());
     }
@@ -801,7 +1765,33 @@ fn run_cleanup(config: &MbrewConfig, logger: &ModuleLogger) -> anyhow::Result<()
 fn brew_maintenance(
     config: &MbrewConfig,
     logger: &ModuleLogger,
+    action: Option<&str>,
 ) -> anyhow::Result<BrewMaintenanceOutcome> {
+    brew_maintenance_with_broker(config, logger, action, None)
+}
+
+fn brew_maintenance_with_broker(
+    config: &MbrewConfig,
+    logger: &ModuleLogger,
+    action: Option<&str>,
+    broker: Option<&crate::control::SharedBroker>,
+) -> anyhow::Result<BrewMaintenanceOutcome> {
+    if action == Some("retry_pending") {
+        let only = retry_candidates()?;
+        let outcome = brew_cask_maintenance_with_broker(config, logger, Some(&only), broker)
+            .unwrap_or_else(|error| BrewMaintenanceOutcome {
+                cask_error: Some(error.to_string()),
+                ..BrewMaintenanceOutcome::default()
+            });
+        record_cask_ledger(&outcome, true)?;
+        if outcome.cask_error.is_none() {
+            clear_resolved_retries(&only, &outcome)?;
+        }
+        if let Some(error) = outcome.cask_error.as_deref() {
+            bail!("{error}");
+        }
+        return Ok(outcome);
+    }
     ensure_askpass(config, logger)?;
     trust_configured_taps(config, logger)?;
     let (update_out, update_err, status) = command_for_brew(config, &["update"])?;
@@ -825,23 +1815,152 @@ fn brew_maintenance(
         update_out.trim()
     });
 
-    let (formula_out, _formula_err, _formula_status) =
+    let (formula_out, formula_err, formula_status) =
         command_for_brew(config, &["upgrade", "--formula"])?;
     if !formula_out.trim().is_empty() {
         logger.info(formula_out.trim());
     }
-    let cask_result = brew_cask_maintenance(config, logger);
-    let cleanup_result = run_cleanup(config, logger);
-    let outcome = cask_result?;
-    cleanup_result?;
+    let mut outcome = brew_cask_maintenance_with_broker(config, logger, None, broker)
+        .unwrap_or_else(|error| BrewMaintenanceOutcome {
+            cask_error: Some(error.to_string()),
+            ..BrewMaintenanceOutcome::default()
+        });
+    if formula_status != 0 {
+        outcome.formula_error = Some(if formula_err.trim().is_empty() {
+            "brew upgrade --formula returned a nonzero status".to_string()
+        } else {
+            formula_err.trim().to_string()
+        });
+    }
+    if let Err(error) = run_cleanup(config, logger) {
+        outcome.cleanup_error = Some(error.to_string());
+    }
+    record_cask_ledger(&outcome, false)?;
     Ok(outcome)
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+struct PackageLedger {
+    #[serde(default)]
+    packages: Vec<PackageRecord>,
+    #[serde(default)]
+    formula_error: Option<String>,
+    #[serde(default)]
+    cleanup_error: Option<String>,
+    #[serde(default)]
+    cask_error: Option<String>,
+}
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PackageRecord {
+    name: String,
+    state: String,
+    reason: Option<String>,
+    attempts: u32,
+    retry: bool,
+}
+fn ledger_path() -> std::path::PathBuf {
+    crate::paths::resolve_state_dir().join("mbrew-outcomes.json")
+}
+fn read_ledger(path: &Path) -> anyhow::Result<PackageLedger> {
+    match std::fs::read_to_string(path) {
+        Ok(raw) => serde_json::from_str(&raw)
+            .with_context(|| format!("parse Homebrew outcome ledger at {}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(PackageLedger::default()),
+        Err(error) => Err(error)
+            .with_context(|| format!("read Homebrew outcome ledger at {}", path.display())),
+    }
+}
+fn load_ledger() -> anyhow::Result<PackageLedger> {
+    read_ledger(&ledger_path())
+}
+fn retry_candidates() -> anyhow::Result<std::collections::BTreeSet<String>> {
+    Ok(load_ledger()?
+        .packages
+        .into_iter()
+        .filter(|record| record.retry)
+        .map(|record| record.name)
+        .collect())
+}
+fn persist_ledger(path: &Path, ledger: &PackageLedger) -> anyhow::Result<()> {
+    let body = serde_json::to_vec_pretty(ledger)?;
+    crate::paths::write_private_atomic(path, &body)
+        .with_context(|| format!("persist Homebrew outcome ledger at {}", path.display()))
+}
+
+fn record_cask_ledger(outcome: &BrewMaintenanceOutcome, pending_retry: bool) -> anyhow::Result<()> {
+    let mut ledger = load_ledger()?;
+    if !pending_retry {
+        ledger.formula_error = outcome.formula_error.clone();
+        ledger.cleanup_error = outcome.cleanup_error.clone();
+    }
+    ledger.cask_error = outcome.cask_error.clone();
+    let updates = outcome
+        .repaired_casks
+        .iter()
+        .map(|name| (name.clone(), "updated".to_string(), false))
+        .chain(outcome.deferred_casks.iter().map(|name| {
+            let state = if outcome.attention_casks.contains(name) {
+                "attention"
+            } else {
+                "deferred"
+            };
+            (
+                name.clone(),
+                state.to_string(),
+                outcome.retryable_casks.contains(name),
+            )
+        }))
+        .chain(
+            outcome
+                .failed_casks
+                .iter()
+                .map(|name| (name.clone(), "attention".to_string(), false)),
+        );
+    for (name, state, retry) in updates {
+        let attempts = ledger
+            .packages
+            .iter()
+            .find(|record| record.name == name)
+            .map(|record| record.attempts.saturating_add(1))
+            .unwrap_or(1);
+        ledger.packages.retain(|record| record.name != name);
+        ledger.packages.push(PackageRecord {
+            reason: outcome.reasons.get(&name).cloned(),
+            name,
+            state,
+            attempts,
+            retry,
+        });
+    }
+    persist_ledger(&ledger_path(), &ledger)
+}
+
+fn clear_resolved_retries(
+    candidates: &std::collections::BTreeSet<String>,
+    outcome: &BrewMaintenanceOutcome,
+) -> anyhow::Result<()> {
+    let observed = outcome
+        .repaired_casks
+        .iter()
+        .chain(&outcome.deferred_casks)
+        .chain(&outcome.failed_casks)
+        .collect::<BTreeSet<_>>();
+    let mut ledger = load_ledger()?;
+    for record in &mut ledger.packages {
+        if candidates.contains(&record.name) && !observed.contains(&record.name) {
+            record.state = "current".to_string();
+            record.reason = None;
+            record.retry = false;
+        }
+    }
+    persist_ledger(&ledger_path(), &ledger)
 }
 
 pub fn setup(context: &mut ModuleContext) -> anyhow::Result<()> {
     let config = update_from_config(context)?;
     let password = credentials::admin_password_or_prompt()?;
     write_askpass(&config, &context.logger)?;
-    configure_sudo(&config, &password, &context.logger)?;
+    install_privilege_broker(&config, context, &password)?;
     context.logger.info("mbrew setup complete");
     println!("mbrew setup complete.");
     Ok(())
@@ -849,18 +1968,37 @@ pub fn setup(context: &mut ModuleContext) -> anyhow::Result<()> {
 
 pub fn run_once(context: &mut ModuleContext) -> anyhow::Result<Option<ModuleStatus>> {
     let config = update_from_config(context)?;
-    let result = brew_maintenance(&config, &context.logger);
+    let result = brew_maintenance_with_broker(
+        &config,
+        &context.logger,
+        context.action.as_deref(),
+        context.broker.as_ref(),
+    );
     let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
 
     match result {
         Ok(outcome) => {
             state.last_error = None;
             state.last_run_at = Some(chrono::Utc::now().to_rfc3339());
+            let stage_error = outcome
+                .formula_error
+                .clone()
+                .or(outcome.cleanup_error.clone())
+                .or(outcome.cask_error.clone());
             state.repaired_casks = outcome.repaired_casks;
             state.deferred_casks = outcome.deferred_casks;
             state.failed_casks = outcome.failed_casks;
             state.last_message = Some(maintenance_message(&state));
-            if !state.failed_casks.is_empty() {
+            if let Some(error) = stage_error.as_deref() {
+                state.last_message = Some(format!(
+                    "{}; stage error: {error}",
+                    state
+                        .last_message
+                        .as_deref()
+                        .unwrap_or("Homebrew maintenance failed")
+                ));
+            }
+            if !state.failed_casks.is_empty() || stage_error.is_some() {
                 let error = state.last_message.clone().unwrap_or_else(|| {
                     "Homebrew maintenance failed for one or more casks".to_string()
                 });
@@ -1021,6 +2159,44 @@ mod tests {
     }
 
     #[test]
+    fn broker_daemon_pins_the_installed_service_identity() {
+        let plist = broker_daemon_plist(Path::new("/tmp/scriptd"), "com.example.scriptd");
+        assert!(
+            plist.contains("<key>SCRIPTD_SERVICE_LABEL</key><string>com.example.scriptd</string>")
+        );
+        let escaped = broker_daemon_plist(Path::new("/tmp/a&b"), "com.example.scriptd");
+        assert!(escaped.contains("<string>/tmp/a&amp;b</string>"));
+    }
+
+    #[test]
+    fn outcome_ledger_persistence_failures_are_reported() -> anyhow::Result<()> {
+        let root = tempdir()?;
+        let blocked_parent = root.path().join("not-a-directory");
+        fs::write(&blocked_parent, "file blocks ledger directory")?;
+
+        let error = persist_ledger(
+            &blocked_parent.join("ledger.json"),
+            &PackageLedger::default(),
+        )
+        .expect_err("ledger persistence must fail when its parent is not a directory");
+        assert!(error
+            .to_string()
+            .contains("persist Homebrew outcome ledger"));
+        Ok(())
+    }
+
+    #[test]
+    fn corrupt_outcome_ledger_blocks_retry_without_discarding_state() -> anyhow::Result<()> {
+        let root = tempdir()?;
+        let path = root.path().join("ledger.json");
+        fs::write(&path, "{not valid json")?;
+
+        let error = read_ledger(&path).expect_err("corrupt retry ledger must be surfaced");
+        assert!(error.to_string().contains("parse Homebrew outcome ledger"));
+        Ok(())
+    }
+
+    #[test]
     fn cask_runtime_identity_extracts_exact_bundle_ids_and_app_paths() -> anyhow::Result<()> {
         let metadata = serde_json::json!({
             "artifacts": [
@@ -1033,6 +2209,7 @@ mod tests {
                 },
                 {"app": ["Demo.app"]},
                 {"suite": ["Demo Suite"]},
+                {"uninstall": {"launchctl": ["com.example.agent"], "pkgutil": ["com.example.pkg"]}},
                 {"postflight_steps": [{"type": "terminate_process", "name": "/Applications/Demo.app"}]}
             ]
         });
@@ -1040,6 +2217,9 @@ mod tests {
 
         assert!(identity.bundle_ids.contains("com.example.Demo"));
         assert!(identity.bundle_ids.contains("com.example.DemoHelper"));
+        assert!(identity.service_names.contains("com.example.agent"));
+        assert!(identity.package_receipts.contains("com.example.pkg"));
+        assert!(identity_is_known(&identity));
         assert!(identity.app_paths.contains("/Applications/Demo Suite"));
         assert_eq!(
             identity.app_paths,
@@ -1096,6 +2276,207 @@ mod tests {
             identity.bundle_ids,
             BTreeSet::from(["com.example.good".to_string()])
         );
+
+        let unresolved_uninstall = cask_runtime_identity(&serde_json::json!({
+            "artifacts": [{
+                "app": ["Demo.app"],
+                "uninstall": {"launchctl": ["com.example.good", "${SERVICE_LABEL}"]}
+            }]
+        }))
+        .expect("valid metadata with an unresolved service declaration");
+        assert!(unresolved_uninstall.observation_incomplete);
+        assert!(!identity_is_known(&unresolved_uninstall));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn service_activity_checks_console_and_system_launchd_domains() -> anyhow::Result<()> {
+        let root = tempdir()?;
+        let bin = root.path().join("bin");
+        fs::create_dir_all(&bin)?;
+        let log = root.path().join("launchctl.log");
+        write_script(
+            &bin.join("launchctl"),
+            "#!/bin/sh\necho \"$2\" >> \"$LAUNCHCTL_TEST_LOG\"\nif [ \"$2\" = \"system/com.example.agent\" ]; then echo 'state = waiting'; exit 0; fi\necho 'Could not find service' >&2\nexit 113\n",
+        )?;
+        let old_log = std::env::var("LAUNCHCTL_TEST_LOG").ok();
+        std::env::set_var("LAUNCHCTL_TEST_LOG", &log);
+        let running = service_is_running_with(&bin.join("launchctl"), "com.example.agent");
+        if let Some(value) = old_log {
+            std::env::set_var("LAUNCHCTL_TEST_LOG", value);
+        } else {
+            std::env::remove_var("LAUNCHCTL_TEST_LOG");
+        }
+
+        assert!(running?);
+        let queried = fs::read_to_string(log)?;
+        let uid = unsafe { libc::geteuid() };
+        assert!(queried.contains(&format!("gui/{uid}/com.example.agent")));
+        assert!(queried.contains("system/com.example.agent"));
+        Ok(())
+    }
+
+    #[test]
+    fn failed_launchctl_observation_is_not_treated_as_inactive() -> anyhow::Result<()> {
+        let root = tempdir()?;
+        let launchctl = root.path().join("launchctl");
+        write_script(
+            &launchctl,
+            "#!/bin/sh\necho 'Operation not permitted' >&2\nexit 1\n",
+        )?;
+
+        let error = service_is_running_with(&launchctl, "com.example.agent")
+            .expect_err("failed service observation must defer the cask");
+        assert!(error.to_string().contains("could not establish activity"));
+        Ok(())
+    }
+
+    #[test]
+    fn binary_activity_matches_resolved_symlink_targets() -> anyhow::Result<()> {
+        let root = tempdir()?;
+        let target = root.path().join("installed/helper");
+        let alias = root.path().join("bin/helper");
+        fs::create_dir_all(target.parent().expect("target parent"))?;
+        fs::create_dir_all(alias.parent().expect("alias parent"))?;
+        fs::write(&target, "helper")?;
+        std::os::unix::fs::symlink(&target, &alias)?;
+
+        assert!(executable_matches(
+            &BTreeSet::from([alias.to_string_lossy().into_owned()]),
+            &[target]
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn binary_targets_resolve_from_the_configured_homebrew_prefix() -> anyhow::Result<()> {
+        let root = tempdir()?;
+        let brew_bin = root.path().join("opt/homebrew/bin");
+        fs::create_dir_all(&brew_bin)?;
+        let brew = brew_bin.join("brew");
+        fs::write(&brew, "")?;
+        let alternate_bin = root.path().join("usr/local/bin");
+        fs::create_dir_all(&alternate_bin)?;
+        std::os::unix::fs::symlink(&brew, alternate_bin.join("brew"))?;
+
+        let metadata = serde_json::json!({
+            "artifacts": [{"binary": [{"target": "demo-helper", "source": "helper"}]}]
+        });
+        let bin_dir = homebrew_bin_dir(&alternate_bin.join("brew"))?;
+        assert_eq!(bin_dir, brew_bin.canonicalize()?);
+        let identity = cask_runtime_identity_with_bin_dir(&metadata, &bin_dir)?;
+        assert!(identity
+            .binary_paths
+            .contains(bin_dir.join("demo-helper").to_str().expect("UTF-8 path")));
+        assert!(identity_is_known(&identity));
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn package_receipt_resolves_relocated_relative_helper_and_service() -> anyhow::Result<()> {
+        let root = tempdir()?;
+        let volume = root.path().join("mounted-volume");
+        let install_root = volume.join("Vendor/Scriptd");
+        let plist = install_root.join("Library/LaunchDaemons/com.example.helper.plist");
+        let helper = install_root.join("Library/PrivilegedHelperTools/example-helper");
+        fs::create_dir_all(plist.parent().expect("plist parent"))?;
+        fs::create_dir_all(helper.parent().expect("helper parent"))?;
+        fs::write(
+            &plist,
+            "<?xml version=\"1.0\"?><plist><dict><key>Label</key><string>com.example.helper</string></dict></plist>",
+        )?;
+        fs::write(&helper, "helper")?;
+
+        let pkgutil = root.path().join("pkgutil");
+        write_script(
+            &pkgutil,
+            "#!/bin/sh\nif [ \"$1\" = \"--pkg-info-plist\" ]; then echo '<plist />'; exit 0; fi\nif [ \"$1\" = \"--files\" ]; then printf '%s\\n' 'Library/LaunchDaemons/com.example.helper.plist' 'Library/PrivilegedHelperTools/example-helper'; exit 0; fi\necho unsupported >&2\nexit 2\n",
+        )?;
+        fs::write(
+            root.path().join("receipt-info.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "volume": volume.to_string_lossy(),
+                "install-location": "/Vendor/Scriptd"
+            }))?,
+        )?;
+        let plutil = root.path().join("plutil");
+        write_script(
+            &plutil,
+            "#!/bin/sh\ncat >/dev/null\ncat \"$(dirname \"$0\")/receipt-info.json\"\n",
+        )?;
+
+        let (paths, services) = resolve_package_receipts_with_tools(
+            &BTreeSet::from(["com.example.product".to_string()]),
+            &pkgutil,
+            &plutil,
+        )?;
+        let helper_path = helper.canonicalize()?.to_string_lossy().into_owned();
+        let plist_path = plist.canonicalize()?.to_string_lossy().into_owned();
+        assert!(paths.contains(&plist_path));
+        assert!(paths.contains(&helper_path));
+        assert!(services.contains("com.example.helper"));
+        assert!(executable_matches(&paths, &[helper]));
+        Ok(())
+    }
+
+    #[test]
+    fn missing_package_receipt_location_is_unknown_activity() -> anyhow::Result<()> {
+        let root = tempdir()?;
+        let pkgutil = root.path().join("pkgutil");
+        write_script(
+            &pkgutil,
+            "#!/bin/sh\necho 'receipt metadata unavailable' >&2\nexit 1\n",
+        )?;
+        let plutil = root.path().join("plutil");
+        write_script(&plutil, "#!/bin/sh\ncat >/dev/null\nexit 1\n")?;
+
+        let error = resolve_package_receipts_with_tools(
+            &BTreeSet::from(["com.example.product".to_string()]),
+            &pkgutil,
+            &plutil,
+        )
+        .expect_err("missing package location must defer the cask");
+        assert!(error
+            .to_string()
+            .contains("could not establish package receipt location"));
+        Ok(())
+    }
+
+    #[test]
+    fn missing_package_receipt_files_are_unknown_activity() -> anyhow::Result<()> {
+        let root = tempdir()?;
+        let volume = root.path().join("volume");
+        let install_root = volume.join("Vendor/Scriptd");
+        fs::create_dir_all(&install_root)?;
+        let pkgutil = root.path().join("pkgutil");
+        write_script(
+            &pkgutil,
+            "#!/bin/sh\nif [ \"$1\" = \"--pkg-info-plist\" ]; then echo '<plist />'; exit 0; fi\necho 'receipt missing' >&2\nexit 1\n",
+        )?;
+        fs::write(
+            root.path().join("receipt-info.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "volume": volume.to_string_lossy(),
+                "install-location": "/Vendor/Scriptd"
+            }))?,
+        )?;
+        let plutil = root.path().join("plutil");
+        write_script(
+            &plutil,
+            "#!/bin/sh\ncat >/dev/null\ncat \"$(dirname \"$0\")/receipt-info.json\"\n",
+        )?;
+
+        let error = resolve_package_receipts_with_tools(
+            &BTreeSet::from(["com.example.product".to_string()]),
+            &pkgutil,
+            &plutil,
+        )
+        .expect_err("failed receipt observation must be surfaced");
+        assert!(error
+            .to_string()
+            .contains("could not establish installed files"));
+        Ok(())
     }
 
     #[test]
@@ -1153,7 +2534,7 @@ if [ "$1" = "update" ]; then
   exit 0
 fi
 if [ "$1" = "upgrade" ] && [ "$2" = "--formula" ]; then exit 0; fi
-if [ "$1" = "outdated" ] && [ "$2" = "--cask" ] && [ "$3" = "--quiet" ]; then exit 0; fi
+if [ "$1" = "outdated" ] && [ "$2" = "--cask" ]; then printf '%s\n' '{{"casks":[]}}'; exit 0; fi
 if [ "$1" = "cleanup" ]; then exit 0; fi
 echo unsupported-command >&2
 exit 1
@@ -1179,6 +2560,7 @@ exit 1
         brew_maintenance(
             &config,
             &ModuleLogger::new(root.path().to_path_buf(), "mbrew", false),
+            None,
         )?;
 
         let log = fs::read_to_string(log)?;
@@ -1208,6 +2590,7 @@ exit 1
         let error = brew_maintenance(
             &config,
             &ModuleLogger::new(root.path().to_path_buf(), "mbrew", false),
+            None,
         )
         .expect_err("untrusted entries must stop maintenance");
 
@@ -1227,8 +2610,8 @@ exit 1
 echo "$@" >> "$BREW_TEST_LOG"
 if [ "$1" = "update" ]; then exit 0; fi
 if [ "$1" = "upgrade" ] && [ "$2" = "--formula" ]; then exit 0; fi
-if [ "$1" = "outdated" ] && [ "$2" = "--cask" ] && [ "$3" = "--quiet" ]; then
-  printf '%s\n' running-cask closed-cask opaque-cask malformed-cask
+if [ "$1" = "outdated" ] && [ "$2" = "--cask" ]; then
+  printf '%s\n' '{{"casks":[{{"name":"running-cask","current_version":"2.0"}},{{"name":"closed-cask","current_version":"2.0"}},{{"name":"opaque-cask","current_version":"2.0"}},{{"name":"malformed-cask","current_version":"2.0"}}]}}'
   exit 0
 fi
 if [ "$1" = "info" ] && [ "$2" = "--cask" ]; then
@@ -1290,6 +2673,7 @@ exit 1
             brew_maintenance(
                 &config,
                 &ModuleLogger::new(root.path().to_path_buf(), "mbrew", false),
+                None,
             )
         });
         if let Some(value) = previous_log {
@@ -1302,22 +2686,145 @@ exit 1
 
     #[test]
     #[serial_test::serial]
+    fn pending_retry_only_upgrades_retryable_casks_and_preserves_full_pass_errors(
+    ) -> anyhow::Result<()> {
+        let root = tempdir()?;
+        let home = root.path().join("home");
+        let fake_bin = root.path().join("bin");
+        fs::create_dir_all(&home)?;
+        fs::create_dir_all(&fake_bin)?;
+        let brew_log = root.path().join("brew.log");
+        let brew = fake_bin.join("brew");
+        let askpass = root.path().join("askpass.sh");
+        let script = r#"#!/bin/sh
+echo "$@" >> "$BREW_TEST_LOG"
+if [ "$1" = "outdated" ]; then
+  printf '%s\n' '{"casks":[{"name":"pending-cask","current_version":"1.0"},{"name":"attention-cask","current_version":"1.0"}]}'
+  exit 0
+fi
+if [ "$1" = "info" ]; then
+  printf '%s\n' '{"casks":[{"token":"pending-cask","artifacts":[{"app":["Pending.app"],"target":"/Applications/Pending.app"}]}]}'
+  exit 0
+fi
+if [ "$1" = "upgrade" ] && [ "$4" = "pending-cask" ]; then exit 0; fi
+echo unexpected-command >&2
+exit 1
+"#;
+        write_script(&brew, script)?;
+        write_script(
+            &fake_bin.join("osascript"),
+            "#!/bin/sh\nprintf '%s\\n' '[]'\n",
+        )?;
+        fs::write(&askpass, "#!/bin/sh\nexit 1\n")?;
+        let config = default_config(root.path(), &brew, &askpass);
+        let state_dir = home.join("Library/Application Support/scriptd");
+        fs::create_dir_all(&state_dir)?;
+        let ledger_path = state_dir.join("mbrew-outcomes.json");
+        fs::write(
+            &ledger_path,
+            serde_json::to_vec(&PackageLedger {
+                packages: vec![
+                    PackageRecord {
+                        name: "pending-cask".to_string(),
+                        state: "deferred".to_string(),
+                        reason: Some("application running".to_string()),
+                        attempts: 2,
+                        retry: true,
+                    },
+                    PackageRecord {
+                        name: "attention-cask".to_string(),
+                        state: "attention".to_string(),
+                        reason: Some("metadata unavailable".to_string()),
+                        attempts: 1,
+                        retry: false,
+                    },
+                    PackageRecord {
+                        name: "stale-cask".to_string(),
+                        state: "deferred".to_string(),
+                        reason: Some("application running".to_string()),
+                        attempts: 3,
+                        retry: true,
+                    },
+                ],
+                formula_error: Some("prior formula warning".to_string()),
+                cleanup_error: None,
+                cask_error: None,
+            })?,
+        )?;
+
+        let previous_home = std::env::var("HOME").ok();
+        let previous_log = std::env::var("BREW_TEST_LOG").ok();
+        std::env::set_var("HOME", &home);
+        std::env::set_var("BREW_TEST_LOG", &brew_log);
+        let result = with_path_scope(&fake_bin, || {
+            brew_maintenance(
+                &config,
+                &ModuleLogger::new(root.path().to_path_buf(), "mbrew", false),
+                Some("retry_pending"),
+            )
+        });
+        if let Some(value) = previous_home {
+            std::env::set_var("HOME", value);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        if let Some(value) = previous_log {
+            std::env::set_var("BREW_TEST_LOG", value);
+        } else {
+            std::env::remove_var("BREW_TEST_LOG");
+        }
+
+        let outcome = result?;
+        assert!(outcome.repaired_casks.is_empty());
+        assert_eq!(outcome.deferred_casks, vec!["pending-cask"]);
+        let log = fs::read_to_string(&brew_log)?;
+        assert!(!log.contains("upgrade --cask --no-quit pending-cask"));
+        assert!(!log.contains("attention-cask"));
+        assert!(!log.contains(" update"));
+        assert!(!log.contains("upgrade --formula"));
+        assert!(!log.contains("cleanup"));
+
+        let ledger: PackageLedger = serde_json::from_slice(&fs::read(ledger_path)?)?;
+        assert_eq!(
+            ledger.formula_error.as_deref(),
+            Some("prior formula warning")
+        );
+        assert!(ledger
+            .packages
+            .iter()
+            .any(|item| item.name == "pending-cask" && item.state == "attention" && !item.retry));
+        assert!(ledger
+            .packages
+            .iter()
+            .any(|item| item.name == "attention-cask" && item.state == "attention" && !item.retry));
+        assert!(ledger.packages.iter().any(|item| {
+            item.name == "stale-cask"
+                && item.state == "current"
+                && !item.retry
+                && item.reason.is_none()
+        }));
+        Ok(())
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn brew_maintenance_defers_running_opaque_and_malformed_casks() -> anyhow::Result<()> {
         let (outcome, log) = run_safe_cask_brew_test(
             0,
             "#!/bin/sh\nprintf '%s\\n' '[{\"bundleId\":\"com.example.running\",\"path\":\"/Applications/Running.app/Contents/MacOS/Running\"}]'\nexit 0\n",
         )?;
-        assert_eq!(outcome.repaired_casks, Vec::<String>::new());
+        assert!(outcome.repaired_casks.is_empty());
         assert_eq!(outcome.failed_casks, Vec::<String>::new());
         assert_eq!(
             outcome.deferred_casks,
             vec![
                 "running-cask".to_string(),
+                "closed-cask".to_string(),
                 "opaque-cask".to_string(),
                 "malformed-cask".to_string()
             ]
         );
-        assert!(log.contains("upgrade --cask --no-quit closed-cask"));
+        assert!(!log.contains("upgrade --cask --no-quit closed-cask"));
         assert!(!log.contains("--force"));
         assert!(!log.contains("uninstall"));
         assert!(!log.contains("install"));
@@ -1351,10 +2858,16 @@ exit 1
             run_safe_cask_brew_test(1, "#!/bin/sh\nprintf '%s\\n' '[]'\nexit 0\n")?;
         assert_eq!(
             outcome.deferred_casks,
-            vec!["opaque-cask".to_string(), "malformed-cask".to_string()]
+            vec![
+                "running-cask".to_string(),
+                "closed-cask".to_string(),
+                "opaque-cask".to_string(),
+                "malformed-cask".to_string()
+            ]
         );
-        assert_eq!(outcome.failed_casks, vec!["closed-cask".to_string()]);
-        assert!(log.contains("upgrade --cask --no-quit closed-cask"));
+        assert!(outcome.failed_casks.is_empty());
+        assert!(outcome.deferred_casks.contains(&"closed-cask".to_string()));
+        assert!(!log.contains("upgrade --cask --no-quit closed-cask"));
         assert!(!log.contains("--force"));
         assert!(!log.contains("uninstall"));
         assert!(!log.contains("install"));
@@ -1432,11 +2945,42 @@ exit 1
         let askpass = root.path().join("askpass.sh");
         fs::write(&askpass, "SECRET=1\n")?;
         let brew = fake_bin.join("brew");
-        write_script(&brew, "#!/bin/sh\necho \"$SUDO_ASKPASS\"\nexit 0\n")?;
+        write_script(&brew, "#!/bin/sh\nprintf \"$SUDO_ASKPASS\"\nexit 0\n")?;
         let config = default_config(root.path(), &brew, &askpass);
         let (stdout, _, code) = command_for_brew(&config, &["--version"])?;
         assert_eq!(code, 0);
         assert_eq!(stdout.trim(), askpass.to_string_lossy());
+        Ok(())
+    }
+
+    #[test]
+    fn root_service_runs_homebrew_as_the_console_user() -> anyhow::Result<()> {
+        let root = tempdir()?;
+        let brew = root.path().join("brew");
+        let askpass = root.path().join("askpass helper.sh");
+        let config = default_config(root.path(), &brew, &askpass);
+
+        let command = build_brew_command(&config, &["upgrade", "--formula"], 0, Some(501))?;
+        assert_eq!(command.get_program(), "/usr/bin/sudo");
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let expected = [
+            "-n".to_string(),
+            "-u".to_string(),
+            "#501".to_string(),
+            "-H".to_string(),
+            "--".to_string(),
+            "/usr/bin/env".to_string(),
+            format!("SUDO_ASKPASS={}", askpass.display()),
+            brew.to_string_lossy().into_owned(),
+            "upgrade".to_string(),
+            "--formula".to_string(),
+        ];
+        assert_eq!(args, expected);
+        assert!(build_brew_command(&config, &["upgrade"], 0, Some(0)).is_err());
+        assert!(build_brew_command(&config, &["upgrade"], 0, None).is_err());
         Ok(())
     }
 }

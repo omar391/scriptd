@@ -1,11 +1,14 @@
 use anyhow::Context;
 use std::env;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+mod broker;
 mod config;
+mod control;
 mod credentials;
+mod execution_lock;
 mod launchd;
 mod logger;
 mod modules;
@@ -14,6 +17,7 @@ mod schema;
 mod status;
 mod supervisor;
 mod triggers;
+mod web;
 use crate::modules::BuiltInModule;
 
 fn usage() {
@@ -28,6 +32,7 @@ fn usage() {
     println!("  scriptd.sh miwatch remote verify");
     println!("  scriptd.sh config <module> show");
     println!("  scriptd.sh config <module> [--enable|--disable]");
+    println!("  scriptd.sh broker activate");
     println!("  scriptd.sh status");
     println!("  scriptd.sh schema service");
     println!("  scriptd.sh schema module <module>");
@@ -120,8 +125,8 @@ fn parse_and_update_module_config(args: &[String], repo_root: PathBuf) -> anyhow
                 disable_seen = true;
                 enabled = Some(false);
             }
-            "--every-seconds" | "--every-minutes" | "--every-hours" | "--daily-at"
-            | "--cron" | "--weekday" | "--window-start" | "--window-end" => anyhow::bail!(
+            "--every-seconds" | "--every-minutes" | "--every-hours" | "--daily-at" | "--cron"
+            | "--weekday" | "--window-start" | "--window-end" => anyhow::bail!(
                 "schedule flags were removed; author complex rules in modules.<module>.triggers in service.yaml"
             ),
             other => anyhow::bail!("unknown config flag: {other}"),
@@ -177,6 +182,166 @@ fn cmd_run(args: &[String], root: PathBuf) -> anyhow::Result<()> {
     let module = &args[0];
     BuiltInModule::kind_from_id(module)?;
     supervisor::run_one_module(root, module)
+}
+
+fn cmd_broker(args: &[String], root: &Path) -> ExitCode {
+    use base64::Engine;
+    use std::time::Duration;
+
+    let fail = |message: &str| {
+        eprintln!("{message}");
+        ExitCode::from(1)
+    };
+    match args.first().map(String::as_str) {
+        Some("serve") if args.len() == 1 => {
+            return match control::run_broker_service(root.to_path_buf()) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => fail(&error.to_string()),
+            };
+        }
+        Some("activate") if args.len() == 1 => {
+            if unsafe { libc::geteuid() } != 0 {
+                return fail("activate the privilege broker with administrator privileges");
+            }
+            if let Err(error) = control::broker_activation_status(root) {
+                return fail(&format!(
+                    "privilege broker activation was rejected: {error}"
+                ));
+            }
+            let plist = "/Library/LaunchDaemons/com.astronlab.scriptd.broker.plist";
+            return match std::process::Command::new("/bin/launchctl")
+                .args(["bootstrap", "system", plist])
+                .status()
+            {
+                Ok(status) if status.success() => {
+                    println!("Activated the generation-bound scriptd privilege broker.");
+                    ExitCode::SUCCESS
+                }
+                Ok(status) => fail(&format!("launchctl bootstrap failed with status {status}")),
+                Err(error) => fail(&format!("start privilege broker: {error}")),
+            };
+        }
+        Some("exec") => {}
+        _ => {
+            return fail(
+                "broker supports: activate, or exec --job <id> --token <capability> -- <command> [args…]",
+            );
+        }
+    }
+    if args.first().map(String::as_str) != Some("exec") {
+        return fail(
+            "broker supports only: exec --job <id> --token <capability> -- <command> [args…]",
+        );
+    }
+    let mut job_id = None;
+    let mut token = None;
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--job" if index + 1 < args.len() => {
+                job_id = Some(args[index + 1].clone());
+                index += 2;
+            }
+            "--token" if index + 1 < args.len() => {
+                token = Some(args[index + 1].clone());
+                index += 2;
+            }
+            "--" => {
+                index += 1;
+                break;
+            }
+            _ => return fail("broker execution arguments are invalid"),
+        }
+    }
+    let (Some(job_id), Some(token), Some(program)) = (job_id, token, args.get(index).cloned())
+    else {
+        return fail("broker execution requires a job, capability, and command");
+    };
+    let command_args = args[index + 1..].to_vec();
+    let mut stdin = Vec::new();
+    if let Err(error) = std::io::stdin().read_to_end(&mut stdin) {
+        return fail(&format!("read broker command stdin: {error}"));
+    }
+    let payload = serde_json::json!({
+        "args": command_args,
+        "cwd": match std::env::current_dir() {
+            Ok(path) => path.to_string_lossy().into_owned(),
+            Err(error) => return fail(&format!("resolve broker working directory: {error}")),
+        },
+        "env": std::env::vars().collect::<Vec<_>>(),
+        "stdin": base64::engine::general_purpose::STANDARD.encode(stdin),
+    });
+    let request_id = format!(
+        "broker-{}-{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+    let request = control::Request {
+        v: control::PROTOCOL_VERSION,
+        id: request_id.clone(),
+        op: "broker_exec".to_string(),
+        repo: root.to_string_lossy().into_owned(),
+        document: Some(program),
+        module: Some(job_id),
+        yaml: Some(payload.to_string()),
+        base_digest: None,
+        request_id: Some(token),
+        bypass: false,
+        action: Some(request_id),
+        max_lines: None,
+        severity: None,
+        query: None,
+    };
+    let uid = match credentials::console_uid() {
+        Ok(uid) => uid,
+        Err(error) => return fail(&error.to_string()),
+    };
+    let socket = control::broker_socket_path(root, uid);
+    let response = match control::transact_with_timeout(
+        &socket,
+        &request,
+        Duration::from_secs(15 * 60 + 10),
+    ) {
+        Ok(response) if response.ok => response,
+        Ok(response) => {
+            return fail(
+                response
+                    .message
+                    .as_deref()
+                    .unwrap_or("broker rejected command"),
+            );
+        }
+        Err(error) => return fail(&format!("broker request failed: {error}")),
+    };
+    let Some(snapshot) = response.snapshot else {
+        return fail("broker returned no command result");
+    };
+    let Some(status) = snapshot.get("status").and_then(serde_json::Value::as_i64) else {
+        return fail("broker returned an invalid command status");
+    };
+    let decode_output = |key: &str| -> anyhow::Result<Vec<u8>> {
+        let Some(encoded) = snapshot.get(key).and_then(serde_json::Value::as_str) else {
+            return Ok(Vec::new());
+        };
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .with_context(|| format!("broker returned invalid {key}"))
+    };
+    let stdout = match decode_output("stdout") {
+        Ok(output) => output,
+        Err(error) => return fail(&error.to_string()),
+    };
+    let stderr = match decode_output("stderr") {
+        Ok(output) => output,
+        Err(error) => return fail(&error.to_string()),
+    };
+    if let Err(error) = std::io::stdout().write_all(&stdout) {
+        return fail(&format!("write broker command stdout: {error}"));
+    }
+    if let Err(error) = std::io::stderr().write_all(&stderr) {
+        return fail(&format!("write broker command stderr: {error}"));
+    }
+    ExitCode::from(status.clamp(0, 255) as u8)
 }
 
 fn cmd_miwatch(args: &[String], root: PathBuf) -> anyhow::Result<()> {
@@ -291,12 +456,26 @@ fn cmd_test() -> anyhow::Result<()> {
 fn main() -> ExitCode {
     let mut args = env::args().skip(1).collect::<Vec<_>>();
     if args.is_empty() {
+        if env::var("SCRIPTD_BROWSER_BRIDGE").ok().as_deref() == Some("1") {
+            return exit_from(web::serve_bridge());
+        }
+        if web::should_open_browser(
+            args.len(),
+            web::stdin_is_interactive(),
+            web::stdout_is_interactive(),
+        ) {
+            let root = paths::resolve_repo_root();
+            return exit_from(web::open_control_center(&root));
+        }
         usage();
         return ExitCode::SUCCESS;
     }
 
     let root = paths::resolve_repo_root();
     let command = args.remove(0);
+    if command == "broker" {
+        return cmd_broker(&args, &root);
+    }
     let outcome = match command.as_str() {
         "status" => cmd_status(root),
         "start" => cmd_start(&args, root),
@@ -319,6 +498,16 @@ fn main() -> ExitCode {
     };
 
     match outcome {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{error:?}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn exit_from(result: anyhow::Result<()>) -> ExitCode {
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{error:?}");

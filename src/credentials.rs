@@ -1,8 +1,9 @@
+use anyhow::Context;
 use std::collections::HashMap;
+use std::ffi::CStr;
 #[cfg(not(test))]
 use std::fs;
 use std::io::Write;
-#[cfg(not(test))]
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -49,6 +50,50 @@ pub fn current_user() -> String {
         .filter(|output| output.status.success())
         .map(|output| String::from_utf8_lossy(&output.stdout).into_owned());
     resolve_user_name(user, logname, id_output)
+}
+
+pub fn console_uid() -> anyhow::Result<u32> {
+    let output = Command::new("/usr/bin/stat")
+        .args(["-f", "%u", "/dev/console"])
+        .output()
+        .context("resolve the logged-in macOS console user's UID")?;
+    if !output.status.success() {
+        anyhow::bail!("could not resolve the logged-in macOS console user's UID");
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u32>()
+        .context("console user UID was not numeric")
+}
+
+pub fn home_dir_for_uid(uid: u32) -> anyhow::Result<PathBuf> {
+    let mut record = std::mem::MaybeUninit::<libc::passwd>::uninit();
+    let mut result = std::ptr::null_mut();
+    let mut buffer = vec![0_u8; 16 * 1024];
+    let status = unsafe {
+        libc::getpwuid_r(
+            uid,
+            record.as_mut_ptr(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut result,
+        )
+    };
+    if status != 0 {
+        return Err(std::io::Error::from_raw_os_error(status))
+            .with_context(|| format!("resolve home directory for UID {uid}"));
+    }
+    if result.is_null() {
+        anyhow::bail!("no account exists for UID {uid}");
+    }
+    let record = unsafe { record.assume_init_ref() };
+    let home = unsafe { CStr::from_ptr(record.pw_dir) }
+        .to_string_lossy()
+        .into_owned();
+    if home.is_empty() || !PathBuf::from(&home).is_absolute() {
+        anyhow::bail!("account home directory for UID {uid} is invalid");
+    }
+    Ok(PathBuf::from(home))
 }
 
 pub fn scriptd_service(scope: &str, name: &str) -> String {
@@ -342,5 +387,12 @@ mod tests {
             ),
             "omar"
         );
+    }
+
+    #[test]
+    fn home_dir_lookup_uses_the_requested_account_uid() {
+        let home = home_dir_for_uid(unsafe { libc::geteuid() }).expect("current account home");
+        assert!(home.is_absolute());
+        assert!(home_dir_for_uid(u32::MAX).is_err());
     }
 }

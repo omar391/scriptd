@@ -13,6 +13,8 @@ pub struct TriggerConfig {
     pub module: String,
     pub fire: FirePolicy,
     pub when: Condition,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
 }
 
 impl TriggerConfig {
@@ -21,7 +23,15 @@ impl TriggerConfig {
             anyhow::bail!("trigger module must not be empty");
         }
         self.when.validate().context("invalid trigger condition")?;
-        self.fire.validate().context("invalid trigger fire policy")
+        self.fire
+            .validate()
+            .context("invalid trigger fire policy")?;
+        if let Some(action) = &self.action {
+            if action != "retry_pending" && action != "full" {
+                anyhow::bail!("unsupported trigger action {action}");
+            }
+        }
+        Ok(())
     }
 }
 

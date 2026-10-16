@@ -24,7 +24,9 @@ serde_json = "1.0"
 serde_yaml = "0.9"
 schemars = "1.2"
 sysinfo = { version = "0.32", default-features = true, features = ["system"] }
-tokio = { version = "1.39", features = ["macros", "rt", "fs", "process", "signal", "time", "sync"] }
+tokio = { version = "1.39", features = ["macros", "rt", "rt-multi-thread", "fs", "process", "signal", "time", "sync", "net", "io-util"] }
+axum = { version = "0.7.9", default-features = false, features = ["http1", "json", "tokio", "query"] }
+futures-util = "0.3"
 security-framework = "3.7.0"
 
 [features]
