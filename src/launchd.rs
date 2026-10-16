@@ -128,19 +128,39 @@ fn write_scriptd_wrapper(binary_path: &Path, config: &ServiceConfig) -> Result<P
         let _ = fs::copy(icon_src, icon_dest)?;
     }
 
-    let script = format!(
-        "#!/bin/sh\nset -eu\nexport SCRIPTD_ROOT_DIR=\"{}\"\nexport SCRIPTD_ENTRY_SHELL_PATH=\"{}/scriptd.sh\"\nrelease_binary_is_stale() {{\n  binary=\"$1\"\n  root=\"$2\"\n  [ -x \"$binary\" ] || return 0\n  [ \"$root/Cargo.toml\" -nt \"$binary\" ] && return 0\n  [ -f \"$root/Cargo.lock\" ] && [ \"$root/Cargo.lock\" -nt \"$binary\" ] && return 0\n  [ -f \"$root/build.rs\" ] && [ \"$root/build.rs\" -nt \"$binary\" ] && return 0\n  if find \"$root/src\" \"$root/modules\" -type f \\( -name '*.rs' -o -name '*.swift' \\) -newer \"$binary\" -print -quit 2>/dev/null | grep -q .; then\n    return 0\n  fi\n  return 1\n}}\nif release_binary_is_stale \"{}\" \"{}\"; then\n  exec \"$SCRIPTD_ENTRY_SHELL_PATH\" \"$@\"\nfi\nexec \"{}\" \"$@\"\n",
-        config.root_dir.to_string_lossy(),
-        config.root_dir.to_string_lossy(),
-        binary_path.to_string_lossy(),
-        config.root_dir.to_string_lossy(),
-        binary_path.to_string_lossy(),
+    let script = scriptd_wrapper_script(
+        binary_path,
+        config,
+        binary_path == Path::new("/usr/local/libexec/scriptd-broker"),
     );
     fs::write(&exec_path, script)?;
     let _ = Command::new("chmod")
         .args(["+x", exec_path.to_str().expect("path")])
         .status();
     Ok(exec_path)
+}
+
+fn scriptd_wrapper_script(
+    binary_path: &Path,
+    config: &ServiceConfig,
+    protected_helper: bool,
+) -> String {
+    if protected_helper {
+        return format!(
+            "#!/bin/sh\nset -eu\nexport SCRIPTD_ROOT_DIR=\"{}\"\nexec \"{}\" \"$@\"\n",
+            config.root_dir.to_string_lossy(),
+            binary_path.to_string_lossy(),
+        );
+    }
+
+    format!(
+        "#!/bin/sh\nset -eu\nexport SCRIPTD_ROOT_DIR=\"{}\"\nexport SCRIPTD_ENTRY_SHELL_PATH=\"{}/scriptd.sh\"\nrelease_binary_is_stale() {{\n  binary=\"$1\"\n  root=\"$2\"\n  [ -x \"$binary\" ] || return 0\n  [ \"$root/Cargo.toml\" -nt \"$binary\" ] && return 0\n  [ -f \"$root/Cargo.lock\" ] && [ \"$root/Cargo.lock\" -nt \"$binary\" ] && return 0\n  [ -f \"$root/build.rs\" ] && [ \"$root/build.rs\" -nt \"$binary\" ] && return 0\n  if find \"$root/src\" \"$root/modules\" -type f \\( -name '*.rs' -o -name '*.swift' \\) -newer \"$binary\" -print -quit 2>/dev/null | grep -q .; then\n    return 0\n  fi\n  return 1\n}}\nif release_binary_is_stale \"{}\" \"{}\"; then\n  exec \"$SCRIPTD_ENTRY_SHELL_PATH\" \"$@\"\nfi\nexec \"{}\" \"$@\"\n",
+        config.root_dir.to_string_lossy(),
+        config.root_dir.to_string_lossy(),
+        binary_path.to_string_lossy(),
+        config.root_dir.to_string_lossy(),
+        binary_path.to_string_lossy(),
+    )
 }
 
 pub fn write_root_plist(executable: &Path, config: &ServiceConfig) -> Result<PathBuf> {
@@ -157,7 +177,10 @@ pub fn write_root_plist(executable: &Path, config: &ServiceConfig) -> Result<Pat
 
 pub fn start_root(config: &ServiceConfig) -> Result<()> {
     ensure_stable_service_root(&config.root_dir)?;
-    let exe = std::env::current_exe()?;
+    let current = std::env::current_exe()?;
+    let helper = Path::new("/usr/local/libexec/scriptd-broker");
+    let helper_protected = crate::broker::validate_root_owned_file(helper, 0).is_ok();
+    let exe = select_service_executable(&current, helper, helper_protected);
     let plist_path = write_root_plist(&exe, config)?;
     let label = &config.label;
 
@@ -169,6 +192,19 @@ pub fn start_root(config: &ServiceConfig) -> Result<()> {
     );
     println!("Started root launchd item: {label}");
     Ok(())
+}
+
+fn select_service_executable(current: &Path, helper: &Path, helper_protected: bool) -> PathBuf {
+    if helper_protected
+        && fs::read(current)
+            .ok()
+            .zip(fs::read(helper).ok())
+            .is_some_and(|(current, helper)| current == helper)
+    {
+        helper.to_path_buf()
+    } else {
+        current.to_path_buf()
+    }
 }
 
 pub fn stop_root(label: &str) -> Result<()> {
@@ -219,9 +255,31 @@ pub fn run_launchctl(args: &[&str], must_succeed: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_stable_service_root, plist_contents};
+    use super::{
+        ensure_stable_service_root, plist_contents, scriptd_wrapper_script,
+        select_service_executable,
+    };
+    use crate::config::ServiceConfig;
     use crate::credentials::current_user;
+    use std::collections::HashMap;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
     use tempfile::tempdir;
+
+    fn test_service_config(root_dir: std::path::PathBuf) -> ServiceConfig {
+        ServiceConfig {
+            label: "com.example.scriptd".into(),
+            log_dir: String::new(),
+            watch: false,
+            self_update_check_hours: 24,
+            modules: HashMap::new(),
+            triggers: Default::default(),
+            path: root_dir.join("config.toml"),
+            root_dir: root_dir.clone(),
+            state_dir: root_dir.join("state"),
+            state_file: root_dir.join("state.json"),
+        }
+    }
 
     #[test]
     fn launch_agent_plist_pins_the_current_user() {
@@ -237,5 +295,66 @@ mod tests {
         std::fs::write(root.path().join(".git"), "gitdir: /tmp/example").expect("git marker");
         let error = ensure_stable_service_root(root.path()).expect_err("linked worktree rejected");
         assert!(error.to_string().contains("primary checkout"));
+    }
+
+    #[test]
+    fn launch_agent_uses_protected_broker_binary_only_for_the_same_generation() {
+        let root = tempdir().expect("temp root");
+        let current = root.path().join("current-scriptd");
+        let helper = root.path().join("protected-scriptd");
+        std::fs::write(&current, b"same signed executable").expect("write current binary");
+        std::fs::write(&helper, b"same signed executable").expect("write helper binary");
+
+        assert_eq!(
+            select_service_executable(&current, &helper, true),
+            helper,
+            "the launch agent and broker must execute the same protected code generation"
+        );
+        assert_eq!(
+            select_service_executable(&current, &helper, false),
+            current,
+            "an unprotected helper path must never become the launch target"
+        );
+
+        std::fs::write(&helper, b"different signed executable").expect("replace helper bytes");
+        assert_eq!(
+            select_service_executable(&current, &helper, true),
+            current,
+            "a stale protected helper must not be used for a different service generation"
+        );
+    }
+
+    #[test]
+    fn protected_launch_wrapper_ignores_newer_repository_sources() {
+        let root = tempdir().expect("temp root");
+        let binary = root.path().join("protected-scriptd");
+        let source = root.path().join("src").join("newer.rs");
+        let marker = root.path().join("launched");
+        std::fs::create_dir_all(source.parent().expect("source parent")).expect("source dir");
+        std::fs::write(
+            &binary,
+            format!("#!/bin/sh\nprintf launched > '{}'\n", marker.display()),
+        )
+        .expect("write helper executable");
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
+            .expect("make helper executable");
+        std::fs::write(&source, "newer repository source").expect("write source");
+        let config = test_service_config(root.path().to_path_buf());
+        let wrapper = scriptd_wrapper_script(&binary, &config, true);
+        let wrapper_path = root.path().join("wrapper.sh");
+        std::fs::write(&wrapper_path, wrapper).expect("write wrapper");
+        std::fs::set_permissions(&wrapper_path, std::fs::Permissions::from_mode(0o755))
+            .expect("make wrapper executable");
+
+        let status = Command::new(&wrapper_path)
+            .arg("run")
+            .arg("root")
+            .status()
+            .expect("run wrapper");
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read_to_string(marker).expect("helper marker"),
+            "launched"
+        );
     }
 }

@@ -194,6 +194,7 @@ fn install_privilege_broker(
         let bridge = fs::read(&bridge_source)
             .with_context(|| format!("read generic Homebrew bridge {}", bridge_source.display()))?;
         let current = std::env::current_exe().context("resolve the running scriptd binary")?;
+        sign_broker_binary(&current)?;
         let policy = format!("{}\n", config.trusted_taps.join("\n"));
         let service = crate::config::read_service_config(&context.repo_root)
             .context("read service identity for the installed privilege broker")?;
@@ -319,6 +320,38 @@ fn install_privilege_broker(
     let _ = fs::remove_file(&policy_stage);
     let _ = fs::remove_file(&plist_stage);
     result
+}
+
+fn sign_broker_binary(binary: &Path) -> anyhow::Result<()> {
+    let status = Command::new("/usr/bin/codesign")
+        .args(["--force", "--sign", "-", "--options", "runtime,library"])
+        .arg(binary)
+        .status()
+        .context(
+            "enable the hardened runtime and library validation for the broker and service binary",
+        )?;
+    if !status.success() {
+        bail!("could not enable the hardened runtime for the broker binary");
+    }
+
+    let output = Command::new("/usr/bin/codesign")
+        .args(["--display", "--verbose=4"])
+        .arg(binary)
+        .output()
+        .context("verify the broker binary code signature")?;
+    let details = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if !output.status.success()
+        || !details
+            .lines()
+            .any(|line| line.starts_with("CodeDirectory ") && line.contains("runtime)"))
+    {
+        bail!("broker binary is not signed with the hardened runtime");
+    }
+    Ok(())
 }
 
 fn broker_daemon_plist(repo: &Path, service_label: &str) -> String {
@@ -2121,6 +2154,63 @@ mod tests {
     use std::io::Write;
     use std::path::Path;
     use tempfile::tempdir;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn broker_binary_signing_enforces_broker_code_identity() -> anyhow::Result<()> {
+        const VERIFY_RUNNING_SIGNATURE: &str = "SCRIPTD_VERIFY_BROKER_CODE_IDENTITY";
+        const REQUIRED: u32 = 0x00000001 | 0x00000200 | 0x00002000 | 0x00010000;
+        const FORBIDDEN: u32 = 0x00000004 | 0x00000020 | 0x10000000;
+
+        if std::env::var_os(VERIFY_RUNNING_SIGNATURE).is_some() {
+            extern "C" {
+                fn csops(
+                    pid: libc::pid_t,
+                    ops: libc::c_uint,
+                    data: *mut libc::c_void,
+                    size: usize,
+                ) -> libc::c_int;
+            }
+            let mut flags = 0u32;
+            // SAFETY: `flags` is a writable u32 buffer of the size passed to csops.
+            let result = unsafe {
+                csops(
+                    0,
+                    0,
+                    (&mut flags as *mut u32).cast(),
+                    std::mem::size_of_val(&flags),
+                )
+            };
+            anyhow::ensure!(result == 0, "could not read running process code flags");
+            anyhow::ensure!(
+                flags & REQUIRED == REQUIRED && flags & FORBIDDEN == 0,
+                "running broker binary does not satisfy the broker code identity predicate: {flags:#010x}"
+            );
+            return Ok(());
+        }
+
+        let root = tempdir()?;
+        let binary = root.path().join("scriptd-broker");
+        fs::copy(std::env::current_exe()?, &binary)?;
+
+        sign_broker_binary(&binary)?;
+
+        let output = Command::new(&binary)
+            .args([
+                "--exact",
+                "modules::mbrew::tests::broker_binary_signing_enforces_broker_code_identity",
+                "--nocapture",
+            ])
+            .env(VERIFY_RUNNING_SIGNATURE, "1")
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "signed broker binary failed its running-process identity check: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    }
 
     fn write_script(path: &Path, body: &str) -> anyhow::Result<()> {
         let mut file = File::create(path)?;
