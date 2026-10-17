@@ -168,6 +168,7 @@ mod tests {
             label: "com.test.scriptd".to_string(),
             log_dir: "/tmp/scriptd-test-logs".to_string(),
             watch: false,
+            control_center: false,
             self_update_check_hours: 12,
             modules: HashMap::new(),
             triggers: Default::default(),

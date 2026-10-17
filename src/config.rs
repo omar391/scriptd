@@ -33,6 +33,9 @@ pub struct ServiceSettings {
     pub log_dir: String,
     #[serde(default)]
     pub watch: bool,
+    #[serde(default)]
+    #[schemars(description = "Serve the browser control center as part of the service.")]
+    pub control_center: bool,
     #[serde(default = "default_self_update_check_hours")]
     #[schemars(range(min = 1))]
     pub self_update_check_hours: u64,
@@ -152,6 +155,7 @@ pub struct ServiceConfig {
     pub label: String,
     pub log_dir: String,
     pub watch: bool,
+    pub control_center: bool,
     pub self_update_check_hours: u64,
     pub modules: HashMap<String, ServiceModuleConfig>,
     pub triggers: TriggerMap,
@@ -244,6 +248,7 @@ impl ServiceConfig {
             label: document.service.label,
             log_dir: document.service.log_dir,
             watch: document.service.watch,
+            control_center: document.service.control_center,
             self_update_check_hours: document.service.self_update_check_hours,
             modules,
             triggers,
@@ -277,6 +282,7 @@ impl ServiceConfig {
                 label: self.label.clone(),
                 log_dir: self.log_dir.clone(),
                 watch: self.watch,
+                control_center: self.control_center,
                 self_update_check_hours: self.self_update_check_hours,
             },
             modules: ServiceModulePolicies::from_map(&modules),
@@ -620,6 +626,7 @@ mod tests {
             label: "com.omar.scriptd".to_string(),
             log_dir: "/tmp/logs".to_string(),
             watch: true,
+            control_center: false,
             self_update_check_hours: 12,
             modules: Default::default(),
             triggers: Default::default(),

@@ -1,10 +1,10 @@
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -12,20 +12,23 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::sse::{Event, Sse};
 use axum::response::IntoResponse;
+use axum::response::sse::{Event, Sse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::stream;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::net::TcpListener;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 
 use crate::control::{self, ControlPaths};
 use crate::paths::{self, write_private_atomic};
 
 const INDEX: &str = include_str!("../assets/web/index.html");
+
+/// Default loopback port for the control center, chosen as a memorable short number.
+pub const DEFAULT_BROWSER_PORT: u16 = 15921;
 const STYLES: &str = include_str!("../assets/web/styles.css");
 const APP: &str = include_str!("../assets/web/app.js");
 const PREACT: &str = include_str!("../assets/web/vendor/preact.module.js");
@@ -65,6 +68,7 @@ struct AppState {
     connections: AtomicUsize,
     last_disconnect: Mutex<Instant>,
     shutdown: Notify,
+    stopping: watch::Sender<bool>,
 }
 
 struct ConnectionGuard(Arc<AppState>);
@@ -80,6 +84,57 @@ impl Drop for ConnectionGuard {
 
 fn shutdown_due(connections: usize, last_disconnect: Instant, now: Instant) -> bool {
     connections == 0 && now.saturating_duration_since(last_disconnect) >= Duration::from_secs(600)
+}
+
+/// A bridge started by the service must stay reachable for the whole service
+/// lifetime, so it never idles out while waiting for a browser client.
+fn persistent_bridge_requested() -> bool {
+    std::env::var("SCRIPTD_BROWSER_BRIDGE_PERSISTENT")
+        .ok()
+        .as_deref()
+        == Some("1")
+}
+
+/// Ports tried in order for the control center. The first free port wins.
+const BROWSER_PORT_CANDIDATES: [u16; 4] = [
+    DEFAULT_BROWSER_PORT,
+    DEFAULT_BROWSER_PORT + 1,
+    DEFAULT_BROWSER_PORT + 2,
+    0,
+];
+
+/// Overrides the preferred control center port when set to a valid value.
+fn preferred_browser_port() -> u16 {
+    std::env::var("SCRIPTD_BROWSER_PORT")
+        .ok()
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .filter(|port| *port != 0)
+        .unwrap_or(DEFAULT_BROWSER_PORT)
+}
+
+/// Binds the bridge on the configured preferred port.
+async fn bind_browser_listener() -> Result<TcpListener> {
+    bind_browser_listener_from(Some(preferred_browser_port())).await
+}
+
+/// Binds the first free port from the candidate list.
+///
+/// The preferred port never displaces an existing listener: a taken candidate
+/// is skipped so another bridge or unrelated process keeps serving on it.
+async fn bind_browser_listener_from(preferred: Option<u16>) -> Result<TcpListener> {
+    let mut candidates = BROWSER_PORT_CANDIDATES.to_vec();
+    candidates[0] = preferred.unwrap_or(BROWSER_PORT_CANDIDATES[0]);
+    let mut last_error = None;
+    for port in candidates {
+        match TcpListener::bind(("127.0.0.1", port)).await {
+            Ok(listener) => return Ok(listener),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    match last_error {
+        Some(error) => Err(error.into()),
+        None => anyhow::bail!("no browser port candidates configured"),
+    }
 }
 
 fn session_path(paths: &ControlPaths) -> PathBuf {
@@ -143,26 +198,16 @@ fn open_url(url: &str) -> Result<()> {
     }
 }
 
-pub fn open_control_center(root: &Path) -> Result<()> {
+pub fn open_control_center(root: &Path, log_dir: &Path) -> Result<()> {
     let paths = control::browser_paths_for(root, &paths::resolve_state_dir(), 0);
     if let Some(url) = reusable_url(&paths) {
         return open_url(&url);
     }
-    let exe = std::env::current_exe().context("resolve scriptd executable")?;
-    let mut command = Command::new(exe);
-    command
-        .env("SCRIPTD_BROWSER_BRIDGE", "1")
-        .env("SCRIPTD_ROOT_DIR", root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    unsafe {
-        command.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
-    }
-    command.spawn().context("start browser bridge")?;
+    spawn_bridge(
+        &std::env::current_exe().context("resolve scriptd executable")?,
+        root,
+        log_dir,
+    )?;
     for _ in 0..50 {
         if let Some(url) = reusable_url(&paths) {
             return open_url(&url);
@@ -170,6 +215,108 @@ pub fn open_control_center(root: &Path) -> Result<()> {
         std::thread::sleep(Duration::from_millis(100));
     }
     anyhow::bail!("browser bridge did not become ready")
+}
+
+/// Starts a detached browser bridge process for `root`, reusing one that already answers.
+pub fn spawn_bridge(exe: &Path, root: &Path, log_dir: &Path) -> Result<()> {
+    spawn_bridge_with_mode(exe, root, log_dir, false).map(|_| ())
+}
+
+/// Starts a detached browser bridge process owned by the service.
+///
+/// The bridge a service uses must stay reachable for the whole service lifetime,
+/// so it never idles out while it waits for a browser client.
+pub fn spawn_bridge_persistent(exe: &Path, root: &Path, log_dir: &Path) -> Result<Child> {
+    let paths = control::browser_paths_for(root, &paths::resolve_state_dir(), 0);
+    if let Some(session) = read_session(&paths).filter(|_| reusable_url(&paths).is_some()) {
+        // Ask the authenticated bridge to stop itself. Never signal a PID from
+        // a session file: stale PID reuse could otherwise target an unrelated process.
+        request_bridge_shutdown(&session)?;
+        let stopped = (0..50).any(|_| {
+            if !process_alive(session.pid) && read_session(&paths).is_none() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            false
+        });
+        if !stopped {
+            anyhow::bail!("existing browser bridge did not stop after authenticated shutdown");
+        }
+    }
+    let mut child = spawn_bridge_with_mode(exe, root, log_dir, true)?;
+    for _ in 0..50 {
+        if reusable_url(&paths).is_some() {
+            return Ok(child);
+        }
+        if child.try_wait()?.is_some() {
+            anyhow::bail!("service browser bridge exited before becoming ready");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    anyhow::bail!("service browser bridge did not become ready")
+}
+
+fn request_bridge_shutdown(session: &BrowserSession) -> Result<()> {
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], session.port));
+    let mut stream = TcpStream::connect_timeout(&address, Duration::from_millis(500))
+        .context("connect to existing browser bridge")?;
+    stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+    write!(
+        stream,
+        "POST /api/shutdown HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nX-Scriptd-Session: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        session.port, session.token
+    )
+    .context("request authenticated browser bridge shutdown")?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .context("read browser bridge shutdown response")?;
+    let status = response.lines().next().unwrap_or_default();
+    if !status.starts_with("HTTP/1.1 202 ") && !status.starts_with("HTTP/2 202") {
+        anyhow::bail!("existing listener did not authenticate browser bridge shutdown");
+    }
+    Ok(())
+}
+
+fn spawn_bridge_with_mode(
+    exe: &Path,
+    root: &Path,
+    log_dir: &Path,
+    persistent: bool,
+) -> Result<Child> {
+    let paths = control::browser_paths_for(root, &paths::resolve_state_dir(), 0);
+    if !persistent && reusable_url(&paths).is_some() {
+        anyhow::bail!("browser bridge is already running");
+    }
+    let mut command = Command::new(exe);
+    command
+        .env("SCRIPTD_BROWSER_BRIDGE", "1")
+        .env("SCRIPTD_ROOT_DIR", root)
+        .env(
+            "SCRIPTD_BROWSER_BRIDGE_PERSISTENT",
+            if persistent { "1" } else { "0" },
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let log_path = log_dir.join("browser-bridge.log");
+    if let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        command.stdout(Stdio::from(file.try_clone().context("clone log file")?));
+        command.stderr(Stdio::from(file));
+    }
+    unsafe {
+        command.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    command.spawn().context("start browser bridge")
 }
 
 pub fn serve_bridge() -> Result<()> {
@@ -185,11 +332,12 @@ pub fn serve_bridge() -> Result<()> {
 async fn serve(paths: ControlPaths) -> Result<()> {
     fs::create_dir_all(&paths.state_dir)?;
     let _instance_lock = BridgeInstanceLock::acquire(&session_path(&paths).with_extension("lock"))?;
-    let listener = TcpListener::bind("127.0.0.1:0")
+    let listener = bind_browser_listener()
         .await
         .context("bind browser bridge")?;
     let port = listener.local_addr()?.port();
     let token = random_token()?;
+    let (stopping, _) = watch::channel(false);
     let state = Arc::new(AppState {
         token: token.clone(),
         port,
@@ -197,6 +345,7 @@ async fn serve(paths: ControlPaths) -> Result<()> {
         connections: AtomicUsize::new(0),
         last_disconnect: Mutex::new(Instant::now()),
         shutdown: Notify::new(),
+        stopping,
     });
     let session = BrowserSession {
         pid: std::process::id(),
@@ -208,6 +357,7 @@ async fn serve(paths: ControlPaths) -> Result<()> {
         serde_json::to_string(&session)?.as_bytes(),
     )?;
     let shutdown = state.clone();
+    let persistent = persistent_bridge_requested();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(5)).await;
@@ -217,7 +367,8 @@ async fn serve(paths: ControlPaths) -> Result<()> {
                 .lock()
                 .map(|slot| shutdown_due(connections, *slot, Instant::now()))
                 .unwrap_or(false);
-            if expired {
+            if expired && !persistent {
+                shutdown.stopping.send_replace(true);
                 shutdown.shutdown.notify_one();
                 break;
             }
@@ -230,6 +381,7 @@ async fn serve(paths: ControlPaths) -> Result<()> {
         .route("/vendor/preact.module.js", get(preact))
         .route("/vendor/htm.module.js", get(htm))
         .route("/api/snapshot", get(snapshot))
+        .route("/api/shutdown", post(shutdown_bridge))
         .route("/api/logs", get(logs))
         .route("/api/validate", post(validate))
         .route("/api/trigger-draft", post(trigger_draft))
@@ -283,6 +435,18 @@ fn authorized(state: &AppState, headers: &HeaderMap, query_token: Option<&str>) 
     let supplied = header(headers, "x-scriptd-session").or(query_token);
     supplied == Some(state.token.as_str())
         && host_allowed(header(headers, "host").unwrap_or(""), state.port)
+}
+
+async fn shutdown_bridge(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if !authorized(&state, &headers, None) {
+        return reject(StatusCode::UNAUTHORIZED, "session was not accepted");
+    }
+    state.stopping.send_replace(true);
+    state.shutdown.notify_one();
+    (StatusCode::ACCEPTED, Json(json!({ "ok": true })))
 }
 
 fn reject(status: StatusCode, message: &str) -> (StatusCode, Json<Value>) {
@@ -670,8 +834,19 @@ async fn events(
     }
     state.connections.fetch_add(1, Ordering::SeqCst);
     let guard = ConnectionGuard(state.clone());
-    let stream = stream::unfold((state, guard), |(state, guard)| async move {
-        tokio::time::sleep(Duration::from_secs(2)).await;
+    let stopping = state.stopping.subscribe();
+    let stream = stream::unfold((state, guard, stopping), |(state, guard, mut stopping)| async move {
+        tokio::select! {
+            changed = stopping.changed() => {
+                if changed.is_err() || *stopping.borrow() {
+                    return None;
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+        }
+        if *stopping.borrow() {
+            return None;
+        }
         let data = service_snapshot(&state.paths)
             .await
             .map(|(_, snapshot)| snapshot.to_string())
@@ -679,7 +854,7 @@ async fn events(
                 json!({ "ok": false, "message": error.to_string() }).to_string()
             });
         let event = Event::default().event("snapshot").data(data);
-        Some((Ok::<Event, std::convert::Infallible>(event), (state, guard)))
+        Some((Ok::<Event, std::convert::Infallible>(event), (state, guard, stopping)))
     });
     Sse::new(stream).into_response()
 }
@@ -705,6 +880,54 @@ mod tests {
         assert!(!origin_allowed(None, 43123));
     }
 
+    #[tokio::test]
+    async fn browser_port_falls_back_when_a_port_is_already_taken() {
+        // The test must not depend on the production port being free, so it
+        // reserves candidates itself and exercises the fallback against them.
+        let occupied =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve the preferred candidate");
+        let taken = occupied.local_addr().expect("reserved address").port();
+        let listener = bind_browser_listener_from(Some(taken))
+            .await
+            .expect("bind without displacing the reserved port");
+        let port = listener.local_addr().expect("bound address").port();
+        assert_ne!(port, taken, "a taken port must not be reused");
+        assert_eq!(
+            occupied.local_addr().expect("reserved address").port(),
+            taken,
+            "the existing listener must keep its port"
+        );
+    }
+
+    #[test]
+    fn stale_session_listener_is_never_signalled_as_a_process() {
+        let listener =
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind fixture listener");
+        let port = listener.local_addr().expect("fixture address").port();
+        let responder = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept shutdown request");
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request).expect("read request");
+            stream
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .expect("write unrelated listener response");
+        });
+        let session = BrowserSession {
+            pid: std::process::id(),
+            port,
+            token: "stale-token".to_string(),
+        };
+
+        assert!(request_bridge_shutdown(&session).is_err());
+        assert!(
+            process_alive(session.pid),
+            "the unrelated PID must remain alive"
+        );
+        responder.join().expect("fixture responder");
+    }
+
     #[test]
     fn only_one_browser_bridge_instance_can_hold_a_repository_lock() {
         let dir = tempfile::tempdir().expect("temporary state directory");
@@ -715,6 +938,21 @@ mod tests {
         assert!(BridgeInstanceLock::acquire(&lock_path).is_ok());
     }
 
+    #[test]
+    fn only_a_bridge_owned_by_the_service_reports_persistence() {
+        // The supervisor sets this marker, the browser-open path does not.
+        unsafe {
+            std::env::remove_var("SCRIPTD_BROWSER_BRIDGE_PERSISTENT");
+        }
+        assert!(!persistent_bridge_requested());
+        unsafe {
+            std::env::set_var("SCRIPTD_BROWSER_BRIDGE_PERSISTENT", "1");
+        }
+        assert!(persistent_bridge_requested());
+        unsafe {
+            std::env::remove_var("SCRIPTD_BROWSER_BRIDGE_PERSISTENT");
+        }
+    }
     #[test]
     fn bridge_grace_expires_only_ten_minutes_after_the_last_disconnection() {
         let disconnected = Instant::now();
@@ -746,6 +984,7 @@ mod tests {
             connections: AtomicUsize::new(2),
             last_disconnect: Mutex::new(Instant::now()),
             shutdown: Notify::new(),
+            stopping: watch::channel(false).0,
         });
         let first = ConnectionGuard(state.clone());
         drop(first);

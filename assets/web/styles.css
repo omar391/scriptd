@@ -17,6 +17,8 @@
   line-height: 1.5;
 }
 * { box-sizing: border-box; }
+html, body { overflow-x: hidden; }
+img, video, svg, canvas { max-width: 100%; height: auto; }
 body { margin: 0; background: var(--background); color: var(--foreground); }
 button, input, select, textarea { font: inherit; color: inherit; }
 button { cursor: pointer; }
@@ -181,7 +183,7 @@ dialog.dialog:focus { outline: none; }
   .module-toolbar { align-items: center; }
 }
 @media (max-width: 620px) {
-  .app-shell { grid-template-columns: minmax(0, 1fr); }
+  .app-shell, .app-shell.sidebar-collapsed { grid-template-columns: minmax(0, 1fr); }
   .sidebar, .sidebar.collapsed { position: sticky; z-index: 4; top: 0; flex-direction: row; align-items: center; width: 100%; height: auto; padding: .35rem .55rem; border-right: 0; border-bottom: 1px solid var(--border); }
   .brand { padding: 0 .25rem; }
   .brand strong { display: inline !important; }
@@ -190,6 +192,8 @@ dialog.dialog:focus { outline: none; }
   .nav-caption, .sidebar-foot { display: none !important; }
   .nav-item { flex: 0 0 auto; min-height: 2.5rem; width: auto; padding-inline: .55rem; }
   .sidebar .nav-item .nav-name { display: inline; font-size: .78rem; }
+  .sidebar.collapsed .nav-item .nav-name { display: inline; }
+  .sidebar.collapsed .nav-item { justify-content: flex-start; }
   .sidebar .nav-icon, .nav-health { display: none; }
   .main { padding: 1rem .8rem 2rem; }
   .topbar { align-items: flex-start; }
@@ -203,6 +207,32 @@ dialog.dialog:focus { outline: none; }
   .settings-grid, .nested-settings { grid-template-columns: 1fr; }
   .log-controls { align-items: stretch; flex-direction: column; }
   .key-row { grid-template-columns: minmax(7rem, .7fr) minmax(0, 1fr); }
+}
+@media (max-width: 1024px) {
+  .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .module-cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .main { max-width: 100%; }
+}
+@media (max-width: 768px) {
+  .metric-grid, .module-cards, .two-col, .settings-grid, .nested-settings { grid-template-columns: 1fr; }
+  .key-row, .condition-node { grid-template-columns: 1fr; }
+  .topbar { flex-wrap: wrap; }
+  .breadcrumbs { flex-wrap: wrap; }
+  .editor-toolbar, .editor-actions { flex-wrap: wrap; }
+  .log-controls { flex-wrap: wrap; }
+  .section-intro, .module-title-row { flex-wrap: wrap; }
+  .dialog-actions { flex-wrap: wrap; }
+  dialog.dialog { width: calc(100% - 1rem); }
+  .yaml-editor { min-height: 16rem; }
+}
+@media (max-width: 480px) {
+  .main { padding: .75rem .6rem 1.5rem; }
+  .welcome { padding: 1rem; }
+  .welcome h2, .module-title-row h2 { font-size: 1.2rem; }
+  .metric { padding: .75rem; }
+  .card { padding: .75rem; }
+  .nav-item { min-height: 2.3rem; }
+  .button { min-height: 2.1rem; padding: .35rem .6rem; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; transition-duration: .01ms !important; }

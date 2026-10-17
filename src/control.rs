@@ -1150,7 +1150,7 @@ fn save(paths: &ControlPaths, request: &Request) -> Response {
     if let Err(error) = validate_document(&paths.repo, document, request.module.as_deref(), yaml) {
         return rejected(&request.id, &error.to_string());
     }
-    let restart = document == "service" && label_changed(&current, yaml.as_bytes());
+    let restart = document == "service" && settings_require_restart(&current, yaml.as_bytes());
     if let Err(error) = write_private_atomic(&target, yaml.as_bytes()) {
         return rejected(&request.id, &error.to_string());
     }
@@ -1415,14 +1415,14 @@ fn trigger_draft(paths: &ControlPaths, request: &Request) -> Response {
     }
 }
 
-fn label_changed(current: &[u8], next: &[u8]) -> bool {
+fn settings_require_restart(current: &[u8], next: &[u8]) -> bool {
     let Ok(current) = serde_yaml::from_slice::<ServiceConfig>(current) else {
         return false;
     };
     let Ok(next) = serde_yaml::from_slice::<ServiceConfig>(next) else {
         return false;
     };
-    current.label != next.label
+    current.label != next.label || current.control_center != next.control_center
 }
 
 fn enqueue_run(paths: &ControlPaths, request: &Request) -> Response {

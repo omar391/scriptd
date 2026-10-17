@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -13,9 +13,9 @@ use notify::event::EventKind;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use sysinfo::{Pid, ProcessesToUpdate, System};
 use tokio::select;
-use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
-use tokio::time::{sleep, sleep_until, Instant};
+use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::time::{Instant, sleep, sleep_until};
 
 use crate::config::{self, ServiceConfig};
 use crate::control::{self, ControlPaths};
@@ -177,6 +177,8 @@ struct RunningSupervisor {
     label: String,
     started_at: String,
     watch: bool,
+    control_center: bool,
+    browser_bridge: Option<std::process::Child>,
     modules: BTreeMap<String, ModuleRuntime>,
     triggers: BTreeMap<String, TriggerRuntime>,
     sensors: SensorSuite,
@@ -280,6 +282,12 @@ fn request_self_restart() -> Result<()> {
     Ok(())
 }
 
+impl Drop for RunningSupervisor {
+    fn drop(&mut self) {
+        stop_control_center(&mut self.browser_bridge);
+    }
+}
+
 impl RunningSupervisor {
     fn build(
         root: &Path,
@@ -355,6 +363,8 @@ impl RunningSupervisor {
             label: config.label.clone(),
             started_at: Local::now().to_rfc3339(),
             watch: config.watch,
+            control_center: config.control_center,
+            browser_bridge: None,
             modules,
             triggers,
             sensors: SensorSuite::default(),
@@ -417,6 +427,8 @@ impl RunningSupervisor {
         self.watch = config.watch;
         self.label = config.label.clone();
         self.log_dir = config.expanded_log_dir();
+        let previous_control_center = self.control_center;
+        self.control_center = config.control_center;
         for definition in registry.modules() {
             let entry = self
                 .modules
@@ -441,6 +453,11 @@ impl RunningSupervisor {
         }
         self.modules.retain(|id, _| registry.get(id).is_some());
 
+        if self.control_center && !previous_control_center {
+            self.browser_bridge = start_control_center(&self.root, &self.log_dir);
+        } else if !self.control_center && previous_control_center {
+            stop_control_center(&mut self.browser_bridge);
+        }
         let prior = self
             .triggers
             .iter()
@@ -710,6 +727,7 @@ impl RunningSupervisor {
     }
 
     fn stop(&mut self) -> Result<()> {
+        stop_control_center(&mut self.browser_bridge);
         for runtime in self.modules.values_mut() {
             runtime.status = RuntimeStatus::Stopped;
             runtime.message = "supervisor stopped".to_string();
@@ -1157,6 +1175,45 @@ pub fn run_one_module(root: PathBuf, module: &str) -> Result<()> {
     Ok(())
 }
 
+fn start_control_center(
+    root: &std::path::Path,
+    log_dir: &std::path::Path,
+) -> Option<std::process::Child> {
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(error) => {
+            crate::logger::append_warn(
+                &log_dir.join("scriptd.log"),
+                &format!("control center not started: {error}"),
+            );
+            return None;
+        }
+    };
+    match crate::web::spawn_bridge_persistent(&exe, root, log_dir) {
+        Ok(child) => {
+            crate::logger::append_info(
+                &log_dir.join("scriptd.log"),
+                "control center started with the service",
+            );
+            Some(child)
+        }
+        Err(error) => {
+            crate::logger::append_warn(
+                &log_dir.join("scriptd.log"),
+                &format!("control center not started: {error}"),
+            );
+            None
+        }
+    }
+}
+
+fn stop_control_center(child: &mut Option<std::process::Child>) {
+    if let Some(mut child) = child.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
 async fn run_supervisor_async(root: PathBuf) -> Result<()> {
     let (config, registry) = read_state_config(&root)?;
     let update_interval = config.self_update_check_interval();
@@ -1176,6 +1233,9 @@ async fn run_supervisor_async(root: PathBuf) -> Result<()> {
     let _ = control::set_restart_required(&supervisor.control_paths, false);
     if supervisor.watch {
         supervisor.start_watcher()?;
+    }
+    if supervisor.control_center {
+        supervisor.browser_bridge = start_control_center(&supervisor.root, &supervisor.log_dir);
     }
 
     let update_root = supervisor.root.clone();
@@ -1230,10 +1290,12 @@ mod tests {
         );
         assert!(!outcome.retryable);
         assert!(outcome.uncertain);
-        assert!(outcome
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("completion is unknown")));
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("completion is unknown"))
+        );
         assert!(matches!(outcome.label, WorkLabel::Manual { job_id, .. } if job_id == "manual-1"));
     }
 
@@ -1572,9 +1634,11 @@ modules:
             .build()
             .expect("runtime");
 
-        assert!(runtime
-            .block_on(receive_optional_event(&mut receiver))
-            .is_none());
+        assert!(
+            runtime
+                .block_on(receive_optional_event(&mut receiver))
+                .is_none()
+        );
         receiver = None;
         assert!(receiver.is_none());
     }

@@ -271,6 +271,7 @@ mod tests {
             label: "com.example.scriptd".into(),
             log_dir: String::new(),
             watch: false,
+            control_center: false,
             self_update_check_hours: 24,
             modules: HashMap::new(),
             triggers: Default::default(),

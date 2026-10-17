@@ -409,6 +409,11 @@
       "additionalProperties": false,
       "description": "Shared daemon settings used by all modules.",
       "properties": {
+        "control_center": {
+          "default": false,
+          "description": "Serve the browser control center as part of the service.",
+          "type": "boolean"
+        },
         "label": {
           "minLength": 1,
           "type": "string"

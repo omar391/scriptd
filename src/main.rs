@@ -465,7 +465,10 @@ fn main() -> ExitCode {
             web::stdout_is_interactive(),
         ) {
             let root = paths::resolve_repo_root();
-            return exit_from(web::open_control_center(&root));
+            let log_dir = config::read_service_config(&root)
+                .map(|config| config.expanded_log_dir())
+                .unwrap_or_else(|_| root.join("logs"));
+            return exit_from(web::open_control_center(&root, &log_dir));
         }
         usage();
         return ExitCode::SUCCESS;
