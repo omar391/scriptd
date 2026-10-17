@@ -61,7 +61,7 @@ if (session) {
 }
 
 let appState = {
-  section: 'overview', module: null, tab: 'Overview', collapsed: false,
+  section: 'overview', module: null, tab: 'Overview', collapsed: false, mobileNavOpen: false,
   snapshot: null, drafts: {}, logs: [], severity: 'all', search: '',
   follow: true, message: '', error: '', loading: true, dialog: null,
   saveDiff: null, serviceOnline: false, quitQueue: null, quitWorking: false
@@ -347,6 +347,26 @@ function sidebarToggleIcon(collapsed) {
   h('path', { d: 'M9 3v18' }),
   h('path', { d: collapsed ? 'm13 9 3 3-3 3' : 'm15 15-3-3 3-3' }));
 }
+function mobileNavigationIcon(open) {
+  return h('svg', {
+    class: 'icon-button-svg', viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor',
+    'stroke-width': '2', 'stroke-linecap': 'round', 'stroke-linejoin': 'round',
+    'aria-hidden': 'true', focusable: 'false'
+  }, h('path', { d: open ? 'm6 6 12 12M18 6 6 18' : 'M4 6h16M4 12h16M4 18h16' }));
+}
+function closeMobileNavigation(restoreFocus) {
+  if (!appState.mobileNavOpen) return;
+  appState = Object.assign({}, appState, { mobileNavOpen: false });
+  renderApp();
+  if (restoreFocus) {
+    const toggle = document.getElementById('mobile-nav-toggle');
+    if (toggle) toggle.focus();
+  }
+}
+function focusMainContent() {
+  const main = document.getElementById('content');
+  if (main) main.focus();
+}
 
 function Sidebar() {
   const info = appState.snapshot || {};
@@ -362,20 +382,28 @@ function Sidebar() {
         h('span', { class: 'nav-health' }, statusLabel(state)));
     }),
     h('div', { class: 'nav-caption service-caption' }, 'SERVICE'),
-    h('button', { type: 'button', class: 'nav-item ' + (appState.section === 'service' ? 'selected' : ''), onClick: () => { appState = Object.assign({}, appState, { section: 'service', module: null, tab: 'Overview' }); renderApp(); } },
+    h('button', { type: 'button', class: 'nav-item ' + (appState.section === 'service' ? 'selected' : ''), onClick: () => {
+      const mobileNavigationWasOpen = appState.mobileNavOpen;
+      appState = Object.assign({}, appState, { section: 'service', module: null, tab: 'Overview', mobileNavOpen: false });
+      renderApp();
+      if (mobileNavigationWasOpen) focusMainContent();
+    } },
       h('span', { class: 'nav-icon' }, '◉'), navName('Service'), badge(service.running ? 'Running' : 'Offline', service.running ? 'good' : 'muted'))
   ];
-  return h('aside', { class: 'sidebar ' + (appState.collapsed ? 'collapsed' : ''), 'aria-label': 'Scriptd navigation' },
+  return h('aside', { class: 'sidebar ' + (appState.collapsed ? 'collapsed ' : '') + (appState.mobileNavOpen ? 'mobile-nav-open' : ''), 'aria-label': 'Scriptd navigation' },
     h('div', { class: 'brand' }, BrandMark, h('strong', null, 'scriptd'),
-      button(sidebarToggleIcon(appState.collapsed), () => setState({ collapsed: !appState.collapsed }), 'icon-button', { 'aria-expanded': String(!appState.collapsed), 'aria-label': appState.collapsed ? 'Expand navigation' : 'Collapse navigation', title: appState.collapsed ? 'Expand navigation' : 'Collapse navigation' })),
-    h('nav', { class: 'nav-list', 'aria-label': 'Main' }, entries),
+      button(sidebarToggleIcon(appState.collapsed), () => setState({ collapsed: !appState.collapsed }), 'icon-button desktop-sidebar-toggle', { 'aria-expanded': String(!appState.collapsed), 'aria-label': appState.collapsed ? 'Expand navigation' : 'Collapse navigation', title: appState.collapsed ? 'Expand navigation' : 'Collapse navigation' }),
+      button(mobileNavigationIcon(appState.mobileNavOpen), () => setState({ mobileNavOpen: !appState.mobileNavOpen }), 'icon-button mobile-nav-toggle', { id: 'mobile-nav-toggle', 'aria-expanded': String(appState.mobileNavOpen), 'aria-controls': 'primary-navigation', 'aria-label': appState.mobileNavOpen ? 'Close navigation' : 'Open navigation', title: appState.mobileNavOpen ? 'Close navigation' : 'Open navigation' })),
+    h('nav', { id: 'primary-navigation', class: 'nav-list', 'aria-label': 'Main' }, entries),
     h('div', { class: 'sidebar-foot' }, h('span', { class: 'pulse ' + (service.running ? 'on' : '') }), service.running ? 'Service connected' : 'Service unavailable')
   );
 }
 
 function navigate(id) {
-  appState = Object.assign({}, appState, { module: id, section: id ? 'module' : 'overview', tab: 'Overview', error: '', message: '' });
+  const mobileNavigationWasOpen = appState.mobileNavOpen;
+  appState = Object.assign({}, appState, { module: id, section: id ? 'module' : 'overview', tab: 'Overview', error: '', message: '', mobileNavOpen: false });
   renderApp();
+  if (mobileNavigationWasOpen) focusMainContent();
   if (id && appState.tab === 'Logs') loadLogs();
 }
 
@@ -1017,11 +1045,22 @@ window.addEventListener('keydown', event => {
     if (appState.quitQueue) stayInApp();
     else if (appState.saveDiff) cancelSaveReview();
     else setState({ dialog: null });
+  } else if (event.key === 'Escape' && appState.mobileNavOpen) {
+    event.preventDefault();
+    const navigation = document.getElementById('primary-navigation');
+    const toggle = document.getElementById('mobile-nav-toggle');
+    const focusWasInside =
+      (navigation && navigation.contains(document.activeElement)) || toggle === document.activeElement;
+    closeMobileNavigation(focusWasInside);
   }
   if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 's') {
     event.preventDefault();
     const id = activeModule() && appState.tab === 'Settings' ? activeModule().id : null;
     if (isDirty(id)) reviewSave(id);
   }
+});
+const mobileNavMedia = window.matchMedia('(max-width: 620px)');
+window.addEventListener('resize', () => {
+  if (!mobileNavMedia.matches) closeMobileNavigation(false);
 });
 connect();
