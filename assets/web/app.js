@@ -296,6 +296,11 @@ function node(tag, props, children) { return h(tag, props || {}, ...(children ||
 function button(label, action, className, extra) {
   return h('button', Object.assign({ type: 'button', class: className || 'button', onClick: action }, extra || {}), label);
 }
+// A hidden visible label must not remove the button's accessible name, so mirror
+// the label in a screen-reader-only element the compact rail keeps available.
+function navName(label) {
+  return [h('span', { class: 'nav-name', 'aria-hidden': 'true' }, label), h('span', { class: 'sr-only' }, label)];
+}
 function statusLabel(info) {
   if (!info.present) return 'Not installed';
   if (!info.valid) return 'Invalid configuration';
@@ -332,27 +337,37 @@ function healthText(info) {
   return badge(state, tone);
 }
 function activeModule() { return appState.module ? moduleInfo(appState.module) : null; }
+function sidebarToggleIcon(collapsed) {
+  return h('svg', {
+    class: 'icon-button-svg', viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor',
+    'stroke-width': '1.8', 'stroke-linecap': 'round', 'stroke-linejoin': 'round',
+    'aria-hidden': 'true', focusable: 'false'
+  },
+  h('rect', { x: '3', y: '3', width: '18', height: '18', rx: '2' }),
+  h('path', { d: 'M9 3v18' }),
+  h('path', { d: collapsed ? 'm13 9 3 3-3 3' : 'm15 15-3-3 3-3' }));
+}
 
 function Sidebar() {
   const info = appState.snapshot || {};
   const service = info.service || {};
   const entries = [
     h('button', { type: 'button', class: 'nav-item ' + (appState.section === 'overview' ? 'selected' : ''), onClick: () => navigate(null) },
-      h('span', { class: 'nav-icon' }, '⌂'), h('span', null, 'Overview')),
+      h('span', { class: 'nav-icon' }, '⌂'), navName('Overview')),
     h('div', { class: 'nav-caption' }, 'MODULES'),
     ...MODULES.map(item => {
       const state = moduleInfo(item.id);
       return h('button', { type: 'button', class: 'nav-item ' + (appState.module === item.id ? 'selected' : ''), onClick: () => navigate(item.id) },
-        h('span', { class: 'nav-icon' }, item.icon), h('span', { class: 'nav-name' }, item.name),
+        h('span', { class: 'nav-icon' }, item.icon), navName(item.name),
         h('span', { class: 'nav-health' }, statusLabel(state)));
     }),
     h('div', { class: 'nav-caption service-caption' }, 'SERVICE'),
     h('button', { type: 'button', class: 'nav-item ' + (appState.section === 'service' ? 'selected' : ''), onClick: () => { appState = Object.assign({}, appState, { section: 'service', module: null, tab: 'Overview' }); renderApp(); } },
-      h('span', { class: 'nav-icon' }, '◉'), h('span', { class: 'nav-name' }, 'Service'), badge(service.running ? 'Running' : 'Offline', service.running ? 'good' : 'muted'))
+      h('span', { class: 'nav-icon' }, '◉'), navName('Service'), badge(service.running ? 'Running' : 'Offline', service.running ? 'good' : 'muted'))
   ];
   return h('aside', { class: 'sidebar ' + (appState.collapsed ? 'collapsed' : ''), 'aria-label': 'Scriptd navigation' },
     h('div', { class: 'brand' }, BrandMark, h('strong', null, 'scriptd'),
-      button(appState.collapsed ? 'Expand navigation' : 'Collapse navigation', () => setState({ collapsed: !appState.collapsed }), 'icon-button', { 'aria-expanded': String(!appState.collapsed), 'aria-label': appState.collapsed ? 'Expand navigation' : 'Collapse navigation' })),
+      button(sidebarToggleIcon(appState.collapsed), () => setState({ collapsed: !appState.collapsed }), 'icon-button', { 'aria-expanded': String(!appState.collapsed), 'aria-label': appState.collapsed ? 'Expand navigation' : 'Collapse navigation', title: appState.collapsed ? 'Expand navigation' : 'Collapse navigation' })),
     h('nav', { class: 'nav-list', 'aria-label': 'Main' }, entries),
     h('div', { class: 'sidebar-foot' }, h('span', { class: 'pulse ' + (service.running ? 'on' : '') }), service.running ? 'Service connected' : 'Service unavailable')
   );

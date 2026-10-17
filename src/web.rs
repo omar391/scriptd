@@ -86,15 +86,6 @@ fn shutdown_due(connections: usize, last_disconnect: Instant, now: Instant) -> b
     connections == 0 && now.saturating_duration_since(last_disconnect) >= Duration::from_secs(600)
 }
 
-/// A bridge started by the service must stay reachable for the whole service
-/// lifetime, so it never idles out while waiting for a browser client.
-fn persistent_bridge_requested() -> bool {
-    std::env::var("SCRIPTD_BROWSER_BRIDGE_PERSISTENT")
-        .ok()
-        .as_deref()
-        == Some("1")
-}
-
 /// Ports tried in order for the control center. The first free port wins.
 const BROWSER_PORT_CANDIDATES: [u16; 4] = [
     DEFAULT_BROWSER_PORT,
@@ -102,6 +93,7 @@ const BROWSER_PORT_CANDIDATES: [u16; 4] = [
     DEFAULT_BROWSER_PORT + 2,
     0,
 ];
+const BRIDGE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Overrides the preferred control center port when set to a valid value.
 fn preferred_browser_port() -> u16 {
@@ -110,11 +102,6 @@ fn preferred_browser_port() -> u16 {
         .and_then(|value| value.trim().parse::<u16>().ok())
         .filter(|port| *port != 0)
         .unwrap_or(DEFAULT_BROWSER_PORT)
-}
-
-/// Binds the bridge on the configured preferred port.
-async fn bind_browser_listener() -> Result<TcpListener> {
-    bind_browser_listener_from(Some(preferred_browser_port())).await
 }
 
 /// Binds the first free port from the candidate list.
@@ -219,43 +206,151 @@ pub fn open_control_center(root: &Path, log_dir: &Path) -> Result<()> {
 
 /// Starts a detached browser bridge process for `root`, reusing one that already answers.
 pub fn spawn_bridge(exe: &Path, root: &Path, log_dir: &Path) -> Result<()> {
-    spawn_bridge_with_mode(exe, root, log_dir, false).map(|_| ())
+    spawn_bridge_process(exe, root, log_dir).map(|_| ())
 }
 
-/// Starts a detached browser bridge process owned by the service.
-///
-/// The bridge a service uses must stay reachable for the whole service lifetime,
-/// so it never idles out while it waits for a browser client.
-pub fn spawn_bridge_persistent(exe: &Path, root: &Path, log_dir: &Path) -> Result<Child> {
-    let paths = control::browser_paths_for(root, &paths::resolve_state_dir(), 0);
-    if let Some(session) = read_session(&paths).filter(|_| reusable_url(&paths).is_some()) {
-        // Ask the authenticated bridge to stop itself. Never signal a PID from
-        // a session file: stale PID reuse could otherwise target an unrelated process.
-        request_bridge_shutdown(&session)?;
-        let stopped = (0..50).any(|_| {
-            if !process_alive(session.pid) && read_session(&paths).is_none() {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-            false
-        });
-        if !stopped {
-            anyhow::bail!("existing browser bridge did not stop after authenticated shutdown");
-        }
+/// Owns a service control-center bridge hosted on a thread in the supervisor process.
+pub struct ServiceBridge {
+    state: Arc<AppState>,
+    worker: Option<std::thread::JoinHandle<Result<()>>>,
+}
+
+impl std::fmt::Debug for ServiceBridge {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ServiceBridge")
+            .field(
+                "worker_running",
+                &self
+                    .worker
+                    .as_ref()
+                    .is_some_and(|worker| !worker.is_finished()),
+            )
+            .finish()
     }
-    let mut child = spawn_bridge_with_mode(exe, root, log_dir, true)?;
-    for _ in 0..50 {
-        if reusable_url(&paths).is_some() {
-            return Ok(child);
+}
+
+struct BridgeReady {
+    state: Arc<AppState>,
+}
+
+impl ServiceBridge {
+    pub fn stop(&mut self) -> Result<()> {
+        self.state.stopping.send_replace(true);
+        self.state.shutdown.notify_one();
+        // The server forces any remaining connections closed after its bounded
+        // graceful-drain window. Join only after it has removed the session and
+        // released the instance lock; never report a detached worker as stopped.
+        let deadline = Instant::now() + BRIDGE_DRAIN_TIMEOUT + Duration::from_secs(2);
+        if let Some(worker) = self.worker.as_ref() {
+            while !worker.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if !worker.is_finished() {
+                anyhow::bail!("service browser bridge did not stop before the drain deadline");
+            }
+            if let Some(worker) = self.worker.take() {
+                worker
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("service browser bridge thread panicked"))??;
+            }
         }
-        if child.try_wait()?.is_some() {
-            anyhow::bail!("service browser bridge exited before becoming ready");
+        Ok(())
+    }
+}
+
+impl Drop for ServiceBridge {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
+}
+
+/// Starts the persistent control center inside a service-owned thread in the
+/// supervisor process, reusing the current browser session when possible.
+pub fn start_service_bridge(root: &Path) -> Result<ServiceBridge> {
+    let paths = control::browser_paths_for(root, &paths::resolve_state_dir(), 0);
+    start_service_bridge_with(paths, Some(preferred_browser_port()))
+}
+
+fn stop_existing_bridge(paths: &ControlPaths) -> Result<()> {
+    let Some(session) = read_session(paths) else {
+        return Ok(());
+    };
+    if reusable_url(paths).is_none() {
+        return Ok(());
+    }
+
+    // Only an authenticated response from the session file can request shutdown.
+    // Never signal a PID from disk: it could have been reused by an unrelated process.
+    request_bridge_shutdown(&session)?;
+    let listener = std::net::SocketAddr::from(([127, 0, 0, 1], session.port));
+    let stopped = (0..50).any(|_| {
+        let session_gone = read_session(paths).is_none();
+        let owner_gone = session.pid == std::process::id() || !process_alive(session.pid);
+        let listener_closed = TcpStream::connect_timeout(&listener, Duration::from_millis(100)).is_err();
+        if session_gone && owner_gone && listener_closed {
+            return true;
         }
         std::thread::sleep(Duration::from_millis(100));
+        false
+    });
+    if !stopped {
+        anyhow::bail!("existing browser bridge did not stop after authenticated shutdown");
     }
-    let _ = child.kill();
-    let _ = child.wait();
-    anyhow::bail!("service browser bridge did not become ready")
+    Ok(())
+}
+
+fn start_service_bridge_with(
+    paths: ControlPaths,
+    preferred_port: Option<u16>,
+) -> Result<ServiceBridge> {
+    stop_existing_bridge(&paths)?;
+    let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(1);
+    let error_sender = ready_sender.clone();
+    let worker = std::thread::Builder::new()
+        .name("scriptd-browser-bridge".to_string())
+        .spawn(move || {
+            let result = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("build in-process browser runtime")
+                .and_then(|runtime| {
+                    runtime.block_on(serve(
+                        paths,
+                        true,
+                        preferred_port,
+                        Some(ready_sender),
+                    ))
+                });
+            if let Err(error) = &result {
+                let _ = error_sender.try_send(Err(error.to_string()));
+            }
+            result
+        })?;
+
+    match ready_receiver.recv_timeout(Duration::from_secs(5)) {
+        Ok(Ok(ready)) => Ok(ServiceBridge {
+            state: ready.state,
+            worker: Some(worker),
+        }),
+        Ok(Err(error)) => {
+            let _ = worker.join();
+            anyhow::bail!("start in-process browser bridge: {error}");
+        }
+        Err(error) => {
+            drop(ready_receiver);
+            for _ in 0..20 {
+                if worker.is_finished() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            if worker.is_finished() {
+                let _ = worker.join();
+            }
+            anyhow::bail!("in-process browser bridge did not become ready: {error}");
+        }
+    }
 }
 
 fn request_bridge_shutdown(session: &BrowserSession) -> Result<()> {
@@ -280,24 +375,15 @@ fn request_bridge_shutdown(session: &BrowserSession) -> Result<()> {
     Ok(())
 }
 
-fn spawn_bridge_with_mode(
-    exe: &Path,
-    root: &Path,
-    log_dir: &Path,
-    persistent: bool,
-) -> Result<Child> {
+fn spawn_bridge_process(exe: &Path, root: &Path, log_dir: &Path) -> Result<Child> {
     let paths = control::browser_paths_for(root, &paths::resolve_state_dir(), 0);
-    if !persistent && reusable_url(&paths).is_some() {
+    if reusable_url(&paths).is_some() {
         anyhow::bail!("browser bridge is already running");
     }
     let mut command = Command::new(exe);
     command
         .env("SCRIPTD_BROWSER_BRIDGE", "1")
         .env("SCRIPTD_ROOT_DIR", root)
-        .env(
-            "SCRIPTD_BROWSER_BRIDGE_PERSISTENT",
-            if persistent { "1" } else { "0" },
-        )
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -326,13 +412,18 @@ pub fn serve_bridge() -> Result<()> {
         .enable_all()
         .build()
         .context("build browser runtime")?;
-    runtime.block_on(serve(paths))
+    runtime.block_on(serve(paths, false, Some(preferred_browser_port()), None))
 }
 
-async fn serve(paths: ControlPaths) -> Result<()> {
+async fn serve(
+    paths: ControlPaths,
+    persistent: bool,
+    preferred_port: Option<u16>,
+    ready: Option<std::sync::mpsc::SyncSender<std::result::Result<BridgeReady, String>>>,
+) -> Result<()> {
     fs::create_dir_all(&paths.state_dir)?;
     let _instance_lock = BridgeInstanceLock::acquire(&session_path(&paths).with_extension("lock"))?;
-    let listener = bind_browser_listener()
+    let listener = bind_browser_listener_from(preferred_port)
         .await
         .context("bind browser bridge")?;
     let port = listener.local_addr()?.port();
@@ -356,8 +447,18 @@ async fn serve(paths: ControlPaths) -> Result<()> {
         &session_path(&paths),
         serde_json::to_string(&session)?.as_bytes(),
     )?;
+    if let Some(ready) = ready {
+        if ready
+            .send(Ok(BridgeReady {
+                state: Arc::clone(&state),
+            }))
+            .is_err()
+        {
+            state.stopping.send_replace(true);
+            state.shutdown.notify_one();
+        }
+    }
     let shutdown = state.clone();
-    let persistent = persistent_bridge_requested();
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(5)).await;
@@ -391,11 +492,20 @@ async fn serve(paths: ControlPaths) -> Result<()> {
         .route("/events", get(events))
         .with_state(state.clone());
     let shutdown = state.clone();
-    let result = axum::serve(listener, router)
-        .with_graceful_shutdown(async move {
-            shutdown.shutdown.notified().await;
-        })
-        .await;
+    let server = axum::serve(listener, router).with_graceful_shutdown(async move {
+        shutdown.shutdown.notified().await;
+    });
+    let forced_shutdown = state.clone();
+    let result = tokio::select! {
+        result = server => result,
+        _ = async move {
+            let mut stopping = forced_shutdown.stopping.subscribe();
+            if !*stopping.borrow() {
+                let _ = stopping.changed().await;
+            }
+            tokio::time::sleep(BRIDGE_DRAIN_TIMEOUT).await;
+        } => Ok(()),
+    };
     let _ = fs::remove_file(session_path(&paths));
     result.context("browser bridge stopped")
 }
@@ -939,20 +1049,65 @@ mod tests {
     }
 
     #[test]
-    fn only_a_bridge_owned_by_the_service_reports_persistence() {
-        // The supervisor sets this marker, the browser-open path does not.
-        unsafe {
-            std::env::remove_var("SCRIPTD_BROWSER_BRIDGE_PERSISTENT");
-        }
-        assert!(!persistent_bridge_requested());
-        unsafe {
-            std::env::set_var("SCRIPTD_BROWSER_BRIDGE_PERSISTENT", "1");
-        }
-        assert!(persistent_bridge_requested());
-        unsafe {
-            std::env::remove_var("SCRIPTD_BROWSER_BRIDGE_PERSISTENT");
-        }
+    fn service_bridge_runs_in_the_supervisor_process_and_stops_cleanly() {
+        let dir = tempfile::tempdir().expect("temporary state directory");
+        let paths = control::paths_for(dir.path(), dir.path());
+        let mut bridge = start_service_bridge_with(paths.clone(), Some(0))
+            .expect("start in-process service bridge");
+        let session = read_session(&paths).expect("service bridge session");
+        assert_eq!(session.pid, std::process::id());
+        let address = std::net::SocketAddr::from(([127, 0, 0, 1], session.port));
+        assert!(
+            TcpStream::connect_timeout(&address, Duration::from_millis(300)).is_ok(),
+            "the supervisor process must own a live bridge listener"
+        );
+
+        bridge.stop().expect("stop in-process service bridge");
+        assert!(read_session(&paths).is_none());
+        assert!(TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_err());
     }
+    #[test]
+    fn bridge_stop_stays_bounded_while_a_request_is_incomplete() {
+        let dir = tempfile::tempdir().expect("temporary state directory");
+        let paths = control::paths_for(dir.path(), dir.path());
+        let mut mine = start_service_bridge_with(paths.clone(), Some(0))
+            .expect("start in-process service bridge");
+        let session = read_session(&paths).expect("service bridge session");
+        let address = std::net::SocketAddr::from(([127, 0, 0, 1], session.port));
+        // An incomplete request holds the graceful drain open, so stopping must
+        // remain bounded instead of blocking service shutdown indefinitely.
+        let mut stalled = TcpStream::connect_timeout(&address, Duration::from_millis(300))
+            .expect("connect to the service bridge");
+        write!(
+            &mut stalled,
+            "POST /api/drafts HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: 100\r\n\r\n{{",
+            session.port
+        )
+        .expect("send an incomplete request");
+
+        let started = Instant::now();
+        mine.stop()
+            .expect("stop the service bridge with a stalled request");
+        let elapsed = started.elapsed();
+
+        // Stopping must close the stalled connection and release all bridge
+        // resources before returning successfully.
+        assert!(TcpStream::connect_timeout(&address, Duration::from_millis(200)).is_err());
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "stopping must not wait indefinitely: {elapsed:?}"
+        );
+        assert!(read_session(&paths).is_none());
+
+        let mut restarted = start_service_bridge_with(paths.clone(), Some(0))
+            .expect("restart while the prior client socket remains open");
+        restarted
+            .stop()
+            .expect("stop restarted bridge while prior client socket remains open");
+        assert!(read_session(&paths).is_none());
+        drop(stalled);
+    }
+
     #[test]
     fn bridge_grace_expires_only_ten_minutes_after_the_last_disconnection() {
         let disconnected = Instant::now();

@@ -178,7 +178,7 @@ struct RunningSupervisor {
     started_at: String,
     watch: bool,
     control_center: bool,
-    browser_bridge: Option<std::process::Child>,
+    browser_bridge: Option<crate::web::ServiceBridge>,
     modules: BTreeMap<String, ModuleRuntime>,
     triggers: BTreeMap<String, TriggerRuntime>,
     sensors: SensorSuite,
@@ -284,7 +284,7 @@ fn request_self_restart() -> Result<()> {
 
 impl Drop for RunningSupervisor {
     fn drop(&mut self) {
-        stop_control_center(&mut self.browser_bridge);
+        stop_control_center(&mut self.browser_bridge, &self.log_dir);
     }
 }
 
@@ -456,7 +456,7 @@ impl RunningSupervisor {
         if self.control_center && !previous_control_center {
             self.browser_bridge = start_control_center(&self.root, &self.log_dir);
         } else if !self.control_center && previous_control_center {
-            stop_control_center(&mut self.browser_bridge);
+            stop_control_center(&mut self.browser_bridge, &self.log_dir);
         }
         let prior = self
             .triggers
@@ -727,7 +727,7 @@ impl RunningSupervisor {
     }
 
     fn stop(&mut self) -> Result<()> {
-        stop_control_center(&mut self.browser_bridge);
+        stop_control_center(&mut self.browser_bridge, &self.log_dir);
         for runtime in self.modules.values_mut() {
             runtime.status = RuntimeStatus::Stopped;
             runtime.message = "supervisor stopped".to_string();
@@ -1178,24 +1178,14 @@ pub fn run_one_module(root: PathBuf, module: &str) -> Result<()> {
 fn start_control_center(
     root: &std::path::Path,
     log_dir: &std::path::Path,
-) -> Option<std::process::Child> {
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(error) => {
-            crate::logger::append_warn(
-                &log_dir.join("scriptd.log"),
-                &format!("control center not started: {error}"),
-            );
-            return None;
-        }
-    };
-    match crate::web::spawn_bridge_persistent(&exe, root, log_dir) {
-        Ok(child) => {
+) -> Option<crate::web::ServiceBridge> {
+    match crate::web::start_service_bridge(root) {
+        Ok(bridge) => {
             crate::logger::append_info(
                 &log_dir.join("scriptd.log"),
-                "control center started with the service",
+                "control center started inside the service process",
             );
-            Some(child)
+            Some(bridge)
         }
         Err(error) => {
             crate::logger::append_warn(
@@ -1207,10 +1197,17 @@ fn start_control_center(
     }
 }
 
-fn stop_control_center(child: &mut Option<std::process::Child>) {
-    if let Some(mut child) = child.take() {
-        let _ = child.kill();
-        let _ = child.wait();
+fn stop_control_center(
+    bridge: &mut Option<crate::web::ServiceBridge>,
+    log_dir: &std::path::Path,
+) {
+    if let Some(mut bridge) = bridge.take() {
+        if let Err(error) = bridge.stop() {
+            crate::logger::append_warn(
+                &log_dir.join("scriptd.log"),
+                &format!("control center did not stop cleanly: {error}"),
+            );
+        }
     }
 }
 
