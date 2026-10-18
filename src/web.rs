@@ -63,6 +63,9 @@ struct BrowserSession {
 
 struct AppState {
     token: String,
+    /// Unpredictable capability that the authenticated browser retains in
+    /// origin-scoped storage for later session recovery.
+    recovery_capability: String,
     port: u16,
     paths: ControlPaths,
     connections: AtomicUsize,
@@ -431,6 +434,7 @@ async fn serve(
     let (stopping, _) = watch::channel(false);
     let state = Arc::new(AppState {
         token: token.clone(),
+        recovery_capability: random_token()?,
         port,
         paths: paths.clone(),
         connections: AtomicUsize::new(0),
@@ -475,22 +479,7 @@ async fn serve(
             }
         }
     });
-    let router = Router::new()
-        .route("/", get(index))
-        .route("/styles.css", get(styles))
-        .route("/app.js", get(script))
-        .route("/vendor/preact.module.js", get(preact))
-        .route("/vendor/htm.module.js", get(htm))
-        .route("/api/snapshot", get(snapshot))
-        .route("/api/shutdown", post(shutdown_bridge))
-        .route("/api/logs", get(logs))
-        .route("/api/validate", post(validate))
-        .route("/api/trigger-draft", post(trigger_draft))
-        .route("/api/save", post(save))
-        .route("/api/run", post(run_action))
-        .route("/api/drafts", get(read_drafts).post(write_drafts))
-        .route("/events", get(events))
-        .with_state(state.clone());
+    let router = bridge_router(state.clone());
     let shutdown = state.clone();
     let server = axum::serve(listener, router).with_graceful_shutdown(async move {
         shutdown.shutdown.notified().await;
@@ -508,6 +497,26 @@ async fn serve(
     };
     let _ = fs::remove_file(session_path(&paths));
     result.context("browser bridge stopped")
+}
+
+fn bridge_router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/", get(index))
+        .route("/styles.css", get(styles))
+        .route("/app.js", get(script))
+        .route("/vendor/preact.module.js", get(preact))
+        .route("/vendor/htm.module.js", get(htm))
+        .route("/api/snapshot", get(snapshot))
+        .route("/api/session", get(session_bootstrap))
+        .route("/api/shutdown", post(shutdown_bridge))
+        .route("/api/logs", get(logs))
+        .route("/api/validate", post(validate))
+        .route("/api/trigger-draft", post(trigger_draft))
+        .route("/api/save", post(save))
+        .route("/api/run", post(run_action))
+        .route("/api/drafts", get(read_drafts).post(write_drafts))
+        .route("/events", get(events))
+        .with_state(state)
 }
 
 struct BridgeInstanceLock(std::fs::File);
@@ -695,6 +704,39 @@ struct TokenQuery {
     session: Option<String>,
 }
 
+/// Returns the session token only to the browser context that received the
+/// unguessable capability from an authenticated request and retained it in
+/// origin-scoped browser storage. Loopback address and request timing alone do
+/// not grant recovery access.
+async fn session_bootstrap(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if !host_allowed(header(&headers, "host").unwrap_or(""), state.port) {
+        return reject(StatusCode::FORBIDDEN, "host was not accepted").into_response();
+    }
+    if authorized(&state, &headers, None) {
+        let mut response = Json(json!({ "ok": true, "recovery": state.recovery_capability }))
+            .into_response();
+        response.headers_mut().insert(
+            "cache-control",
+            axum::http::HeaderValue::from_static("no-store"),
+        );
+        return response;
+    }
+    if header(&headers, "x-scriptd-recovery") != Some(state.recovery_capability.as_str()) {
+        return reject(StatusCode::UNAUTHORIZED, "browser recovery capability was not accepted")
+            .into_response();
+    }
+    let mut response = Json(json!({ "ok": true, "port": state.port, "session": state.token }))
+        .into_response();
+    response.headers_mut().insert(
+        "cache-control",
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
 async fn snapshot(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -705,8 +747,7 @@ async fn snapshot(
     }
     match service_snapshot(&state.paths).await {
         Ok((digest, snapshot)) => {
-            Json(json!({ "ok": true, "config_digest": digest, "snapshot": snapshot }))
-                .into_response()
+            Json(json!({ "ok": true, "config_digest": digest, "snapshot": snapshot })).into_response()
         }
         Err(error) => reject(StatusCode::BAD_GATEWAY, &error.to_string()).into_response(),
     }
@@ -973,12 +1014,165 @@ async fn events(
 mod tests {
     use super::*;
 
+    use axum::http::HeaderValue;
+
     #[test]
     fn browser_opens_only_for_a_fully_interactive_bare_launch() {
         assert!(should_open_browser(0, true, true));
         assert!(!should_open_browser(0, false, true));
         assert!(!should_open_browser(0, true, false));
         assert!(!should_open_browser(2, true, true));
+    }
+
+    fn test_state(token: &str, port: u16) -> Arc<AppState> {
+        let dir = tempfile::tempdir().expect("temporary state directory");
+        let leaked = Box::leak(Box::new(dir));
+        let paths = control::paths_for(leaked.path(), leaked.path());
+        Arc::new(AppState {
+            token: token.to_string(),
+            recovery_capability: "browser-capability".to_string(),
+            port,
+            paths,
+            connections: AtomicUsize::new(0),
+            last_disconnect: Mutex::new(Instant::now()),
+            shutdown: Notify::new(),
+            stopping: watch::channel(false).0,
+        })
+    }
+
+    fn loopback_host(port: u16) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "host",
+            HeaderValue::from_str(&format!("127.0.0.1:{port}")).expect("host header"),
+        );
+        headers
+    }
+
+    fn headers_with_token(port: u16, session: &str) -> HeaderMap {
+        let mut headers = loopback_host(port);
+        headers.insert(
+            "x-scriptd-session",
+            HeaderValue::from_str(session).expect("session header"),
+        );
+        headers
+    }
+
+    async fn http_get(port: u16, path: &str, header: Option<(&str, &str)>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect to test bridge");
+        let extra_header = header
+            .map(|(name, value)| format!("{name}: {value}\r\n"))
+            .unwrap_or_default();
+        let request = format!(
+            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{extra_header}Connection: close\r\n\r\n"
+        );
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("write HTTP request");
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .await
+            .expect("read HTTP response");
+        String::from_utf8(response).expect("HTTP response is UTF-8")
+    }
+
+    #[tokio::test]
+    async fn session_bootstrap_requires_a_valid_session_or_browser_capability() {
+        let state = test_state("live-token", 15921);
+        let mut headers = loopback_host(15921);
+        let denied = session_bootstrap(State(state.clone()), headers.clone()).await.into_response();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+        headers.insert("x-scriptd-recovery", HeaderValue::from_static("wrong"));
+        let denied = session_bootstrap(State(state.clone()), headers.clone()).await.into_response();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+
+        headers.insert(
+            "x-scriptd-recovery",
+            HeaderValue::from_static("browser-capability"),
+        );
+        let accepted = session_bootstrap(State(state), headers).await.into_response();
+        assert_eq!(accepted.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(accepted.into_body(), usize::MAX)
+            .await
+            .expect("read bootstrap body");
+        let value: Value = serde_json::from_slice(&body).expect("bootstrap JSON");
+        assert_eq!(value["session"], "live-token");
+
+        let authorized = session_bootstrap(
+            State(test_state("live-token", 15921)),
+            headers_with_token(15921, "live-token"),
+        )
+        .await
+        .into_response();
+        let body = axum::body::to_bytes(authorized.into_body(), usize::MAX)
+            .await
+            .expect("read recovery capability body");
+        let value: Value = serde_json::from_slice(&body).expect("capability JSON");
+        assert_eq!(value["recovery"], "browser-capability");
+    }
+
+    #[tokio::test]
+    async fn browser_capability_recovers_session_after_storage_loss_and_thirty_seconds() {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind test bridge");
+        let port = listener.local_addr().expect("test bridge address").port();
+        let state = test_state("live-token", port);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, bridge_router(state))
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        let unrelated = http_get(port, "/api/session", None).await;
+        assert!(unrelated.starts_with("HTTP/1.1 401"));
+
+        let issued = http_get(
+            port,
+            "/api/session",
+            Some(("x-scriptd-session", "live-token")),
+        )
+        .await;
+        assert!(issued.starts_with("HTTP/1.1 200"));
+        assert!(issued.contains("\"recovery\":\"browser-capability\""));
+
+        tokio::time::sleep(Duration::from_secs(31)).await;
+        // The browser reloads after its URL token and sessionStorage are gone;
+        // its origin-scoped recovery capability remains in localStorage.
+        let unrelated_after_window = http_get(port, "/api/session", None).await;
+        assert!(unrelated_after_window.starts_with("HTTP/1.1 401"));
+        let recovered = http_get(
+            port,
+            "/api/session",
+            Some(("x-scriptd-recovery", "browser-capability")),
+        )
+        .await;
+        assert!(recovered.starts_with("HTTP/1.1 200"));
+        assert!(recovered.contains("\"session\":\"live-token\""));
+
+        let _ = shutdown_tx.send(());
+        server.await.expect("join test bridge").expect("serve test bridge");
+    }
+
+    #[test]
+    fn session_bootstrap_requires_the_loopback_page_origin() {
+        // A tab on the bridge origin can re-acquire its credential; any other
+        // Host must be refused so the token never leaves the loopback port.
+        assert!(host_allowed("127.0.0.1:15921", 15921));
+        assert!(!host_allowed("localhost:15921", 15921));
+        assert!(!host_allowed("", 15921));
+        assert!(!host_allowed("attacker.example", 15921));
+        assert!(!host_allowed("127.0.0.1:15922", 15921));
     }
 
     #[test]
@@ -1134,6 +1328,7 @@ mod tests {
         let paths = control::paths_for(dir.path(), dir.path());
         let state = Arc::new(AppState {
             token: "test".to_string(),
+            recovery_capability: "browser-capability".to_string(),
             port: 43123,
             paths,
             connections: AtomicUsize::new(2),

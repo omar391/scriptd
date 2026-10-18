@@ -54,10 +54,42 @@ const SETTING_LABELS = {
 };
 const tabs = ['Overview', 'Settings', 'Triggers', 'Logs'];
 const query = new URLSearchParams(location.search);
-const session = query.get('session') || sessionStorage.getItem('scriptd-session');
+
+// The bridge hands the token to the tab through the URL on first launch and
+// through sessionStorage on reload. The authenticated browser context also
+// retains an origin-scoped recovery capability in localStorage, so a reload
+// after sessionStorage was cleared can re-acquire the token from /api/session.
+// Keep the value mutable so the recovered credential reaches
+// every request without a page reload, and read it through sessionToken() so
+// no caller can capture a stale empty value.
+let session = query.get('session') || sessionStorage.getItem('scriptd-session');
+function sessionToken() { return session; }
+
+// Repopulates a lost credential with the origin-scoped recovery capability.
+async function restoreSession() {
+  if (session) return session;
+  try {
+    const capability = localStorage.getItem('scriptd-recovery');
+    if (!capability) return null;
+    const recovered = await fetch('/api/session', {
+      headers: { 'x-scriptd-recovery': capability }, cache: 'no-store'
+    }).then(r => r.json());
+    if (recovered && recovered.ok && recovered.session) {
+      session = recovered.session;
+      sessionStorage.setItem('scriptd-session', session);
+      return session;
+    }
+  } catch (_) {}
+  return null;
+}
 if (session) {
   sessionStorage.setItem('scriptd-session', session);
   history.replaceState(null, '', location.pathname);
+  fetch('/api/session', {
+    headers: { 'x-scriptd-session': session }, cache: 'no-store'
+  }).then(r => r.json()).then(data => {
+    if (data && data.ok && data.recovery) localStorage.setItem('scriptd-recovery', data.recovery);
+  }).catch(() => {});
 }
 
 let appState = {
@@ -75,7 +107,7 @@ let quitOperationToken = 0;
 
 function api(path, options) {
   const opts = options || {};
-  opts.headers = Object.assign({}, opts.headers || {}, { 'x-scriptd-session': session || '' });
+  opts.headers = Object.assign({}, opts.headers || {}, { 'x-scriptd-session': sessionToken() || '' });
   if (opts.body) {
     opts.headers['content-type'] = 'application/json';
     opts.headers.origin = location.origin;
@@ -258,7 +290,10 @@ function draftModuleEnabled(moduleId, enabled) {
 
 function connect() {
   if (!session) {
-    setState({ loading: false, error: 'This browser session has no credential. Run scriptd again to open the control center.' });
+    restoreSession().then(recovered => {
+      if (recovered) connect();
+      else setState({ loading: false, error: 'This browser session has no credential. Run scriptd again to open the control center.' });
+    });
     return;
   }
   api('/api/snapshot').then(data => {
@@ -280,7 +315,7 @@ function connect() {
     }).catch(() => {});
   }).catch(error => setState({ loading: false, error: error.message }));
   if (eventSource) eventSource.close();
-  eventSource = new EventSource('/events?session=' + encodeURIComponent(session));
+  eventSource = new EventSource('/events?session=' + encodeURIComponent(sessionToken()));
   eventSource.addEventListener('snapshot', event => {
     try {
       const data = JSON.parse(event.data);
@@ -312,6 +347,20 @@ function statusLabel(info) {
   if (!info.status || info.status === 'unknown' || info.status === 'stopped') return 'Unknown';
   return 'Healthy';
 }
+
+// The control center can only report what it has actually observed. Before the
+// first snapshot arrives the service state is unknown, not offline, and saying
+// otherwise tells the user their service died when it never stopped.
+function serviceStatusLabel() {
+  const service = appState.snapshot && appState.snapshot.service || {};
+  if (!appState.snapshot) return 'Service status unknown';
+  return service.running ? 'Service running' : 'Service offline';
+}
+function serviceStatusTone() {
+  const service = appState.snapshot && appState.snapshot.service || {};
+  if (!appState.snapshot) return 'warn';
+  return service.running ? 'good' : 'muted';
+}
 function badge(text, tone) { return h('span', { class: 'badge ' + (tone || '') }, text); }
 function card(title, content, detail) {
   return h('section', { class: 'card' }, h('div', { class: 'card-heading' }, h('h2', null, title)),
@@ -323,6 +372,7 @@ function metric(label, value, note) {
 }
 function configurationApplicationState(snapshot) {
   const service = snapshot && snapshot.service || {};
+  if (!snapshot) return 'Not observed yet';
   if (service.restart_required) return 'Restart required';
   if (!service.running) return 'Saved; service offline';
   if (service.reload_error) return 'Reload rejected';
@@ -388,14 +438,15 @@ function Sidebar() {
       renderApp();
       if (mobileNavigationWasOpen) focusMainContent();
     } },
-      h('span', { class: 'nav-icon' }, '◉'), navName('Service'), badge(service.running ? 'Running' : 'Offline', service.running ? 'good' : 'muted'))
+      h('span', { class: 'nav-icon' }, '◉'), navName('Service'), badge(service.running ? 'Running' : (appState.snapshot ? 'Offline' : 'Unknown'), service.running ? 'good' : (appState.snapshot ? 'muted' : 'warn')))
   ];
   return h('aside', { class: 'sidebar ' + (appState.collapsed ? 'collapsed ' : '') + (appState.mobileNavOpen ? 'mobile-nav-open' : ''), 'aria-label': 'Scriptd navigation' },
     h('div', { class: 'brand' }, BrandMark, h('strong', null, 'scriptd'),
       button(sidebarToggleIcon(appState.collapsed), () => setState({ collapsed: !appState.collapsed }), 'icon-button desktop-sidebar-toggle', { 'aria-expanded': String(!appState.collapsed), 'aria-label': appState.collapsed ? 'Expand navigation' : 'Collapse navigation', title: appState.collapsed ? 'Expand navigation' : 'Collapse navigation' }),
       button(mobileNavigationIcon(appState.mobileNavOpen), () => setState({ mobileNavOpen: !appState.mobileNavOpen }), 'icon-button mobile-nav-toggle', { id: 'mobile-nav-toggle', 'aria-expanded': String(appState.mobileNavOpen), 'aria-controls': 'primary-navigation', 'aria-label': appState.mobileNavOpen ? 'Close navigation' : 'Open navigation', title: appState.mobileNavOpen ? 'Close navigation' : 'Open navigation' })),
     h('nav', { id: 'primary-navigation', class: 'nav-list', 'aria-label': 'Main' }, entries),
-    h('div', { class: 'sidebar-foot' }, h('span', { class: 'pulse ' + (service.running ? 'on' : '') }), service.running ? 'Service connected' : 'Service unavailable')
+    h('div', { class: 'sidebar-foot' }, h('span', { class: 'pulse ' + (serviceStatusTone() === 'good' ? 'on' : '') }),
+      service.running ? 'Service connected' : (appState.snapshot ? 'Service unavailable' : 'Service status unknown'))
   );
 }
 
@@ -414,7 +465,7 @@ function Header() {
   return h('header', { class: 'topbar' },
     h('div', { class: 'breadcrumbs' }, h('span', null, 'SCRIPTD'), h('span', { class: 'slash' }, '/'), h('h1', null, title),
       info ? h('code', null, info.id) : null),
-    h('div', { class: 'topbar-status' }, badge(service.running ? 'Service running' : 'Service offline', service.running ? 'good' : 'muted'),
+    h('div', { class: 'topbar-status' }, badge(serviceStatusLabel(), serviceStatusTone()),
       button('Refresh', refresh, 'button subtle'), button('Quit', requestQuit, 'button subtle'))
   );
 }
@@ -439,7 +490,7 @@ function Overview() {
     return h('div', { class: 'content-stack' },
       h('div', { class: 'welcome' }, h('p', { class: 'eyebrow' }, 'CONTROL CENTER'), h('h2', null, 'Your modules, one place.'),
         h('p', null, 'Review service health, module configuration, scheduled work, and recent outcomes. The service runs independently of this browser.')),
-      h('div', { class: 'metric-grid' }, metric('Service', service.running ? 'Running' : 'Offline', service.pid ? 'Process ' + service.pid : 'No active supervisor'),
+      h('div', { class: 'metric-grid' }, metric('Service', service.running ? 'Running' : (appState.snapshot ? 'Offline' : 'Unknown'), service.pid ? 'Process ' + service.pid : (appState.snapshot ? 'No active supervisor' : 'Not observed yet')),
         metric('Modules', modules.length, 'Configured and discovered modules'),
         metric('Configuration', configurationApplicationState(appState.snapshot), service.reload_error || 'Compared with the saved service document')),
       card('Modules', h('div', { class: 'module-cards' }, MODULES.map(item => {
@@ -449,7 +500,7 @@ function Overview() {
           h('strong', null, item.name), h('span', { class: 'muted' }, module.message || module.last_error || 'Open module details'));
       }))),
       card('Service status', h('div', { class: 'key-values' },
-        row('Runtime', service.running ? 'Running' : 'Unavailable'),
+        row('Runtime', service.running ? 'Running' : (appState.snapshot ? 'Unavailable' : 'Not observed yet')),
         row('PID', service.pid || '—'),
         row('Loaded configuration', service.loaded_digest || 'Unknown'),
         row('Last reload error', service.reload_error || 'None')
@@ -527,7 +578,7 @@ function SettingsView() {
       profile.advanced.length ? h('details', { class: 'advanced-settings' }, h('summary', null, 'Advanced settings'),
         h('div', { class: 'settings-grid' }, profile.advanced.map(key => settingField(id, key, settings)))) : null),
     h('div', { class: 'editor-toolbar' }, h('span', null, id ? 'Module configuration · ' + id : 'Shared service configuration'),
-      h('span', null, sourceDigest(id) ? 'Base ' + sourceDigest(id).slice(0, 19) + '…' : 'Service unavailable')),
+    h('span', null, sourceDigest(id) ? 'Base ' + sourceDigest(id).slice(0, 19) + '…' : (appState.snapshot ? 'Service unavailable' : 'Not observed yet'))),
     h('label', { class: 'field-label', for: 'yaml-editor' }, 'YAML configuration'),
     h('textarea', { id: 'yaml-editor', class: 'yaml-editor', spellcheck: false, autocapitalize: 'off', autocorrect: 'off',
       value: current, onInput: event => updateDraft(id, event.currentTarget.value), 'aria-describedby': 'yaml-help' }),
@@ -731,7 +782,7 @@ function LogsView() {
     h('div', { class: 'log-controls' },
       h('label', null, 'Severity', h('select', { value: appState.severity, onChange: event => { setState({ severity: event.currentTarget.value }); loadLogs(); } },
         ['all', 'error', 'warn', 'info'].map(level => h('option', { value: level }, level)))),
-      h('label', { class: 'search-label' }, 'Search', h('input', { type: 'search', value: appState.search, onInput: event => setState({ search: event.currentTarget.value }), onKeyDown: event => { if (event.key === 'Enter') loadLogs(); }, placeholder: 'Filter log lines' })),
+    h('label', { class: 'search-label' }, 'Search', h('input', { type: 'search', value: appState.search, onInput: event => setState({ search: event.currentTarget.value }), onKeyDown: event => { if (event.key === 'Enter') loadLogs(); }, placeholder: 'Filter log lines' })),
       button('Search', loadLogs, 'button'))
     ,
     h('pre', { class: 'log-view', 'aria-live': appState.follow ? 'polite' : 'off' }, appState.logs.length ? appState.logs.join('\n') : 'No log entries loaded.'),
@@ -742,9 +793,9 @@ function LogsView() {
 function ServiceView() {
   const service = appState.snapshot && appState.snapshot.service || {};
   return h('div', { class: 'content-stack' },
-    h('div', { class: 'welcome compact' }, h('p', { class: 'eyebrow' }, 'RUNTIME'), h('h2', null, service.running ? 'The service is running.' : 'The service is not connected.'),
+    h('div', { class: 'welcome compact' }, h('p', { class: 'eyebrow' }, 'RUNTIME'), h('h2', null, service.running ? 'The service is running.' : (appState.snapshot ? 'The service is not connected.' : 'The service has not been observed yet.')),
       h('p', null, 'This browser control center observes and sends explicit requests. It does not start, stop, or restart the service.')),
-    h('div', { class: 'metric-grid' }, metric('Status', service.running ? 'Running' : 'Offline', service.pid ? 'PID ' + service.pid : ''),
+    h('div', { class: 'metric-grid' }, metric('Status', service.running ? 'Running' : (appState.snapshot ? 'Offline' : 'Unknown'), service.pid ? 'PID ' + service.pid : ''),
       metric('Loaded configuration', configurationApplicationState(appState.snapshot), service.loaded_digest || ''),
       metric('Last reload error', service.reload_error ? 'Needs attention' : 'None', service.reload_error || 'No error reported')),
     card('Service lifecycle', h('div', { class: 'key-values' }, row('Configuration saved', appState.snapshot && appState.snapshot.config_digest || 'Unknown'),
