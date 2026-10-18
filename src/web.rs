@@ -24,6 +24,8 @@ use tokio::sync::{Notify, watch};
 
 use crate::control::{self, ControlPaths};
 use crate::paths::{self, write_private_atomic};
+use crate::grants::GrantsStore;
+use crate::access::{self, AccessController, AccessState, GRANT_HEADER};
 
 const INDEX: &str = include_str!("../assets/web/index.html");
 
@@ -62,16 +64,13 @@ struct BrowserSession {
 }
 
 struct AppState {
-    token: String,
-    /// Unpredictable capability that the authenticated browser retains in
-    /// origin-scoped storage for later session recovery.
-    recovery_capability: String,
     port: u16,
     paths: ControlPaths,
     connections: AtomicUsize,
     last_disconnect: Mutex<Instant>,
     shutdown: Notify,
     stopping: watch::Sender<bool>,
+    access: AccessController,
 }
 
 struct ConnectionGuard(Arc<AppState>);
@@ -453,27 +452,18 @@ async fn serve(
         .await
         .context("bind browser bridge")?;
     let port = listener.local_addr()?.port();
-    let token = random_token()?;
+    let grants = GrantsStore::load(&paths).context("load browser grants")?;
+    let access = AccessController::new(grants);
     let (stopping, _) = watch::channel(false);
     let state = Arc::new(AppState {
-        token: token.clone(),
-        recovery_capability: durable_recovery_capability(&paths)?,
         port,
         paths: paths.clone(),
         connections: AtomicUsize::new(0),
         last_disconnect: Mutex::new(Instant::now()),
         shutdown: Notify::new(),
         stopping,
+        access,
     });
-    let session = BrowserSession {
-        pid: std::process::id(),
-        port,
-        token,
-    };
-    write_private_atomic(
-        &session_path(&paths),
-        serde_json::to_string(&session)?.as_bytes(),
-    )?;
     if let Some(ready) = ready {
         if ready
             .send(Ok(BridgeReady {
@@ -518,7 +508,10 @@ async fn serve(
             tokio::time::sleep(BRIDGE_DRAIN_TIMEOUT).await;
         } => Ok(()),
     };
-    let _ = fs::remove_file(session_path(&paths));
+    // Persist the grants store on shutdown
+    if let Err(error) = state.access.snapshot().save(&state.paths) {
+        eprintln!("Failed to save browser grants: {}", error);
+    }
     result.context("browser bridge stopped")
 }
 
@@ -530,7 +523,7 @@ fn bridge_router(state: Arc<AppState>) -> Router {
         .route("/vendor/preact.module.js", get(preact))
         .route("/vendor/htm.module.js", get(htm))
         .route("/api/snapshot", get(snapshot))
-        .route("/api/session", get(session_bootstrap))
+        .route("/api/access", get(access_status))
         .route("/api/shutdown", post(shutdown_bridge))
         .route("/api/logs", get(logs))
         .route("/api/validate", post(validate))
@@ -538,6 +531,11 @@ fn bridge_router(state: Arc<AppState>) -> Router {
         .route("/api/save", post(save))
         .route("/api/run", post(run_action))
         .route("/api/drafts", get(read_drafts).post(write_drafts))
+        .route("/api/access", get(access_status))
+        .route("/api/access/request", post(access_request))
+        .route("/api/access/poll", post(access_poll))
+        .route("/api/access/revoke", post(access_revoke))
+        .route("/api/access/list", get(access_list))
         .route("/events", get(events))
         .with_state(state)
 }
@@ -573,17 +571,19 @@ fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|value| value.to_str().ok())
 }
 
-fn authorized(state: &AppState, headers: &HeaderMap, query_token: Option<&str>) -> bool {
-    let supplied = header(headers, "x-scriptd-session").or(query_token);
-    supplied == Some(state.token.as_str())
-        && host_allowed(header(headers, "host").unwrap_or(""), state.port)
+/// True when the request came from this loopback address and an approved
+/// browser grant. Every authenticated endpoint checks the Host header so a
+/// DNS-rebinding or cross-origin request is rejected before credentials matter.
+fn authorized(state: &AppState, headers: &HeaderMap) -> bool {
+    host_allowed(header(headers, "host").unwrap_or(""), state.port)
+        && state.access.verifies(headers)
 }
 
 async fn shutdown_bridge(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if !authorized(&state, &headers, None) {
+    if !authorized(&state, &headers) {
         return reject(StatusCode::UNAUTHORIZED, "session was not accepted");
     }
     state.stopping.send_replace(true);
@@ -722,37 +722,26 @@ async fn htm(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl Int
     ([("content-type", "text/javascript; charset=utf-8")], HTM).into_response()
 }
 
-#[derive(Deserialize)]
-struct TokenQuery {
-    session: Option<String>,
-}
-
-/// Returns the session token only to the browser context that received the
-/// unguessable capability from an authenticated request and retained it in
-/// origin-scoped browser storage. Loopback address and request timing alone do
-/// not grant recovery access.
-async fn session_bootstrap(
+/// Reports the browser's access state and a short identifier if pending.
+async fn access_status(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     if !host_allowed(header(&headers, "host").unwrap_or(""), state.port) {
         return reject(StatusCode::FORBIDDEN, "host was not accepted").into_response();
     }
-    if authorized(&state, &headers, None) {
-        let mut response = Json(json!({ "ok": true, "recovery": state.recovery_capability }))
-            .into_response();
-        response.headers_mut().insert(
-            "cache-control",
-            axum::http::HeaderValue::from_static("no-store"),
-        );
-        return response;
-    }
-    if header(&headers, "x-scriptd-recovery") != Some(state.recovery_capability.as_str()) {
-        return reject(StatusCode::UNAUTHORIZED, "browser recovery capability was not accepted")
-            .into_response();
-    }
-    let mut response = Json(json!({ "ok": true, "port": state.port, "session": state.token }))
-        .into_response();
+    let access_state = state.access.state_for(&headers);
+    let pending = if access_state == AccessState::Pending {
+        state.access.pending_identifier()
+    } else {
+        None
+    };
+    let mut response = Json(json!({
+        "ok": true,
+        "state": access_state.as_str(),
+        "pending_identifier": pending,
+    }))
+    .into_response();
     response.headers_mut().insert(
         "cache-control",
         axum::http::HeaderValue::from_static("no-store"),
@@ -760,12 +749,182 @@ async fn session_bootstrap(
     response
 }
 
+async fn access_request(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<crate::access::AccessRequestBody>,
+) -> impl IntoResponse {
+    if !host_allowed(header(&headers, "host").unwrap_or(""), state.port) {
+        return reject(StatusCode::FORBIDDEN, "host was not accepted").into_response();
+    }
+    if !origin_allowed(header(&headers, "origin"), state.port) {
+        return reject(StatusCode::FORBIDDEN, "origin was not accepted").into_response();
+    }
+    if state.access.verifies(&headers) {
+        return reject(StatusCode::CONFLICT, "this browser already has access").into_response();
+    }
+    let label = if body.label.trim().is_empty() {
+        "Browser on this Mac".to_string()
+    } else {
+        body.label.trim().chars().take(80).collect()
+    };
+    let ticket = match state.access.open_request(&label) {
+        Ok(ticket) => ticket,
+        Err(message) => {
+            return reject(StatusCode::TOO_MANY_REQUESTS, &message).into_response();
+        }
+    };
+    let decision = match crate::approval::request_approval(
+        "Scriptd access request",
+        &format!(
+            "Allow this browser to manage Scriptd?
+
+Identifier: {}
+Label: {}",
+            ticket.identifier, label
+        ),
+        crate::access::REQUEST_TIMEOUT,
+    )
+    .await
+    {
+        Ok(decision) => decision,
+        Err(error) => {
+            state.access.cancel_pending();
+            let mut response = Json(json!({
+                "ok": false,
+                "state": access::AccessState::Unavailable.as_str(),
+                "message": format!("the approval prompt is unavailable: {error}"),
+            }))
+            .into_response();
+            *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+            return response;
+        }
+    };
+    let mut response = match decision {
+        crate::approval::ApprovalDecision::Allowed => {
+            if let Err(error) = state.access.resolve(true) {
+                state.access.cancel_pending();
+                return reject(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("store the approved grant: {error}"),
+                )
+                .into_response();
+            }
+            Json(json!({
+                "ok": true,
+                "state": access::AccessState::Authorized.as_str(),
+                "identifier": ticket.identifier,
+            }))
+            .into_response()
+        }
+        crate::approval::ApprovalDecision::Denied => {
+            let _ = state.access.resolve(false);
+            let mut response = Json(json!({
+                "ok": false,
+                "state": access::AccessState::Unauthorized.as_str(),
+                "message": "the request was declined",
+            }))
+            .into_response();
+            *response.status_mut() = StatusCode::FORBIDDEN;
+            response
+        }
+        crate::approval::ApprovalDecision::Unavailable => {
+            state.access.cancel_pending();
+            let mut response = Json(json!({
+                "ok": false,
+                "state": access::AccessState::Unavailable.as_str(),
+                "message": "the approval prompt could not be shown",
+            }))
+            .into_response();
+            *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+            response
+        }
+    };
+    response.headers_mut().insert(
+        "cache-control",
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+async fn access_poll(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<crate::access::AccessPollBody>,
+) -> impl IntoResponse {
+    if !host_allowed(header(&headers, "host").unwrap_or(""), state.port) {
+        return reject(StatusCode::FORBIDDEN, "host was not accepted").into_response();
+    }
+    let outcome = state.access.poll(&body.claim);
+    let mut response = match outcome {
+        access::PollOutcome::Waiting => Json(json!({
+            "ok": true,
+            "state": access::AccessState::Pending.as_str(),
+        }))
+        .into_response(),
+        access::PollOutcome::Allowed(credential) => Json(json!({
+            "ok": true,
+            "state": access::AccessState::Authorized.as_str(),
+            "grant": credential,
+        }))
+        .into_response(),
+        access::PollOutcome::Expired => Json(json!({
+            "ok": false,
+            "state": access::AccessState::Unauthorized.as_str(),
+            "message": "the request expired or was never opened by this tab",
+        }))
+        .into_response(),
+    };
+    response.headers_mut().insert(
+        "cache-control",
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+async fn access_revoke(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<crate::access::AccessRevokeBody>,
+) -> impl IntoResponse {
+    if !authorized(&state, &headers) || !origin_allowed(header(&headers, "origin"), state.port) {
+        return reject(StatusCode::FORBIDDEN, "origin or grant was not accepted").into_response();
+    }
+    if !state.access.revoke(&body.id) {
+        return reject(StatusCode::NOT_FOUND, "no browser profile matches that identity")
+            .into_response();
+    }
+    if let Err(error) = state.access.snapshot().save(&state.paths) {
+        return reject(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("persist the revoked grants: {error}"),
+        )
+        .into_response();
+    }
+    Json(json!({ "ok": true })).into_response()
+}
+
+async fn access_list(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if !authorized(&state, &headers) {
+        return reject(StatusCode::UNAUTHORIZED, "grant was not accepted").into_response();
+    }
+    let profiles = state
+        .access
+        .list()
+        .into_iter()
+        .map(|(id, label, issued_at)| json!({ "id": id, "label": label, "issued_at": issued_at }))
+        .collect::<Vec<_>>();
+    Json(json!({ "ok": true, "profiles": profiles })).into_response()
+}
+
 async fn snapshot(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Query(query): Query<TokenQuery>,
 ) -> impl IntoResponse {
-    if !authorized(&state, &headers, query.session.as_deref()) {
+    if !authorized(&state, &headers) {
         return reject(StatusCode::UNAUTHORIZED, "session was not accepted").into_response();
     }
     match service_snapshot(&state.paths).await {
@@ -778,7 +937,6 @@ async fn snapshot(
 
 #[derive(Deserialize)]
 struct LogQuery {
-    session: Option<String>,
     module: String,
     severity: Option<String>,
     query: Option<String>,
@@ -789,7 +947,7 @@ async fn logs(
     headers: HeaderMap,
     Query(query): Query<LogQuery>,
 ) -> impl IntoResponse {
-    if !authorized(&state, &headers, query.session.as_deref()) {
+    if !authorized(&state, &headers) {
         return reject(StatusCode::UNAUTHORIZED, "session was not accepted").into_response();
     }
     let mut request = control_request(&state.paths, "logs", "logs");
@@ -961,15 +1119,14 @@ async fn run_action(
 }
 
 fn mutating_allowed(state: &AppState, headers: &HeaderMap) -> bool {
-    authorized(state, headers, None) && origin_allowed(header(headers, "origin"), state.port)
+    authorized(state, headers) && origin_allowed(header(headers, "origin"), state.port)
 }
 
 async fn read_drafts(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Query(query): Query<TokenQuery>,
 ) -> impl IntoResponse {
-    if !authorized(&state, &headers, query.session.as_deref()) {
+    if !authorized(&state, &headers) {
         return reject(StatusCode::UNAUTHORIZED, "session was not accepted").into_response();
     }
     let value = fs::read_to_string(draft_path(&state.paths))
@@ -1001,9 +1158,8 @@ async fn write_drafts(
 async fn events(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Query(query): Query<TokenQuery>,
 ) -> impl IntoResponse {
-    if !authorized(&state, &headers, query.session.as_deref()) {
+    if !authorized(&state, &headers) {
         return reject(StatusCode::UNAUTHORIZED, "session was not accepted").into_response();
     }
     state.connections.fetch_add(1, Ordering::SeqCst);

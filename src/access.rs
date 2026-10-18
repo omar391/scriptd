@@ -103,6 +103,11 @@ impl AccessController {
         Self::lock(&self.grants).verify(credential).is_some()
     }
 
+    /// Returns the pending identifier if a prompt is waiting.
+    pub fn pending_identifier(&self) -> Option<String> {
+        Self::lock(&self.pending).as_ref().map(|r| r.identifier.clone())
+    }
+
     /// Opens one pending prompt, or explains why it could not be opened.
     ///
     /// Only one prompt may exist at a time and a denial or timeout places the
