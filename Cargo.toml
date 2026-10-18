@@ -10,6 +10,7 @@ chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 cron = "0.12"
 dirs = "6.0"
+hex = "0.4"
 notify = "6.1"
 objc2-core-wlan = { version = "0.3", optional = true, default-features = false, features = ["std", "CWChannel", "CWInterface", "CWNetwork", "CoreWLANTypes"] }
 objc2-foundation = { version = "0.3", optional = true, default-features = false, features = ["std", "NSEnumerator", "NSSet", "NSString"] }
@@ -27,6 +28,8 @@ sysinfo = { version = "0.32", default-features = true, features = ["system"] }
 tokio = { version = "1.39", features = ["macros", "rt", "rt-multi-thread", "fs", "process", "signal", "time", "sync", "net", "io-util"] }
 axum = { version = "0.7.9", default-features = false, features = ["http1", "json", "tokio", "query"] }
 futures-util = "0.3"
+core-foundation = "0.10"
+core-foundation-sys = "0.8"
 security-framework = "3.7.0"
 
 [features]

@@ -4,7 +4,10 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+mod approval;
 mod broker;
+mod grants;
+mod access;
 mod config;
 mod control;
 mod credentials;
