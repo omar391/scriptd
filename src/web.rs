@@ -1185,6 +1185,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_stored_credential_is_rejected_and_the_capability_recovers() {
+        // A tab opened before a service restart keeps the previous bridge's
+        // token in sessionStorage. That token must be refused so the page
+        // knows to recover, and the recovery capability must still work while
+        // loopback address and timing alone grant nothing.
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind test bridge");
+        let port = listener.local_addr().expect("test bridge address").port();
+        let state = test_state("live-token", port);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, bridge_router(state))
+                .with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        let stale = http_get(port, "/api/snapshot", Some(("x-scriptd-session", "dead-token"))).await;
+        assert!(stale.starts_with("HTTP/1.1 401"));
+
+        let recovered = http_get(
+            port,
+            "/api/session",
+            Some(("x-scriptd-recovery", "browser-capability")),
+        )
+        .await;
+        assert!(recovered.starts_with("HTTP/1.1 200"));
+        assert!(recovered.contains("\"session\":\"live-token\""));
+
+        let _ = shutdown_tx.send(());
+        server.await.expect("join test bridge").expect("serve test bridge");
+    }
+
+    #[tokio::test]
     async fn browser_port_falls_back_when_a_port_is_already_taken() {
         // The test must not depend on the production port being free, so it
         // reserves candidates itself and exercises the fallback against them.

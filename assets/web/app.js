@@ -66,8 +66,12 @@ let session = query.get('session') || sessionStorage.getItem('scriptd-session');
 function sessionToken() { return session; }
 
 // Repopulates a lost credential with the origin-scoped recovery capability.
+// A stored token can outlive the bridge process that issued it: the service
+// restarts, the old token is rejected with 401, and a page that keeps trusting
+// it renders stale data behind a disconnected banner. So the stored token is a
+// starting point, not a settled fact, and any rejection falls through to the
+// recovery capability instead of dead-ending.
 async function restoreSession() {
-  if (session) return session;
   try {
     const capability = localStorage.getItem('scriptd-recovery');
     if (!capability) return null;
@@ -78,6 +82,11 @@ async function restoreSession() {
       session = recovered.session;
       sessionStorage.setItem('scriptd-session', session);
       return session;
+    }
+    if (recovered && recovered.ok && !recovered.session) {
+      // The server accepted the capability but no longer issues a token; the
+      // stored credential is unusable and recovery is already exhausted.
+      return null;
     }
   } catch (_) {}
   return null;
@@ -114,7 +123,14 @@ function api(path, options) {
   }
   return fetch(path, opts).then(async response => {
     const data = await response.json();
-    if (!response.ok || data.ok === false) throw new Error(data.message || ('Request failed (' + response.status + ')'));
+    if (!response.ok || data.ok === false) {
+      // The status lives on the response, not in the body text, so it must be
+      // carried through: a 401 that only reads "session was not accepted"
+      // looks identical to any other rejection when callers match on it.
+      const error = new Error(data.message || ('Request failed (' + response.status + ')'));
+      error.status = response.status;
+      throw error;
+    }
     return data;
   });
 }
@@ -289,14 +305,14 @@ function draftModuleEnabled(moduleId, enabled) {
 }
 
 function connect() {
-  if (!session) {
-    restoreSession().then(recovered => {
-      if (recovered) connect();
-      else setState({ loading: false, error: 'This browser session has no credential. Run scriptd again to open the control center.' });
-    });
-    return;
-  }
-  api('/api/snapshot').then(data => {
+  loadSnapshot(true);
+}
+
+// Attempts a snapshot load, recovering the credential once when the server
+// rejects the stored one. Without the recovery retry a tab that keeps a token
+// from a previous bridge process stays frozen on stale data with no way back.
+function loadSnapshot(allowRecovery) {
+  const attempt = () => api('/api/snapshot').then(data => {
     const snapshot = data.snapshot || {};
     const drafts = Object.assign({}, JSON.parse(localStorage.getItem('scriptd-drafts') || '{}'), appState.drafts);
     appState = Object.assign({}, appState, { snapshot, drafts, serviceOnline: !!(snapshot.service && snapshot.service.running), loading: false, error: '' });
@@ -313,7 +329,7 @@ function connect() {
         }
       });
     }).catch(() => {});
-  }).catch(error => setState({ loading: false, error: error.message }));
+  }).catch(error => handleSnapshotFailure(error, allowRecovery));
   if (eventSource) eventSource.close();
   eventSource = new EventSource('/events?session=' + encodeURIComponent(sessionToken()));
   eventSource.addEventListener('snapshot', event => {
@@ -325,6 +341,23 @@ function connect() {
     } catch (_) {}
   });
   eventSource.onerror = () => setState({ error: 'Browser bridge disconnected. Refresh or run scriptd to reconnect.' });
+  attempt();
+}
+
+// A rejected credential is recoverable, an absent one is not, and the two need
+// different messages so the user knows whether to wait or re-run scriptd.
+function handleSnapshotFailure(error, allowRecovery) {
+  const message = (error && error.message) || '';
+  if (allowRecovery && error && error.status === 401) {
+    session = '';
+    sessionStorage.removeItem('scriptd-session');
+    restoreSession().then(recovered => {
+      if (recovered) loadSnapshot(false);
+      else setState({ loading: false, error: 'This browser session has no valid credential. Run scriptd again to open the control center.' });
+    });
+    return;
+  }
+  setState({ loading: false, error: message });
 }
 
 function node(tag, props, children) { return h(tag, props || {}, ...(children || [])); }
