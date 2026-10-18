@@ -71,13 +71,14 @@ function sessionToken() { return session; }
 // it renders stale data behind a disconnected banner. So the stored token is a
 // starting point, not a settled fact, and any rejection falls through to the
 // recovery capability instead of dead-ending.
-async function restoreSession() {
+async function restoreSession(generation) {
   try {
     const capability = localStorage.getItem('scriptd-recovery');
     if (!capability) return null;
     const recovered = await fetch('/api/session', {
       headers: { 'x-scriptd-recovery': capability }, cache: 'no-store'
     }).then(r => r.json());
+    if (generation !== connectionGeneration) return null;
     if (recovered && recovered.ok && recovered.session) {
       session = recovered.session;
       sessionStorage.setItem('scriptd-session', session);
@@ -108,6 +109,9 @@ let appState = {
   saveDiff: null, serviceOnline: false, quitQueue: null, quitWorking: false
 };
 let eventSource;
+let reconnectTimer;
+let reconnectDelay = 1000;
+let connectionGeneration = 0;
 let draftTimer;
 let settingsParseTimer;
 let logTimer;
@@ -305,14 +309,32 @@ function draftModuleEnabled(moduleId, enabled) {
 }
 
 function connect() {
+  clearTimeout(reconnectTimer);
+  reconnectTimer = null;
   loadSnapshot(true);
+}
+
+function scheduleReconnect() {
+  if (reconnectTimer) return;
+  setState({ loading: false, serviceOnline: false, error: 'Connection interrupted. Reconnecting automatically…' });
+  reconnectTimer = setTimeout(connect, reconnectDelay);
+  reconnectDelay = Math.min(reconnectDelay * 2, 10000);
 }
 
 // Attempts a snapshot load, recovering the credential once when the server
 // rejects the stored one. Without the recovery retry a tab that keeps a token
 // from a previous bridge process stays frozen on stale data with no way back.
 function loadSnapshot(allowRecovery) {
-  const attempt = () => api('/api/snapshot').then(data => {
+  const generation = ++connectionGeneration;
+  if (eventSource) { eventSource.close(); eventSource = null; }
+  api('/api/snapshot').then(data => {
+    if (generation !== connectionGeneration) return;
+    reconnectDelay = 1000;
+    // Refresh the remembered capability after a successful bootstrap as well
+    // as initial launch, including tabs upgraded from an older bridge.
+    api('/api/session').then(data => {
+      if (data.recovery) localStorage.setItem('scriptd-recovery', data.recovery);
+    }).catch(() => {});
     const snapshot = data.snapshot || {};
     const drafts = Object.assign({}, JSON.parse(localStorage.getItem('scriptd-drafts') || '{}'), appState.drafts);
     appState = Object.assign({}, appState, { snapshot, drafts, serviceOnline: !!(snapshot.service && snapshot.service.running), loading: false, error: '' });
@@ -329,10 +351,17 @@ function loadSnapshot(allowRecovery) {
         }
       });
     }).catch(() => {});
-  }).catch(error => handleSnapshotFailure(error, allowRecovery));
-  if (eventSource) eventSource.close();
-  eventSource = new EventSource('/events?session=' + encodeURIComponent(sessionToken()));
-  eventSource.addEventListener('snapshot', event => {
+    openEvents(generation);
+  }).catch(error => {
+    if (generation === connectionGeneration) handleSnapshotFailure(error, allowRecovery, generation);
+  });
+}
+
+function openEvents(generation) {
+  const source = new EventSource('/events?session=' + encodeURIComponent(sessionToken()));
+  eventSource = source;
+  source.addEventListener('snapshot', event => {
+    if (generation !== connectionGeneration || eventSource !== source) return;
     try {
       const data = JSON.parse(event.data);
       if (!data.ok && data.message) return setState({ error: data.message });
@@ -340,24 +369,28 @@ function loadSnapshot(allowRecovery) {
       renderApp();
     } catch (_) {}
   });
-  eventSource.onerror = () => setState({ error: 'Browser bridge disconnected. Refresh or run scriptd to reconnect.' });
-  attempt();
+  source.onerror = () => {
+    if (generation !== connectionGeneration || eventSource !== source) return;
+    source.close();
+    eventSource = null;
+    // Native SSE retries keep the old URL token. Re-bootstrap the snapshot so
+    // a new service generation can issue a token before opening a fresh stream.
+    scheduleReconnect();
+  };
 }
 
-// A rejected credential is recoverable, an absent one is not, and the two need
-// different messages so the user knows whether to wait or re-run scriptd.
-function handleSnapshotFailure(error, allowRecovery) {
-  const message = (error && error.message) || '';
+function handleSnapshotFailure(error, allowRecovery, generation) {
   if (allowRecovery && error && error.status === 401) {
     session = '';
     sessionStorage.removeItem('scriptd-session');
-    restoreSession().then(recovered => {
+    restoreSession(generation).then(recovered => {
+      if (generation !== connectionGeneration) return;
       if (recovered) loadSnapshot(false);
-      else setState({ loading: false, error: 'This browser session has no valid credential. Run scriptd again to open the control center.' });
+      else scheduleReconnect();
     });
     return;
   }
-  setState({ loading: false, error: message });
+  scheduleReconnect();
 }
 
 function node(tag, props, children) { return h(tag, props || {}, ...(children || [])); }

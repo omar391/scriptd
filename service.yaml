@@ -48,7 +48,7 @@ modules:
             every_minutes: 5
 
   miwatch:
-    enabled: true
+    enabled: false
     triggers:
       outage:
         fire:

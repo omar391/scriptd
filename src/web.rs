@@ -150,6 +150,29 @@ fn random_token() -> Result<String> {
     Ok(control::digest(&bytes))
 }
 
+/// Kept separately from the ephemeral session file, which is removed on stop.
+/// Each restart rotates the session token while retaining browser authorization.
+fn durable_recovery_capability(paths: &ControlPaths) -> Result<String> {
+    let path = session_path(paths).with_extension("recovery");
+    match fs::read_to_string(&path) {
+        Ok(capability) => {
+            anyhow::ensure!(
+                capability.strip_prefix("sha256:").is_some_and(|value| {
+                    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                }),
+                "invalid browser recovery capability"
+            );
+            Ok(capability)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let capability = random_token()?;
+            write_private_atomic(&path, capability.as_bytes())?;
+            Ok(capability)
+        }
+        Err(error) => Err(error).context("read browser recovery capability"),
+    }
+}
+
 fn process_alive(pid: u32) -> bool {
     pid > 0 && unsafe { libc::kill(pid as i32, 0) == 0 }
 }
@@ -434,7 +457,7 @@ async fn serve(
     let (stopping, _) = watch::channel(false);
     let state = Arc::new(AppState {
         token: token.clone(),
-        recovery_capability: random_token()?,
+        recovery_capability: durable_recovery_capability(&paths)?,
         port,
         paths: paths.clone(),
         connections: AtomicUsize::new(0),
@@ -1295,6 +1318,77 @@ mod tests {
         bridge.stop().expect("stop in-process service bridge");
         assert!(read_session(&paths).is_none());
         assert!(TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_err());
+    }
+    #[tokio::test]
+    async fn browser_authorization_survives_repeated_service_bridge_restarts() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("isolated state directory");
+        let paths = control::paths_for(dir.path(), dir.path());
+        let mut bridge = start_service_bridge_with(paths.clone(), Some(0)).expect("start bridge");
+        let mut session = read_session(&paths).expect("first session");
+        let issued = http_get(
+            session.port,
+            "/api/session",
+            Some(("x-scriptd-session", &session.token)),
+        )
+        .await;
+        let issued: Value = serde_json::from_str(issued.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        let capability = issued["recovery"].as_str().expect("browser capability");
+        let key_path = session_path(&paths).with_extension("recovery");
+        assert_eq!(
+            fs::metadata(&key_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        for _ in 0..2 {
+            let old_token = session.token.clone();
+            let port = session.port;
+            bridge.stop().expect("stop service generation");
+            assert!(read_session(&paths).is_none());
+            assert!(key_path.exists(), "recovery must survive graceful shutdown");
+            bridge = start_service_bridge_with(paths.clone(), Some(port)).expect("restart bridge");
+            session = read_session(&paths).expect("new session");
+            assert_eq!(session.port, port);
+            assert_ne!(session.token, old_token, "session tokens still rotate");
+            assert!(
+                http_get(port, "/api/drafts", Some(("x-scriptd-session", &old_token)))
+                    .await
+                    .starts_with("HTTP/1.1 401")
+            );
+            assert!(http_get(port, "/api/session", None)
+                .await
+                .starts_with("HTTP/1.1 401"));
+            let recovered = http_get(
+                port,
+                "/api/session",
+                Some(("x-scriptd-recovery", capability)),
+            )
+            .await;
+            assert!(recovered.starts_with("HTTP/1.1 200"));
+            let recovered: Value =
+                serde_json::from_str(recovered.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+            assert_eq!(recovered["session"], session.token);
+            assert!(http_get(
+                port,
+                "/api/drafts",
+                Some(("x-scriptd-session", recovered["session"].as_str().unwrap()))
+            )
+            .await
+            .starts_with("HTTP/1.1 200"));
+        }
+        bridge.stop().expect("stop last generation");
+        let other = tempfile::tempdir().unwrap();
+        let other_paths = control::paths_for(other.path(), other.path());
+        assert_ne!(
+            durable_recovery_capability(&other_paths).unwrap(),
+            capability
+        );
+        fs::write(key_path, "corrupt").unwrap();
+        assert!(
+            durable_recovery_capability(&paths).is_err(),
+            "never silently replace an unreadable authorization"
+        );
     }
     #[test]
     fn bridge_stop_stays_bounded_while_a_request_is_incomplete() {
