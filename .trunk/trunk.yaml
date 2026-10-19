@@ -7,11 +7,19 @@ cli:
 plugins:
   sources:
     - id: trunk
-      ref: v1.10.2
+      ref: v1.11.0
       uri: https://github.com/trunk-io/plugins
+# Trunk git-hook actions are deliberately not enabled here.
+# This repo runs pre-commit enforcement from
+# .git/hooks/pre-commit-codex-quality-gates.sh, which invokes
+# "trunk check --ci". Enabling any action that manages git hooks makes the
+# Trunk daemon re-point core.hooksPath at
+# ~/.cache/trunk/repos/<hash>/git-hooks and shadow that file, so Git hooks
+# stay on the default .git/hooks path instead.
 actions:
-  enabled:
+  disabled:
     - trunk-announce
     - trunk-check-pre-push
     - trunk-fmt-pre-commit
+  enabled:
     - trunk-upgrade-available
