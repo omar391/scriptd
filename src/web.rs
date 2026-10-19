@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{Read, Write};
+
 use std::net::TcpStream;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
@@ -8,29 +8,30 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::net::TcpListener;
 
 use anyhow::{Context, Result};
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::IntoResponse;
 use axum::response::sse::{Event, Sse};
+use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::stream;
 use serde::Deserialize;
-use serde_json::{Value, json};
-use tokio::net::TcpListener;
-use tokio::sync::{Notify, watch};
+use serde_json::{json, Value};
+use tokio::sync::{watch, Notify};
 
+use crate::access::{self, AccessController, AccessState};
 use crate::control::{self, ControlPaths};
-use crate::paths::{self, write_private_atomic};
 use crate::grants::GrantsStore;
-use crate::access::{self, AccessController, AccessState, GRANT_HEADER};
+use crate::paths::{self, write_private_atomic};
 
 const INDEX: &str = include_str!("../assets/web/index.html");
 
 /// Default loopback port for the control center, chosen as a memorable short number.
 pub const DEFAULT_BROWSER_PORT: u16 = 15921;
+const BRIDGE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const STYLES: &str = include_str!("../assets/web/styles.css");
 const APP: &str = include_str!("../assets/web/app.js");
 const PREACT: &str = include_str!("../assets/web/vendor/preact.module.js");
@@ -54,13 +55,6 @@ pub fn host_allowed(value: &str, port: u16) -> bool {
 
 pub fn origin_allowed(value: Option<&str>, port: u16) -> bool {
     matches!(value, Some(origin) if origin == format!("http://127.0.0.1:{port}"))
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct BrowserSession {
-    pid: u32,
-    port: u16,
-    token: String,
 }
 
 struct AppState {
@@ -88,114 +82,13 @@ fn shutdown_due(connections: usize, last_disconnect: Instant, now: Instant) -> b
     connections == 0 && now.saturating_duration_since(last_disconnect) >= Duration::from_secs(600)
 }
 
-/// Ports tried in order for the control center. The first free port wins.
-const BROWSER_PORT_CANDIDATES: [u16; 4] = [
-    DEFAULT_BROWSER_PORT,
-    DEFAULT_BROWSER_PORT + 1,
-    DEFAULT_BROWSER_PORT + 2,
-    0,
-];
-const BRIDGE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// Overrides the preferred control center port when set to a valid value.
-fn preferred_browser_port() -> u16 {
-    std::env::var("SCRIPTD_BROWSER_PORT")
-        .ok()
-        .and_then(|value| value.trim().parse::<u16>().ok())
-        .filter(|port| *port != 0)
-        .unwrap_or(DEFAULT_BROWSER_PORT)
-}
-
-/// Binds the first free port from the candidate list.
-///
-/// The preferred port never displaces an existing listener: a taken candidate
-/// is skipped so another bridge or unrelated process keeps serving on it.
-async fn bind_browser_listener_from(preferred: Option<u16>) -> Result<TcpListener> {
-    let mut candidates = BROWSER_PORT_CANDIDATES.to_vec();
-    candidates[0] = preferred.unwrap_or(BROWSER_PORT_CANDIDATES[0]);
-    let mut last_error = None;
-    for port in candidates {
-        match TcpListener::bind(("127.0.0.1", port)).await {
-            Ok(listener) => return Ok(listener),
-            Err(error) => last_error = Some(error),
-        }
-    }
-    match last_error {
-        Some(error) => Err(error.into()),
-        None => anyhow::bail!("no browser port candidates configured"),
-    }
-}
-
-fn session_path(paths: &ControlPaths) -> PathBuf {
-    let name = paths
-        .socket
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("control.sock")
-        .replace("control-", "web-")
-        .replace(".sock", ".json");
-    paths.state_dir.join(name)
-}
-
-fn draft_path(paths: &ControlPaths) -> PathBuf {
-    session_path(paths).with_extension("drafts.json")
-}
-
-fn random_token() -> Result<String> {
-    let mut bytes = [0u8; 32];
-    fs::File::open("/dev/urandom")
-        .context("open random source")?
-        .read_exact(&mut bytes)?;
-    Ok(control::digest(&bytes))
-}
-
-/// Kept separately from the ephemeral session file, which is removed on stop.
-/// Each restart rotates the session token while retaining browser authorization.
-fn durable_recovery_capability(paths: &ControlPaths) -> Result<String> {
-    let path = session_path(paths).with_extension("recovery");
-    match fs::read_to_string(&path) {
-        Ok(capability) => {
-            anyhow::ensure!(
-                capability.strip_prefix("sha256:").is_some_and(|value| {
-                    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-                }),
-                "invalid browser recovery capability"
-            );
-            Ok(capability)
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let capability = random_token()?;
-            write_private_atomic(&path, capability.as_bytes())?;
-            Ok(capability)
-        }
-        Err(error) => Err(error).context("read browser recovery capability"),
-    }
-}
-
-fn process_alive(pid: u32) -> bool {
-    pid > 0 && unsafe { libc::kill(pid as i32, 0) == 0 }
-}
-
-fn read_session(paths: &ControlPaths) -> Option<BrowserSession> {
-    let raw = fs::read_to_string(session_path(paths)).ok()?;
-    serde_json::from_str(&raw).ok()
-}
-
-fn reusable_url(paths: &ControlPaths) -> Option<String> {
-    let session = read_session(paths)?;
-    if !process_alive(session.pid) {
-        let _ = fs::remove_file(session_path(paths));
-        return None;
-    }
-    TcpStream::connect_timeout(
-        &format!("127.0.0.1:{}", session.port).parse().ok()?,
-        Duration::from_millis(200),
-    )
-    .ok()?;
-    Some(format!(
-        "http://127.0.0.1:{}/?session={}",
-        session.port, session.token
-    ))
+fn detached_shutdown_due(
+    persistent: bool,
+    connections: usize,
+    last_disconnect: Instant,
+    now: Instant,
+) -> bool {
+    !persistent && shutdown_due(connections, last_disconnect, now)
 }
 
 fn open_url(url: &str) -> Result<()> {
@@ -211,18 +104,20 @@ fn open_url(url: &str) -> Result<()> {
 }
 
 pub fn open_control_center(root: &Path, log_dir: &Path) -> Result<()> {
-    let paths = control::browser_paths_for(root, &paths::resolve_state_dir(), 0);
-    if let Some(url) = reusable_url(&paths) {
-        return open_url(&url);
-    }
     spawn_bridge(
         &std::env::current_exe().context("resolve scriptd executable")?,
         root,
         log_dir,
     )?;
     for _ in 0..50 {
-        if let Some(url) = reusable_url(&paths) {
-            return open_url(&url);
+        if let Ok(_) = TcpStream::connect_timeout(
+            &format!("127.0.0.1:{}", DEFAULT_BROWSER_PORT)
+                .parse()
+                .ok()
+                .unwrap(),
+            Duration::from_millis(100),
+        ) {
+            return open_url(&format!("http://127.0.0.1:{}", DEFAULT_BROWSER_PORT));
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -294,42 +189,13 @@ impl Drop for ServiceBridge {
 /// supervisor process, reusing the current browser session when possible.
 pub fn start_service_bridge(root: &Path) -> Result<ServiceBridge> {
     let paths = control::browser_paths_for(root, &paths::resolve_state_dir(), 0);
-    start_service_bridge_with(paths, Some(preferred_browser_port()))
-}
-
-fn stop_existing_bridge(paths: &ControlPaths) -> Result<()> {
-    let Some(session) = read_session(paths) else {
-        return Ok(());
-    };
-    if reusable_url(paths).is_none() {
-        return Ok(());
-    }
-
-    // Only an authenticated response from the session file can request shutdown.
-    // Never signal a PID from disk: it could have been reused by an unrelated process.
-    request_bridge_shutdown(&session)?;
-    let listener = std::net::SocketAddr::from(([127, 0, 0, 1], session.port));
-    let stopped = (0..50).any(|_| {
-        let session_gone = read_session(paths).is_none();
-        let owner_gone = session.pid == std::process::id() || !process_alive(session.pid);
-        let listener_closed = TcpStream::connect_timeout(&listener, Duration::from_millis(100)).is_err();
-        if session_gone && owner_gone && listener_closed {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-        false
-    });
-    if !stopped {
-        anyhow::bail!("existing browser bridge did not stop after authenticated shutdown");
-    }
-    Ok(())
+    start_service_bridge_with(paths, Some(DEFAULT_BROWSER_PORT))
 }
 
 fn start_service_bridge_with(
     paths: ControlPaths,
     preferred_port: Option<u16>,
 ) -> Result<ServiceBridge> {
-    stop_existing_bridge(&paths)?;
     let (ready_sender, ready_receiver) = std::sync::mpsc::sync_channel(1);
     let error_sender = ready_sender.clone();
     let worker = std::thread::Builder::new()
@@ -340,12 +206,7 @@ fn start_service_bridge_with(
                 .build()
                 .context("build in-process browser runtime")
                 .and_then(|runtime| {
-                    runtime.block_on(serve(
-                        paths,
-                        true,
-                        preferred_port,
-                        Some(ready_sender),
-                    ))
+                    runtime.block_on(serve(paths, true, preferred_port, Some(ready_sender)))
                 });
             if let Err(error) = &result {
                 let _ = error_sender.try_send(Err(error.to_string()));
@@ -378,33 +239,7 @@ fn start_service_bridge_with(
     }
 }
 
-fn request_bridge_shutdown(session: &BrowserSession) -> Result<()> {
-    let address = std::net::SocketAddr::from(([127, 0, 0, 1], session.port));
-    let mut stream = TcpStream::connect_timeout(&address, Duration::from_millis(500))
-        .context("connect to existing browser bridge")?;
-    stream.set_read_timeout(Some(Duration::from_secs(1)))?;
-    write!(
-        stream,
-        "POST /api/shutdown HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nX-Scriptd-Session: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-        session.port, session.token
-    )
-    .context("request authenticated browser bridge shutdown")?;
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .context("read browser bridge shutdown response")?;
-    let status = response.lines().next().unwrap_or_default();
-    if !status.starts_with("HTTP/1.1 202 ") && !status.starts_with("HTTP/2 202") {
-        anyhow::bail!("existing listener did not authenticate browser bridge shutdown");
-    }
-    Ok(())
-}
-
 fn spawn_bridge_process(exe: &Path, root: &Path, log_dir: &Path) -> Result<Child> {
-    let paths = control::browser_paths_for(root, &paths::resolve_state_dir(), 0);
-    if reusable_url(&paths).is_some() {
-        anyhow::bail!("browser bridge is already running");
-    }
     let mut command = Command::new(exe);
     command
         .env("SCRIPTD_BROWSER_BRIDGE", "1")
@@ -437,7 +272,7 @@ pub fn serve_bridge() -> Result<()> {
         .enable_all()
         .build()
         .context("build browser runtime")?;
-    runtime.block_on(serve(paths, false, Some(preferred_browser_port()), None))
+    runtime.block_on(serve(paths, false, Some(DEFAULT_BROWSER_PORT), None))
 }
 
 async fn serve(
@@ -447,10 +282,10 @@ async fn serve(
     ready: Option<std::sync::mpsc::SyncSender<std::result::Result<BridgeReady, String>>>,
 ) -> Result<()> {
     fs::create_dir_all(&paths.state_dir)?;
-    let _instance_lock = BridgeInstanceLock::acquire(&session_path(&paths).with_extension("lock"))?;
-    let listener = bind_browser_listener_from(preferred_port)
+    let _instance_lock = BridgeInstanceLock::acquire(&paths.state_dir.join("browser-bridge.lock"))?;
+    let listener = TcpListener::bind(("127.0.0.1", preferred_port.unwrap_or(DEFAULT_BROWSER_PORT)))
         .await
-        .context("bind browser bridge")?;
+        .context("bind browser listener")?;
     let port = listener.local_addr()?.port();
     let grants = GrantsStore::load(&paths).context("load browser grants")?;
     let access = AccessController::new(grants);
@@ -483,9 +318,9 @@ async fn serve(
             let expired = shutdown
                 .last_disconnect
                 .lock()
-                .map(|slot| shutdown_due(connections, *slot, Instant::now()))
+                .map(|slot| detached_shutdown_due(persistent, connections, *slot, Instant::now()))
                 .unwrap_or(false);
-            if expired && !persistent {
+            if expired {
                 shutdown.stopping.send_replace(true);
                 shutdown.shutdown.notify_one();
                 break;
@@ -523,7 +358,6 @@ fn bridge_router(state: Arc<AppState>) -> Router {
         .route("/vendor/preact.module.js", get(preact))
         .route("/vendor/htm.module.js", get(htm))
         .route("/api/snapshot", get(snapshot))
-        .route("/api/access", get(access_status))
         .route("/api/shutdown", post(shutdown_bridge))
         .route("/api/logs", get(logs))
         .route("/api/validate", post(validate))
@@ -774,79 +608,58 @@ async fn access_request(
             return reject(StatusCode::TOO_MANY_REQUESTS, &message).into_response();
         }
     };
-    let decision = match crate::approval::request_approval(
-        "Scriptd access request",
-        &format!(
-            "Allow this browser to manage Scriptd?
+    // Hand the claim back immediately and open the native prompt behind the
+    // request. Blocking the response on an OS dialog would strand this tab on
+    // an open HTTP request, so polling is the path that delivers the decision.
+    let pending_state = Arc::clone(&state);
+    let identifier = ticket.identifier.clone();
+    let claim = ticket.claim.clone();
+    tokio::spawn(async move {
+        let decision = crate::approval::request_approval(
+            "Scriptd access request",
+            &format!(
+                "Allow this browser to manage Scriptd?
 
 Identifier: {}
 Label: {}",
-            ticket.identifier, label
-        ),
-        crate::access::REQUEST_TIMEOUT,
-    )
-    .await
-    {
-        Ok(decision) => decision,
-        Err(error) => {
-            state.access.cancel_pending();
-            let mut response = Json(json!({
-                "ok": false,
-                "state": access::AccessState::Unavailable.as_str(),
-                "message": format!("the approval prompt is unavailable: {error}"),
-            }))
-            .into_response();
-            *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
-            return response;
-        }
-    };
-    let mut response = match decision {
-        crate::approval::ApprovalDecision::Allowed => {
-            if let Err(error) = state.access.resolve(true) {
-                state.access.cancel_pending();
-                return reject(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    &format!("store the approved grant: {error}"),
-                )
-                .into_response();
+                identifier, label
+            ),
+            crate::access::REQUEST_TIMEOUT,
+        )
+        .await;
+        match decision {
+            Ok(crate::approval::ApprovalDecision::Allowed) => {
+                if let Err(error) = pending_state.access.resolve_claim(&claim, true) {
+                    pending_state.access.cancel_claim(&claim);
+                    eprintln!("Failed to record a browser approval: {error}");
+                    return;
+                }
+                if let Err(error) = pending_state.access.snapshot().save(&pending_state.paths) {
+                    pending_state.access.cancel_claim(&claim);
+                    eprintln!("Failed to persist a browser approval: {error}");
+                }
             }
-            Json(json!({
-                "ok": true,
-                "state": access::AccessState::Authorized.as_str(),
-                "identifier": ticket.identifier,
-            }))
-            .into_response()
+            Ok(crate::approval::ApprovalDecision::Denied) => {
+                let _ = pending_state.access.resolve_claim(&claim, false);
+            }
+            Ok(crate::approval::ApprovalDecision::Unavailable) | Err(_) => {
+                pending_state.access.cancel_claim(&claim);
+            }
         }
-        crate::approval::ApprovalDecision::Denied => {
-            let _ = state.access.resolve(false);
-            let mut response = Json(json!({
-                "ok": false,
-                "state": access::AccessState::Unauthorized.as_str(),
-                "message": "the request was declined",
-            }))
-            .into_response();
-            *response.status_mut() = StatusCode::FORBIDDEN;
-            response
-        }
-        crate::approval::ApprovalDecision::Unavailable => {
-            state.access.cancel_pending();
-            let mut response = Json(json!({
-                "ok": false,
-                "state": access::AccessState::Unavailable.as_str(),
-                "message": "the approval prompt could not be shown",
-            }))
-            .into_response();
-            *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
-            response
-        }
-    };
+    });
+    let mut response = Json(json!({
+        "ok": true,
+        "state": access::AccessState::Pending.as_str(),
+        "identifier": ticket.identifier,
+        "claim": ticket.claim,
+    }))
+    .into_response();
     response.headers_mut().insert(
         "cache-control",
         axum::http::HeaderValue::from_static("no-store"),
     );
     response
 }
-
 async fn access_poll(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -891,8 +704,11 @@ async fn access_revoke(
         return reject(StatusCode::FORBIDDEN, "origin or grant was not accepted").into_response();
     }
     if !state.access.revoke(&body.id) {
-        return reject(StatusCode::NOT_FOUND, "no browser profile matches that identity")
-            .into_response();
+        return reject(
+            StatusCode::NOT_FOUND,
+            "no browser profile matches that identity",
+        )
+        .into_response();
     }
     if let Err(error) = state.access.snapshot().save(&state.paths) {
         return reject(
@@ -904,10 +720,7 @@ async fn access_revoke(
     Json(json!({ "ok": true })).into_response()
 }
 
-async fn access_list(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+async fn access_list(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
     if !authorized(&state, &headers) {
         return reject(StatusCode::UNAUTHORIZED, "grant was not accepted").into_response();
     }
@@ -920,16 +733,14 @@ async fn access_list(
     Json(json!({ "ok": true, "profiles": profiles })).into_response()
 }
 
-async fn snapshot(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+async fn snapshot(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
     if !authorized(&state, &headers) {
         return reject(StatusCode::UNAUTHORIZED, "session was not accepted").into_response();
     }
     match service_snapshot(&state.paths).await {
         Ok((digest, snapshot)) => {
-            Json(json!({ "ok": true, "config_digest": digest, "snapshot": snapshot })).into_response()
+            Json(json!({ "ok": true, "config_digest": digest, "snapshot": snapshot }))
+                .into_response()
         }
         Err(error) => reject(StatusCode::BAD_GATEWAY, &error.to_string()).into_response(),
     }
@@ -1122,14 +933,11 @@ fn mutating_allowed(state: &AppState, headers: &HeaderMap) -> bool {
     authorized(state, headers) && origin_allowed(header(headers, "origin"), state.port)
 }
 
-async fn read_drafts(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+async fn read_drafts(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
     if !authorized(&state, &headers) {
         return reject(StatusCode::UNAUTHORIZED, "session was not accepted").into_response();
     }
-    let value = fs::read_to_string(draft_path(&state.paths))
+    let value = fs::read_to_string(state.paths.state_dir.join("drafts.json"))
         .ok()
         .and_then(|raw| serde_json::from_str(&raw).ok())
         .unwrap_or_else(|| json!({}));
@@ -1145,7 +953,8 @@ async fn write_drafts(
         return reject(StatusCode::FORBIDDEN, "origin or session was not accepted").into_response();
     }
     match serde_json::to_vec_pretty(&body) {
-        Ok(bytes) => match write_private_atomic(&draft_path(&state.paths), &bytes) {
+        Ok(bytes) => match write_private_atomic(&state.paths.state_dir.join("drafts.json"), &bytes)
+        {
             Ok(()) => Json(json!({ "ok": true })).into_response(),
             Err(error) => {
                 reject(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()).into_response()
@@ -1155,37 +964,45 @@ async fn write_drafts(
     }
 }
 
-async fn events(
-    State(state): State<Arc<AppState>>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+async fn events(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
     if !authorized(&state, &headers) {
         return reject(StatusCode::UNAUTHORIZED, "session was not accepted").into_response();
     }
     state.connections.fetch_add(1, Ordering::SeqCst);
     let guard = ConnectionGuard(state.clone());
     let stopping = state.stopping.subscribe();
-    let stream = stream::unfold((state, guard, stopping), |(state, guard, mut stopping)| async move {
-        tokio::select! {
-            changed = stopping.changed() => {
-                if changed.is_err() || *stopping.borrow() {
-                    return None;
+    let stream_headers = headers.clone();
+    let stream = stream::unfold(
+        (state, guard, stopping, stream_headers),
+        |(state, guard, mut stopping, headers)| async move {
+            tokio::select! {
+                changed = stopping.changed() => {
+                    if changed.is_err() || *stopping.borrow() {
+                        return None;
+                    }
                 }
+                _ = tokio::time::sleep(Duration::from_secs(2)) => {}
             }
-            _ = tokio::time::sleep(Duration::from_secs(2)) => {}
-        }
-        if *stopping.borrow() {
-            return None;
-        }
-        let data = service_snapshot(&state.paths)
-            .await
-            .map(|(_, snapshot)| snapshot.to_string())
-            .unwrap_or_else(|error| {
-                json!({ "ok": false, "message": error.to_string() }).to_string()
-            });
-        let event = Event::default().event("snapshot").data(data);
-        Some((Ok::<Event, std::convert::Infallible>(event), (state, guard, stopping)))
-    });
+            if *stopping.borrow() {
+                return None;
+            }
+            // A revoked profile loses an already-open stream on its next poll.
+            if !authorized(&state, &headers) {
+                return None;
+            }
+            let data = service_snapshot(&state.paths)
+                .await
+                .map(|(_, snapshot)| snapshot.to_string())
+                .unwrap_or_else(|error| {
+                    json!({ "ok": false, "message": error.to_string() }).to_string()
+                });
+            let event = Event::default().event("snapshot").data(data);
+            Some((
+                Ok::<Event, std::convert::Infallible>(event),
+                (state, guard, stopping, headers),
+            ))
+        },
+    );
     Sse::new(stream).into_response()
 }
 
@@ -1195,27 +1012,27 @@ mod tests {
 
     use axum::http::HeaderValue;
 
-    #[test]
-    fn browser_opens_only_for_a_fully_interactive_bare_launch() {
-        assert!(should_open_browser(0, true, true));
-        assert!(!should_open_browser(0, false, true));
-        assert!(!should_open_browser(0, true, false));
-        assert!(!should_open_browser(2, true, true));
+    fn test_paths() -> (tempfile::TempDir, ControlPaths) {
+        let dir = tempfile::tempdir().expect("temporary state directory");
+        let paths = control::paths_for(dir.path(), dir.path());
+        let cloned = paths.clone();
+        (dir, cloned)
     }
 
-    fn test_state(token: &str, port: u16) -> Arc<AppState> {
-        let dir = tempfile::tempdir().expect("temporary state directory");
-        let leaked = Box::leak(Box::new(dir));
-        let paths = control::paths_for(leaked.path(), leaked.path());
+    /// An isolated AppState whose grant store is empty and never persisted to
+    /// the real service state directory.
+    fn test_state(port: u16) -> Arc<AppState> {
+        let (dir, paths) = test_paths();
+        std::mem::forget(dir);
+        let grants = GrantsStore::load(&paths).expect("empty grants store");
         Arc::new(AppState {
-            token: token.to_string(),
-            recovery_capability: "browser-capability".to_string(),
             port,
             paths,
             connections: AtomicUsize::new(0),
             last_disconnect: Mutex::new(Instant::now()),
             shutdown: Notify::new(),
             stopping: watch::channel(false).0,
+            access: AccessController::new(grants),
         })
     }
 
@@ -1228,11 +1045,11 @@ mod tests {
         headers
     }
 
-    fn headers_with_token(port: u16, session: &str) -> HeaderMap {
+    fn headers_with_grant(port: u16, grant: &str) -> HeaderMap {
         let mut headers = loopback_host(port);
         headers.insert(
-            "x-scriptd-session",
-            HeaderValue::from_str(session).expect("session header"),
+            crate::access::GRANT_HEADER,
+            HeaderValue::from_str(grant).expect("grant header"),
         );
         headers
     }
@@ -1261,50 +1078,47 @@ mod tests {
         String::from_utf8(response).expect("HTTP response is UTF-8")
     }
 
-    #[tokio::test]
-    async fn session_bootstrap_requires_a_valid_session_or_browser_capability() {
-        let state = test_state("live-token", 15921);
-        let mut headers = loopback_host(15921);
-        let denied = session_bootstrap(State(state.clone()), headers.clone()).await.into_response();
-        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+    async fn http_post(port: u16, path: &str, body: &str, header: Option<(&str, &str)>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        headers.insert("x-scriptd-recovery", HeaderValue::from_static("wrong"));
-        let denied = session_bootstrap(State(state.clone()), headers.clone()).await.into_response();
-        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
-
-        headers.insert(
-            "x-scriptd-recovery",
-            HeaderValue::from_static("browser-capability"),
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect to test bridge");
+        let mut extra = String::new();
+        if let Some((name, value)) = header {
+            extra.push_str(&format!("{name}: {value}\r\n"));
+        }
+        let request = format!(
+            "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n{body}",
+            body.len()
         );
-        let accepted = session_bootstrap(State(state), headers).await.into_response();
-        assert_eq!(accepted.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(accepted.into_body(), usize::MAX)
+        stream
+            .write_all(request.as_bytes())
             .await
-            .expect("read bootstrap body");
-        let value: Value = serde_json::from_slice(&body).expect("bootstrap JSON");
-        assert_eq!(value["session"], "live-token");
-
-        let authorized = session_bootstrap(
-            State(test_state("live-token", 15921)),
-            headers_with_token(15921, "live-token"),
-        )
-        .await
-        .into_response();
-        let body = axum::body::to_bytes(authorized.into_body(), usize::MAX)
+            .expect("write HTTP request");
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
             .await
-            .expect("read recovery capability body");
-        let value: Value = serde_json::from_slice(&body).expect("capability JSON");
-        assert_eq!(value["recovery"], "browser-capability");
+            .expect("read HTTP response");
+        String::from_utf8(response).expect("HTTP response is UTF-8")
     }
 
-    #[tokio::test]
-    async fn browser_capability_recovers_session_after_storage_loss_and_thirty_seconds() {
+    /// Serves the real bridge router on an ephemeral port and returns the port
+    /// plus the shutdown signal. The join handle is leaked so the test ends by
+    /// sending on the channel.
+    async fn spawn_test_bridge(
+        state: &mut Arc<AppState>,
+    ) -> (u16, tokio::sync::oneshot::Sender<()>) {
         let listener = TcpListener::bind(("127.0.0.1", 0))
             .await
             .expect("bind test bridge");
         let port = listener.local_addr().expect("test bridge address").port();
-        let state = test_state("live-token", port);
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        Arc::get_mut(state)
+            .expect("test bridge state has one owner before serving")
+            .port = port;
+        let state = Arc::clone(state);
         let server = tokio::spawn(async move {
             axum::serve(listener, bridge_router(state))
                 .with_graceful_shutdown(async move {
@@ -1312,139 +1126,282 @@ mod tests {
                 })
                 .await
         });
+        std::mem::forget(server);
+        (port, shutdown_tx)
+    }
 
-        let unrelated = http_get(port, "/api/session", None).await;
-        assert!(unrelated.starts_with("HTTP/1.1 401"));
+    #[tokio::test]
+    async fn unauthorized_browser_is_told_it_needs_authorization() {
+        // A grant-less browser must read "authorization required", never a
+        // misleading service-offline state.
+        let mut state = test_state(0);
+        let (port, shutdown_tx) = spawn_test_bridge(&mut state).await;
 
-        let issued = http_get(
-            port,
-            "/api/session",
-            Some(("x-scriptd-session", "live-token")),
-        )
-        .await;
-        assert!(issued.starts_with("HTTP/1.1 200"));
-        assert!(issued.contains("\"recovery\":\"browser-capability\""));
-
-        tokio::time::sleep(Duration::from_secs(31)).await;
-        // The browser reloads after its URL token and sessionStorage are gone;
-        // its origin-scoped recovery capability remains in localStorage.
-        let unrelated_after_window = http_get(port, "/api/session", None).await;
-        assert!(unrelated_after_window.starts_with("HTTP/1.1 401"));
-        let recovered = http_get(
-            port,
-            "/api/session",
-            Some(("x-scriptd-recovery", "browser-capability")),
-        )
-        .await;
-        assert!(recovered.starts_with("HTTP/1.1 200"));
-        assert!(recovered.contains("\"session\":\"live-token\""));
-
+        let body = http_get(port, "/api/access", None).await;
+        assert!(body.starts_with("HTTP/1.1 200"), "{body}");
+        assert!(body.contains("\"state\":\"unauthorized\""), "{body}");
+        assert!(body.contains("\"pending_identifier\":null"), "{body}");
         let _ = shutdown_tx.send(());
-        server.await.expect("join test bridge").expect("serve test bridge");
+    }
+
+    #[tokio::test]
+    async fn snapshot_and_events_reject_a_missing_grant() {
+        // Authenticated endpoints must refuse a grant-less request instead of
+        // answering as if the browser were approved.
+        let mut state = test_state(0);
+        let (port, shutdown_tx) = spawn_test_bridge(&mut state).await;
+
+        assert!(
+            "HTTP/1.1 401" == &http_get(port, "/api/snapshot", None).await[..12],
+            "the snapshot requires a grant"
+        );
+        assert!(
+            "HTTP/1.1 401" == &http_get(port, "/events", None).await[..12],
+            "the live stream requires a grant"
+        );
+        let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn an_approved_reaches_the_snapshot_stream_and_settings() {
+        // The full path a real browser takes: open a request, approve it,
+        // receive the credential through the private claim, then use it for the
+        // snapshot, the live stream and the browser access settings.
+        let mut state = test_state(0);
+        let (port, shutdown_tx) = spawn_test_bridge(&mut state).await;
+
+        let ticket = state
+            .access
+            .open_request("Test browser")
+            .expect("open request");
+        assert!(!ticket.identifier.is_empty());
+        assert!(!ticket.claim.is_empty());
+        state
+            .access
+            .resolve_claim(&ticket.claim, true)
+            .expect("approve request");
+        let grant = match state.access.poll(&ticket.claim) {
+            access::PollOutcome::Allowed(credential) => credential,
+            _ => panic!("an approved request must deliver its grant"),
+        };
+        state
+            .access
+            .snapshot()
+            .save(&state.paths)
+            .expect("save grants");
+
+        let snapshot = http_get(port, "/api/snapshot", Some((access::GRANT_HEADER, &grant))).await;
+        assert!(snapshot.starts_with("HTTP/1.1 200"), "{snapshot}");
+
+        let profiles = http_get(
+            port,
+            "/api/access/list",
+            Some((access::GRANT_HEADER, &grant)),
+        )
+        .await;
+        assert!(profiles.starts_with("HTTP/1.1 200"), "{profiles}");
+
+        // A different credential is refused.
+        let wrong = http_get(
+            port,
+            "/api/snapshot",
+            Some((access::GRANT_HEADER, "not-a-credential")),
+        )
+        .await;
+        assert!(wrong.starts_with("HTTP/1.1 401"), "{wrong}");
+
+        // Revoking the profile withdraws access immediately.
+        let (revoke_id, _, _) = state.access.list()[0].clone();
+        assert!(
+            state.access.revoke(&revoke_id),
+            "revocation must remove the grant"
+        );
+        let revoked = http_get(port, "/api/snapshot", Some((access::GRANT_HEADER, &grant))).await;
+        assert!(revoked.starts_with("HTTP/1.1 401"), "{revoked}");
+        let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn an_approval_claim_reaches_only_the_tab_that_opened_the_request() {
+        // Approval is delivered through a private claim, so a forged or
+        // replayed claim from another tab learns nothing.
+        let mut state = test_state(0);
+        let (port, shutdown_tx) = spawn_test_bridge(&mut state).await;
+
+        let ticket = state
+            .access
+            .open_request("First tab")
+            .expect("first request");
+        // A second tab cannot open another prompt while one is pending.
+        assert!(
+            state.access.open_request("Second tab").is_err(),
+            "only one native prompt may exist at a time"
+        );
+
+        let forged = http_post(
+            port,
+            "/api/access/poll",
+            &serde_json::json!({ "claim": "forged" }).to_string(),
+            None,
+        )
+        .await;
+        assert!(forged.starts_with("HTTP/1.1 200"), "{forged}");
+        assert!(
+            forged.contains("\"state\":\"unauthorized\""),
+            "a forged claim must never see the approval"
+        );
+
+        state
+            .access
+            .resolve_claim(&ticket.claim, true)
+            .expect("approve");
+        let delivered = http_post(
+            port,
+            "/api/access/poll",
+            &serde_json::json!({ "claim": ticket.claim }).to_string(),
+            None,
+        )
+        .await;
+        assert!(delivered.contains("\"grant\":"), "{delivered}");
+
+        // A dropped response can replay the settled approval briefly.
+        let replayed = http_post(
+            port,
+            "/api/access/poll",
+            &serde_json::json!({ "claim": ticket.claim }).to_string(),
+            None,
+        )
+        .await;
+        assert!(replayed.contains("\"grant\":"), "{replayed}");
+        let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn a_request_naming_another_host_is_refused_before_access_logic() {
+        // Strict Host checks keep foreign origins out even when they reach the
+        // loopback listener.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut state = test_state(0);
+        let (port, shutdown_tx) = spawn_test_bridge(&mut state).await;
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect to test bridge");
+        stream
+            .write_all(
+                b"GET /api/access HTTP/1.1\r\nHost: 127.0.0.1:9999\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .expect("write request");
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .await
+            .expect("read response");
+        let text = String::from_utf8(response).expect("UTF-8 response");
+        assert!(text.starts_with("HTTP/1.1 403"), "{text}");
+        let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn a_declined_request_starts_a_cooldown_and_can_be_retried() {
+        // A declared prompt must not be immediately repeatable, and once it has
+        // been consumed the tab reads unauthorized again.
+        let state = test_state(0);
+        let ticket = state.access.open_request("Declined").expect("open request");
+        assert_eq!(
+            state.access.poll(&ticket.claim),
+            access::PollOutcome::Waiting
+        );
+        state
+            .access
+            .resolve_claim(&ticket.claim, false)
+            .expect("deny request");
+        assert!(
+            state.access.open_request("Declined again").is_err(),
+            "a denial places the controller in a cooldown"
+        );
+        assert_eq!(
+            state.access.poll(&ticket.claim),
+            access::PollOutcome::Expired,
+            "the denied request leaves nothing to poll"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_pending_request_on_shutdown() {
+        // Service shutdown must cancel the pending prompt so the user is not
+        // left with a stale popup after the bridge has stopped.
+        let state = test_state(0);
+        let ticket = state
+            .access
+            .open_request("Cancelled")
+            .expect("open request");
+        assert!(state.access.pending_identifier().is_some());
+        state.access.cancel_claim(&ticket.claim);
+        assert!(state.access.pending_identifier().is_none());
+        assert_eq!(
+            state.access.poll(&ticket.claim),
+            access::PollOutcome::Expired
+        );
+    }
+
+    #[tokio::test]
+    async fn revoking_one_profile_leaves_the_others_authorized() {
+        // Per-profile revocation must not disturb other browsers.
+        let state = test_state(0);
+        let first = state.access.open_request("One").expect("first");
+        state
+            .access
+            .resolve_claim(&first.claim, true)
+            .expect("approve first");
+        let first_grant = match state.access.poll(&first.claim) {
+            access::PollOutcome::Allowed(credential) => credential,
+            _ => panic!("the first approval must deliver a grant"),
+        };
+        assert_eq!(
+            state.access.state_for(&headers_with_grant(0, &first_grant)),
+            access::AccessState::Authorized
+        );
+
+        let second = state.access.open_request("Two").expect("second");
+        state
+            .access
+            .resolve_claim(&second.claim, true)
+            .expect("approve second");
+        let second_grant = match state.access.poll(&second.claim) {
+            access::PollOutcome::Allowed(credential) => credential,
+            _ => panic!("the second approval must deliver a grant"),
+        };
+
+        let (revoke_id, _, _) = state
+            .access
+            .list()
+            .into_iter()
+            .find(|(_, label, _)| label == "One")
+            .expect("the first grant has its unique label");
+        assert!(state.access.revoke(&revoke_id));
+        assert_eq!(state.access.list().len(), 1, "one profile remains");
+        let revoked = state.access.state_for(&headers_with_grant(0, &first_grant));
+        assert_eq!(revoked, access::AccessState::Unauthorized);
+        let survivor = state
+            .access
+            .state_for(&headers_with_grant(0, &second_grant));
+        assert_eq!(survivor, access::AccessState::Authorized);
     }
 
     #[test]
-    fn session_bootstrap_requires_the_loopback_page_origin() {
-        // A tab on the bridge origin can re-acquire its credential; any other
-        // Host must be refused so the token never leaves the loopback port.
+    fn only_the_exact_loopback_page_origin_is_allowed() {
+        // A credential must never travel to any other host or port.
         assert!(host_allowed("127.0.0.1:15921", 15921));
         assert!(!host_allowed("localhost:15921", 15921));
         assert!(!host_allowed("", 15921));
         assert!(!host_allowed("attacker.example", 15921));
         assert!(!host_allowed("127.0.0.1:15922", 15921));
-    }
-
-    #[test]
-    fn host_and_origin_must_match_the_loopback_port() {
-        assert!(host_allowed("127.0.0.1:43123", 43123));
-        assert!(!host_allowed("localhost:43123", 43123));
-        assert!(origin_allowed(Some("http://127.0.0.1:43123"), 43123));
-        assert!(!origin_allowed(Some("http://localhost:43123"), 43123));
-        assert!(!origin_allowed(None, 43123));
-    }
-
-    #[tokio::test]
-    async fn stale_stored_credential_is_rejected_and_the_capability_recovers() {
-        // A tab opened before a service restart keeps the previous bridge's
-        // token in sessionStorage. That token must be refused so the page
-        // knows to recover, and the recovery capability must still work while
-        // loopback address and timing alone grant nothing.
-        let listener = TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .expect("bind test bridge");
-        let port = listener.local_addr().expect("test bridge address").port();
-        let state = test_state("live-token", port);
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-        let server = tokio::spawn(async move {
-            axum::serve(listener, bridge_router(state))
-                .with_graceful_shutdown(async move {
-                    let _ = shutdown_rx.await;
-                })
-                .await
-        });
-
-        let stale = http_get(port, "/api/snapshot", Some(("x-scriptd-session", "dead-token"))).await;
-        assert!(stale.starts_with("HTTP/1.1 401"));
-
-        let recovered = http_get(
-            port,
-            "/api/session",
-            Some(("x-scriptd-recovery", "browser-capability")),
-        )
-        .await;
-        assert!(recovered.starts_with("HTTP/1.1 200"));
-        assert!(recovered.contains("\"session\":\"live-token\""));
-
-        let _ = shutdown_tx.send(());
-        server.await.expect("join test bridge").expect("serve test bridge");
-    }
-
-    #[tokio::test]
-    async fn browser_port_falls_back_when_a_port_is_already_taken() {
-        // The test must not depend on the production port being free, so it
-        // reserves candidates itself and exercises the fallback against them.
-        let occupied =
-            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve the preferred candidate");
-        let taken = occupied.local_addr().expect("reserved address").port();
-        let listener = bind_browser_listener_from(Some(taken))
-            .await
-            .expect("bind without displacing the reserved port");
-        let port = listener.local_addr().expect("bound address").port();
-        assert_ne!(port, taken, "a taken port must not be reused");
-        assert_eq!(
-            occupied.local_addr().expect("reserved address").port(),
-            taken,
-            "the existing listener must keep its port"
-        );
-    }
-
-    #[test]
-    fn stale_session_listener_is_never_signalled_as_a_process() {
-        let listener =
-            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind fixture listener");
-        let port = listener.local_addr().expect("fixture address").port();
-        let responder = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept shutdown request");
-            let mut request = [0u8; 1024];
-            let _ = stream.read(&mut request).expect("read request");
-            stream
-                .write_all(
-                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                )
-                .expect("write unrelated listener response");
-        });
-        let session = BrowserSession {
-            pid: std::process::id(),
-            port,
-            token: "stale-token".to_string(),
-        };
-
-        assert!(request_bridge_shutdown(&session).is_err());
-        assert!(
-            process_alive(session.pid),
-            "the unrelated PID must remain alive"
-        );
-        responder.join().expect("fixture responder");
+        assert!(origin_allowed(Some("http://127.0.0.1:15921"), 15921));
+        assert!(!origin_allowed(Some("http://localhost:15921"), 15921));
+        assert!(!origin_allowed(None, 15921));
+        assert!(!origin_allowed(Some("https://evil.example"), 15921));
     }
 
     #[test]
@@ -1459,133 +1416,33 @@ mod tests {
 
     #[test]
     fn service_bridge_runs_in_the_supervisor_process_and_stops_cleanly() {
+        // The supervisor owns the bridge: the same process hosts the listener,
+        // and stopping it releases the port without any helper process.
+
         let dir = tempfile::tempdir().expect("temporary state directory");
         let paths = control::paths_for(dir.path(), dir.path());
-        let mut bridge = start_service_bridge_with(paths.clone(), Some(0))
-            .expect("start in-process service bridge");
-        let session = read_session(&paths).expect("service bridge session");
-        assert_eq!(session.pid, std::process::id());
-        let address = std::net::SocketAddr::from(([127, 0, 0, 1], session.port));
+        let mut bridge =
+            start_service_bridge_with(paths, Some(0)).expect("start in-process service bridge");
+        let port = bridge.state.port;
+        let connecting = TcpStream::connect_timeout(
+            &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+            Duration::from_millis(200),
+        );
         assert!(
-            TcpStream::connect_timeout(&address, Duration::from_millis(300)).is_ok(),
+            connecting.is_ok(),
             "the supervisor process must own a live bridge listener"
         );
+        drop(connecting);
 
         bridge.stop().expect("stop in-process service bridge");
-        assert!(read_session(&paths).is_none());
-        assert!(TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_err());
-    }
-    #[tokio::test]
-    async fn browser_authorization_survives_repeated_service_bridge_restarts() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempfile::tempdir().expect("isolated state directory");
-        let paths = control::paths_for(dir.path(), dir.path());
-        let mut bridge = start_service_bridge_with(paths.clone(), Some(0)).expect("start bridge");
-        let mut session = read_session(&paths).expect("first session");
-        let issued = http_get(
-            session.port,
-            "/api/session",
-            Some(("x-scriptd-session", &session.token)),
-        )
-        .await;
-        let issued: Value = serde_json::from_str(issued.split("\r\n\r\n").nth(1).unwrap()).unwrap();
-        let capability = issued["recovery"].as_str().expect("browser capability");
-        let key_path = session_path(&paths).with_extension("recovery");
-        assert_eq!(
-            fs::metadata(&key_path).unwrap().permissions().mode() & 0o777,
-            0o600
+        let refused = TcpStream::connect_timeout(
+            &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+            Duration::from_millis(200),
         );
-
-        for _ in 0..2 {
-            let old_token = session.token.clone();
-            let port = session.port;
-            bridge.stop().expect("stop service generation");
-            assert!(read_session(&paths).is_none());
-            assert!(key_path.exists(), "recovery must survive graceful shutdown");
-            bridge = start_service_bridge_with(paths.clone(), Some(port)).expect("restart bridge");
-            session = read_session(&paths).expect("new session");
-            assert_eq!(session.port, port);
-            assert_ne!(session.token, old_token, "session tokens still rotate");
-            assert!(
-                http_get(port, "/api/drafts", Some(("x-scriptd-session", &old_token)))
-                    .await
-                    .starts_with("HTTP/1.1 401")
-            );
-            assert!(http_get(port, "/api/session", None)
-                .await
-                .starts_with("HTTP/1.1 401"));
-            let recovered = http_get(
-                port,
-                "/api/session",
-                Some(("x-scriptd-recovery", capability)),
-            )
-            .await;
-            assert!(recovered.starts_with("HTTP/1.1 200"));
-            let recovered: Value =
-                serde_json::from_str(recovered.split("\r\n\r\n").nth(1).unwrap()).unwrap();
-            assert_eq!(recovered["session"], session.token);
-            assert!(http_get(
-                port,
-                "/api/drafts",
-                Some(("x-scriptd-session", recovered["session"].as_str().unwrap()))
-            )
-            .await
-            .starts_with("HTTP/1.1 200"));
-        }
-        bridge.stop().expect("stop last generation");
-        let other = tempfile::tempdir().unwrap();
-        let other_paths = control::paths_for(other.path(), other.path());
-        assert_ne!(
-            durable_recovery_capability(&other_paths).unwrap(),
-            capability
-        );
-        fs::write(key_path, "corrupt").unwrap();
         assert!(
-            durable_recovery_capability(&paths).is_err(),
-            "never silently replace an unreadable authorization"
+            refused.is_err(),
+            "stopping the bridge must release the loopback listener"
         );
-    }
-    #[test]
-    fn bridge_stop_stays_bounded_while_a_request_is_incomplete() {
-        let dir = tempfile::tempdir().expect("temporary state directory");
-        let paths = control::paths_for(dir.path(), dir.path());
-        let mut mine = start_service_bridge_with(paths.clone(), Some(0))
-            .expect("start in-process service bridge");
-        let session = read_session(&paths).expect("service bridge session");
-        let address = std::net::SocketAddr::from(([127, 0, 0, 1], session.port));
-        // An incomplete request holds the graceful drain open, so stopping must
-        // remain bounded instead of blocking service shutdown indefinitely.
-        let mut stalled = TcpStream::connect_timeout(&address, Duration::from_millis(300))
-            .expect("connect to the service bridge");
-        write!(
-            &mut stalled,
-            "POST /api/drafts HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Length: 100\r\n\r\n{{",
-            session.port
-        )
-        .expect("send an incomplete request");
-
-        let started = Instant::now();
-        mine.stop()
-            .expect("stop the service bridge with a stalled request");
-        let elapsed = started.elapsed();
-
-        // Stopping must close the stalled connection and release all bridge
-        // resources before returning successfully.
-        assert!(TcpStream::connect_timeout(&address, Duration::from_millis(200)).is_err());
-        assert!(
-            elapsed < Duration::from_secs(20),
-            "stopping must not wait indefinitely: {elapsed:?}"
-        );
-        assert!(read_session(&paths).is_none());
-
-        let mut restarted = start_service_bridge_with(paths.clone(), Some(0))
-            .expect("restart while the prior client socket remains open");
-        restarted
-            .stop()
-            .expect("stop restarted bridge while prior client socket remains open");
-        assert!(read_session(&paths).is_none());
-        drop(stalled);
     }
 
     #[test]
@@ -1609,18 +1466,63 @@ mod tests {
     }
 
     #[test]
+    fn detached_bridge_waits_for_idle_grace_regardless_of_supervisor_pid_files() {
+        let directory = tempfile::tempdir().expect("temporary state directory");
+        let lock_path = directory.path().join("scriptd.lock");
+        let now = Instant::now();
+
+        // A running supervisor may have control_center disabled, and a stale
+        // PID may be reused. Neither file state proves a replacement listener
+        // has taken ownership, so an active dashboard keeps its bridge.
+        std::fs::write(&lock_path, std::process::id().to_string()).expect("write live PID");
+        assert!(!detached_shutdown_due(
+            false,
+            1,
+            now - Duration::from_secs(900),
+            now
+        ));
+        std::fs::write(&lock_path, "999999999").expect("write stale PID");
+        assert!(!detached_shutdown_due(
+            false,
+            1,
+            now - Duration::from_secs(900),
+            now
+        ));
+        assert!(detached_shutdown_due(
+            false,
+            0,
+            now - Duration::from_secs(600),
+            now
+        ));
+        assert!(!detached_shutdown_due(
+            true,
+            0,
+            now - Duration::from_secs(900),
+            now
+        ));
+    }
+
+    #[test]
+    fn browser_opens_only_for_a_fully_interactive_bare_launch() {
+        assert!(should_open_browser(0, true, true));
+        assert!(!should_open_browser(0, false, true));
+        assert!(!should_open_browser(0, true, false));
+        assert!(!should_open_browser(2, true, true));
+    }
+
+    #[test]
     fn closing_one_of_multiple_tabs_does_not_start_the_idle_grace() {
         let dir = tempfile::tempdir().expect("temporary state directory");
-        let paths = control::paths_for(dir.path(), dir.path());
+        let grants = GrantsStore::load(&control::paths_for(dir.path(), dir.path()))
+            .expect("empty grants store");
         let state = Arc::new(AppState {
-            token: "test".to_string(),
-            recovery_capability: "browser-capability".to_string(),
             port: 43123,
-            paths,
+            paths: control::paths_for(dir.path(), dir.path()),
             connections: AtomicUsize::new(2),
             last_disconnect: Mutex::new(Instant::now()),
             shutdown: Notify::new(),
             stopping: watch::channel(false).0,
+            access: AccessController::new(grants),
         });
         let first = ConnectionGuard(state.clone());
         drop(first);

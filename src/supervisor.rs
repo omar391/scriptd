@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -13,9 +13,9 @@ use notify::event::EventKind;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use sysinfo::{Pid, ProcessesToUpdate, System};
 use tokio::select;
-use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
-use tokio::time::{Instant, sleep, sleep_until};
+use tokio::signal::unix::{signal, SignalKind};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::time::{sleep, sleep_until, Instant};
 
 use crate::config::{self, ServiceConfig};
 use crate::control::{self, ControlPaths};
@@ -179,6 +179,7 @@ struct RunningSupervisor {
     watch: bool,
     control_center: bool,
     browser_bridge: Option<crate::web::ServiceBridge>,
+    last_control_center_attempt: Instant,
     modules: BTreeMap<String, ModuleRuntime>,
     triggers: BTreeMap<String, TriggerRuntime>,
     sensors: SensorSuite,
@@ -365,6 +366,7 @@ impl RunningSupervisor {
             watch: config.watch,
             control_center: config.control_center,
             browser_bridge: None,
+            last_control_center_attempt: Instant::now(),
             modules,
             triggers,
             sensors: SensorSuite::default(),
@@ -455,6 +457,7 @@ impl RunningSupervisor {
 
         if self.control_center && !previous_control_center {
             self.browser_bridge = start_control_center(&self.root, &self.log_dir);
+            self.last_control_center_attempt = Instant::now();
         } else if !self.control_center && previous_control_center {
             stop_control_center(&mut self.browser_bridge, &self.log_dir);
         }
@@ -676,6 +679,9 @@ impl RunningSupervisor {
             self.evaluate_and_dispatch(Utc::now())?;
             self.pump_execution()?;
             let mut delay = self.next_run_delay(Utc::now());
+            if self.control_center && self.browser_bridge.is_none() {
+                delay = delay.min(Duration::from_secs(5));
+            }
             if self.worker.is_some() || !self.work.is_empty() {
                 delay = delay.min(Duration::from_millis(250));
             }
@@ -744,6 +750,13 @@ impl RunningSupervisor {
     }
 
     fn pump_execution(&mut self) -> Result<()> {
+        if self.control_center
+            && self.browser_bridge.is_none()
+            && self.last_control_center_attempt.elapsed() >= Duration::from_secs(5)
+        {
+            self.browser_bridge = start_control_center(&self.root, &self.log_dir);
+            self.last_control_center_attempt = Instant::now();
+        }
         self.poll_worker()?;
         if control::pending_reload(&self.control_paths)?.is_some() {
             self.apply_reload();
@@ -1197,10 +1210,7 @@ fn start_control_center(
     }
 }
 
-fn stop_control_center(
-    bridge: &mut Option<crate::web::ServiceBridge>,
-    log_dir: &std::path::Path,
-) {
+fn stop_control_center(bridge: &mut Option<crate::web::ServiceBridge>, log_dir: &std::path::Path) {
     if let Some(mut bridge) = bridge.take() {
         if let Err(error) = bridge.stop() {
             crate::logger::append_warn(
@@ -1287,12 +1297,10 @@ mod tests {
         );
         assert!(!outcome.retryable);
         assert!(outcome.uncertain);
-        assert!(
-            outcome
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("completion is unknown"))
-        );
+        assert!(outcome
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("completion is unknown")));
         assert!(matches!(outcome.label, WorkLabel::Manual { job_id, .. } if job_id == "manual-1"));
     }
 
@@ -1631,11 +1639,9 @@ modules:
             .build()
             .expect("runtime");
 
-        assert!(
-            runtime
-                .block_on(receive_optional_event(&mut receiver))
-                .is_none()
-        );
+        assert!(runtime
+            .block_on(receive_optional_event(&mut receiver))
+            .is_none());
         receiver = None;
         assert!(receiver.is_none());
     }

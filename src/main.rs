@@ -4,14 +4,14 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+mod access;
 mod approval;
 mod broker;
-mod grants;
-mod access;
 mod config;
 mod control;
 mod credentials;
 mod execution_lock;
+mod grants;
 mod launchd;
 mod logger;
 mod modules;

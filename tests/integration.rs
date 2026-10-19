@@ -329,12 +329,10 @@ fn integration_bare_launch_with_redirected_stdio_prints_usage_without_starting_b
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Usage:"));
     assert!(!stdout.contains("http://127.0.0.1"));
-    assert!(
-        !home
-            .path()
-            .join("Library/Application Support/scriptd")
-            .exists()
-    );
+    assert!(!home
+        .path()
+        .join("Library/Application Support/scriptd")
+        .exists());
 }
 
 #[test]

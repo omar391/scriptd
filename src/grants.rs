@@ -64,13 +64,12 @@ impl GrantsStore {
         let path = Self::path(paths);
         match fs::read_to_string(&path) {
             Ok(raw) => {
-                let mut store: Self = serde_json::from_str(&raw)
-                    .context("parse browser grants file")?;
+                let mut store: Self =
+                    serde_json::from_str(&raw).context("parse browser grants file")?;
                 // Prune malformed entries.
                 store.grants.retain(|_, grant| {
                     grant.id.len() == 32
-                        && grant.credential_hash.starts_with("sha256:")
-                        && grant.credential_hash.len() == 6 + 64
+                        && valid_credential_hash(&grant.credential_hash)
                         && grant.issued_at > 0
                 });
                 Ok(store)
@@ -83,10 +82,8 @@ impl GrantsStore {
     /// Persist the grants store to disk with 0600 permissions.
     pub fn save(&self, paths: &ControlPaths) -> Result<()> {
         let path = Self::path(paths);
-        let content = serde_json::to_string_pretty(self)
-            .context("serialize browser grants")?;
-        write_private_atomic(&path, content.as_bytes())
-            .context("write browser grants file")
+        let content = serde_json::to_string_pretty(self).context("serialize browser grants")?;
+        write_private_atomic(&path, content.as_bytes()).context("write browser grants file")
     }
 
     /// Generate a new random grant credential.
@@ -109,7 +106,7 @@ impl GrantsStore {
 
     /// Add a new grant with the given credential and label.
     pub fn add(&mut self, credential: &GrantCredential, label: String) -> Result<BrowserGrant> {
-        let id = Self::random_credential()?;
+        let id = Self::random_credential()?[..32].to_string();
         let credential_hash = Self::hash_credential(credential);
         let issued_at = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -144,5 +141,33 @@ impl GrantsStore {
     /// Count active grants.
     pub fn count(&self) -> usize {
         self.grants.len()
+    }
+}
+
+fn valid_credential_hash(value: &str) -> bool {
+    let Some(hex) = value.strip_prefix("sha256:") else {
+        return false;
+    };
+    hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saved_grants_survive_loading_after_a_restart() {
+        let directory = tempfile::tempdir().expect("temporary state directory");
+        let paths = crate::control::paths_for(directory.path(), directory.path());
+        let credential = GrantsStore::random_credential().expect("credential");
+        let mut original = GrantsStore::default();
+        original
+            .add(&credential, "Safari on this Mac".to_string())
+            .expect("add grant");
+        original.save(&paths).expect("save grants");
+
+        let restarted = GrantsStore::load(&paths).expect("load grants after restart");
+        assert!(restarted.verify(&credential).is_some());
+        assert_eq!(restarted.list().len(), 1);
     }
 }

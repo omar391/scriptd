@@ -18,6 +18,8 @@ use crate::grants::{GrantCredential, GrantsStore};
 pub const GRANT_HEADER: &str = "x-scriptd-grant";
 /// Idle lifetime of one pending native approval prompt.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long a completed approval can be replayed to its requesting tab.
+pub const SETTLED_REPLAY_TIMEOUT: Duration = Duration::from_secs(60);
 /// Quiet period after a denial or timeout before a new prompt may open.
 pub const COOLDOWN: Duration = Duration::from_secs(10);
 
@@ -54,14 +56,19 @@ struct PendingRequest {
     identifier: String,
     /// Browser-supplied label recorded with an approved grant.
     label: String,
-    granted: Option<GrantCredential>,
     opened_at: Instant,
+}
+
+struct SettledApproval {
+    credential: GrantCredential,
+    settled_at: Instant,
 }
 
 /// Authorization state shared by the web handlers.
 pub struct AccessController {
     grants: Mutex<GrantsStore>,
     pending: Mutex<Option<PendingRequest>>,
+    settled: Mutex<HashMap<String, SettledApproval>>,
     cooldown_until: Mutex<Option<Instant>>,
 }
 
@@ -71,6 +78,7 @@ impl AccessController {
         Self {
             grants: Mutex::new(grants),
             pending: Mutex::new(None),
+            settled: Mutex::new(HashMap::new()),
             cooldown_until: Mutex::new(None),
         }
     }
@@ -84,7 +92,9 @@ impl AccessController {
         if self.verifies(headers) {
             return AccessState::Authorized;
         }
-        let pending = Self::lock(&self.pending);
+        let mut pending = Self::lock(&self.pending);
+        Self::expire_request(&mut pending, &self.cooldown_until);
+        Self::expire_settled(&mut Self::lock(&self.settled));
         if pending.is_some() {
             return AccessState::Pending;
         }
@@ -97,7 +107,10 @@ impl AccessController {
 
     /// True when the presented credential matches a live grant.
     pub fn verifies(&self, headers: &HeaderMap) -> bool {
-        let Some(credential) = headers.get(GRANT_HEADER).and_then(|value| value.to_str().ok()) else {
+        let Some(credential) = headers
+            .get(GRANT_HEADER)
+            .and_then(|value| value.to_str().ok())
+        else {
             return false;
         };
         Self::lock(&self.grants).verify(credential).is_some()
@@ -105,7 +118,9 @@ impl AccessController {
 
     /// Returns the pending identifier if a prompt is waiting.
     pub fn pending_identifier(&self) -> Option<String> {
-        Self::lock(&self.pending).as_ref().map(|r| r.identifier.clone())
+        Self::lock(&self.pending)
+            .as_ref()
+            .map(|r| r.identifier.clone())
     }
 
     /// Opens one pending prompt, or explains why it could not be opened.
@@ -114,15 +129,18 @@ impl AccessController {
     /// controller in a brief cooldown, so a page cannot flood the user with
     /// popups.
     pub fn open_request(&self, label: &str) -> Result<RequestTicket, String> {
-        let cooldown = Self::lock(&self.cooldown_until);
+        let mut pending = Self::lock(&self.pending);
+        Self::expire_request(&mut pending, &self.cooldown_until);
+        let mut cooldown = Self::lock(&self.cooldown_until);
         if let Some(deadline) = *cooldown {
             if Instant::now() < deadline {
                 return Err("a recent request was declined; try again in a moment".to_string());
             }
+            *cooldown = None;
         }
         drop(cooldown);
 
-        let mut pending = Self::lock(&self.pending);
+        Self::expire_settled(&mut Self::lock(&self.settled));
         if pending.is_some() {
             return Err("an approval request is already waiting".to_string());
         }
@@ -133,7 +151,6 @@ impl AccessController {
             claim: claim.clone(),
             identifier: identifier.clone(),
             label: label.to_string(),
-            granted: None,
             opened_at: Instant::now(),
         });
         drop(pending);
@@ -145,11 +162,16 @@ impl AccessController {
     ///
     /// An approval mints and stores the grant credential that only the
     /// requesting tab can read back through its private claim.
-    pub fn resolve(&self, approved: bool) -> Result<(), String> {
+    pub fn resolve_claim(&self, claim: &str, approved: bool) -> Result<(), String> {
         let mut pending = Self::lock(&self.pending);
-        let Some(request) = pending.take() else {
+        Self::expire_request(&mut pending, &self.cooldown_until);
+        let Some(request) = pending.as_ref() else {
             return Err("no approval request is waiting".to_string());
         };
+        if request.claim != claim {
+            return Err("the approval request was replaced".to_string());
+        }
+        let request = pending.take().expect("pending request was checked");
         drop(pending);
         if !approved {
             *Self::lock(&self.cooldown_until) = Some(Instant::now() + COOLDOWN);
@@ -158,13 +180,17 @@ impl AccessController {
         let credential = GrantsStore::random_credential().map_err(|error| error.to_string())?;
         let mut grants = Self::lock(&self.grants);
         let label = request.label.clone();
-        grants.add(&credential, label).map_err(|error| error.to_string())?;
-        let updated = grants.clone();
+        grants
+            .add(&credential, label)
+            .map_err(|error| error.to_string())?;
         drop(grants);
-        let mut request = request;
-        request.granted = Some(credential);
-        *Self::lock(&self.pending) = Some(request);
-        let _ = updated;
+        Self::lock(&self.settled).insert(
+            request.claim,
+            SettledApproval {
+                credential,
+                settled_at: Instant::now(),
+            },
+        );
         Ok(())
     }
 
@@ -174,32 +200,48 @@ impl AccessController {
     /// only there. Polling stays idempotent until the request expires.
     pub fn poll(&self, claim: &str) -> PollOutcome {
         let mut pending = Self::lock(&self.pending);
-        let Some(request) = pending.as_ref() else {
-            return PollOutcome::Expired;
-        };
-        if request.claim != claim {
-            return PollOutcome::Expired;
+        Self::expire_request(&mut pending, &self.cooldown_until);
+        if pending
+            .as_ref()
+            .is_some_and(|request| request.claim == claim)
+        {
+            return PollOutcome::Waiting;
         }
-        if let Some(credential) = &request.granted {
-            let credential = credential.clone();
+        drop(pending);
+        let mut settled = Self::lock(&self.settled);
+        Self::expire_settled(&mut settled);
+        settled
+            .get(claim)
+            .map(|approval| PollOutcome::Allowed(approval.credential.clone()))
+            .unwrap_or(PollOutcome::Expired)
+    }
+
+    fn expire_request(
+        pending: &mut Option<PendingRequest>,
+        cooldown_until: &Mutex<Option<Instant>>,
+    ) {
+        let expired = pending
+            .as_ref()
+            .is_some_and(|request| request.opened_at.elapsed() >= REQUEST_TIMEOUT);
+        if expired {
             *pending = None;
-            return PollOutcome::Allowed(credential);
+            *Self::lock(cooldown_until) = Some(Instant::now() + COOLDOWN);
         }
-        if request.opened_at.elapsed() >= REQUEST_TIMEOUT {
-            *pending = None;
-            *Self::lock(&self.cooldown_until) = Some(Instant::now() + COOLDOWN);
-            return PollOutcome::Expired;
-        }
-        PollOutcome::Waiting
+    }
+
+    fn expire_settled(settled: &mut HashMap<String, SettledApproval>) {
+        settled.retain(|_, approval| approval.settled_at.elapsed() < SETTLED_REPLAY_TIMEOUT);
     }
 
     /// Closes the prompt and cancels the native notification.
-    pub fn cancel_pending(&self) {
-        let request = Self::lock(&self.pending).take();
-        if let Some(request) = request {
-            if request.granted.is_none() {
-                *Self::lock(&self.cooldown_until) = Some(Instant::now() + COOLDOWN);
-            }
+    pub fn cancel_claim(&self, claim: &str) {
+        let mut pending = Self::lock(&self.pending);
+        if pending
+            .as_ref()
+            .is_some_and(|request| request.claim == claim)
+        {
+            pending.take();
+            *Self::lock(&self.cooldown_until) = Some(Instant::now() + COOLDOWN);
         }
     }
 
@@ -275,4 +317,73 @@ pub struct AccessPollBody {
 pub struct AccessRevokeBody {
     /// Identifier of the grant to revoke.
     pub id: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn abandoned_request_expires_without_its_tab_polling() {
+        let access = AccessController::new(GrantsStore::default());
+        access.open_request("Abandoned tab").expect("open request");
+        make_request_expired(&access);
+
+        assert_eq!(access.state_for(&HeaderMap::new()), AccessState::Pending);
+        assert!(access.open_request("Another browser").is_err());
+        *AccessController::lock(&access.cooldown_until) =
+            Some(Instant::now() - Duration::from_secs(1));
+        assert!(access.open_request("Another browser").is_ok());
+    }
+
+    #[test]
+    fn settled_grant_replays_then_expires_without_owner_polling() {
+        let access = AccessController::new(GrantsStore::default());
+        let ticket = access.open_request("Requesting tab").expect("open request");
+        access
+            .resolve_claim(&ticket.claim, true)
+            .expect("approve request");
+        let first = access.poll(&ticket.claim);
+        assert!(matches!(&first, PollOutcome::Allowed(_)));
+        assert_eq!(access.poll(&ticket.claim), first);
+
+        if let Some(approval) = AccessController::lock(&access.settled).get_mut(&ticket.claim) {
+            approval.settled_at = Instant::now() - SETTLED_REPLAY_TIMEOUT;
+        }
+        assert_eq!(
+            access.state_for(&HeaderMap::new()),
+            AccessState::Unauthorized
+        );
+        assert_eq!(access.poll(&ticket.claim), PollOutcome::Expired);
+        assert!(access.open_request("Another browser").is_ok());
+    }
+
+    fn make_request_expired(access: &AccessController) {
+        if let Some(request) = AccessController::lock(&access.pending).as_mut() {
+            request.opened_at = Instant::now() - REQUEST_TIMEOUT;
+        }
+    }
+
+    #[test]
+    fn stale_native_callbacks_cannot_resolve_or_cancel_a_replacement() {
+        let access = AccessController::new(GrantsStore::default());
+        let first = access.open_request("first").expect("open first");
+        make_request_expired(&access);
+        assert!(access.poll(&first.claim) == PollOutcome::Expired);
+        *AccessController::lock(&access.cooldown_until) =
+            Some(Instant::now() - Duration::from_secs(1));
+        let second = access.open_request("second").expect("open replacement");
+
+        assert!(access.resolve_claim(&first.claim, true).is_err());
+        assert!(access.resolve_claim(&first.claim, false).is_err());
+        access.cancel_claim(&first.claim);
+        assert_eq!(access.poll(&second.claim), PollOutcome::Waiting);
+        access
+            .resolve_claim(&second.claim, true)
+            .expect("resolve second");
+        assert!(matches!(
+            access.poll(&second.claim),
+            PollOutcome::Allowed(_)
+        ));
+    }
 }

@@ -36,7 +36,11 @@ impl ApprovalDecision {
 /// The blocking interaction with the GUI session runs on a blocking thread so
 /// the caller's event loops are never stalled. A denial and a timeout are
 /// reported distinctly from a failure to present the prompt at all.
-pub async fn request_approval(title: &str, message: &str, timeout: Duration) -> Result<ApprovalDecision> {
+pub async fn request_approval(
+    title: &str,
+    message: &str,
+    timeout: Duration,
+) -> Result<ApprovalDecision> {
     let title = title.to_string();
     let message = message.to_string();
     #[cfg(target_os = "macos")]
@@ -56,16 +60,15 @@ pub async fn request_approval(title: &str, message: &str, timeout: Duration) -> 
 fn macos_prompt(title: &str, message: &str, timeout: Duration) -> ApprovalDecision {
     use core_foundation::base::{kCFAllocatorDefault, TCFType};
     use core_foundation::dictionary::CFDictionary;
-use core_foundation_sys::dictionary::CFDictionaryRef;
     use core_foundation::string::CFString;
     use core_foundation_sys::base::{CFOptionFlags, SInt32};
     use core_foundation_sys::date::CFTimeInterval;
+    use core_foundation_sys::dictionary::CFDictionaryRef;
     use core_foundation_sys::user_notification::{
         kCFUserNotificationAlertHeaderKey, kCFUserNotificationAlertMessageKey,
         kCFUserNotificationAlternateButtonTitleKey, kCFUserNotificationAlternateResponse,
         kCFUserNotificationCautionAlertLevel, kCFUserNotificationDefaultButtonTitleKey,
-        kCFUserNotificationDefaultResponse, CFUserNotificationCancel, CFUserNotificationCreate,
-        CFUserNotificationReceiveResponse,
+        CFUserNotificationCancel, CFUserNotificationCreate, CFUserNotificationReceiveResponse,
     };
 
     let header = CFString::new(title);
@@ -75,12 +78,21 @@ use core_foundation_sys::dictionary::CFDictionaryRef;
 
     let dictionary = unsafe {
         CFDictionary::from_CFType_pairs(&[
-            (CFString::wrap_under_get_rule(kCFUserNotificationAlertHeaderKey), header),
-            (CFString::wrap_under_get_rule(kCFUserNotificationAlertMessageKey), body),
-            (CFString::wrap_under_get_rule(kCFUserNotificationDefaultButtonTitleKey), allow),
+            (
+                CFString::wrap_under_get_rule(kCFUserNotificationAlertHeaderKey),
+                header,
+            ),
+            (
+                CFString::wrap_under_get_rule(kCFUserNotificationAlertMessageKey),
+                body,
+            ),
+            (
+                CFString::wrap_under_get_rule(kCFUserNotificationDefaultButtonTitleKey),
+                deny,
+            ),
             (
                 CFString::wrap_under_get_rule(kCFUserNotificationAlternateButtonTitleKey),
-                deny,
+                allow,
             ),
         ])
     };
@@ -101,18 +113,20 @@ use core_foundation_sys::dictionary::CFDictionaryRef;
     }
 
     let mut response_flags: CFOptionFlags = 0;
-    let status =
-        unsafe { CFUserNotificationReceiveResponse(notification, timeout_seconds, &mut response_flags) };
+    let status = unsafe {
+        CFUserNotificationReceiveResponse(notification, timeout_seconds, &mut response_flags)
+    };
     unsafe { CFUserNotificationCancel(notification) };
 
     if status != 0 {
         return ApprovalDecision::Unavailable;
     }
+    // Deny is the default button, so anything other than an explicit Allow
+    // choice -- including a timeout, a dismissed alert, or an unexpected
+    // response flag -- is a denial.
     let response = response_flags & 0b11;
-    if response == kCFUserNotificationDefaultResponse {
+    if response == kCFUserNotificationAlternateResponse {
         ApprovalDecision::Allowed
-    } else if response == kCFUserNotificationAlternateResponse {
-        ApprovalDecision::Denied
     } else {
         ApprovalDecision::Denied
     }

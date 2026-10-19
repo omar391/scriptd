@@ -53,62 +53,22 @@ const SETTING_LABELS = {
   remote: ['Remote router settings', 'API endpoint, client identity, HTTP status, and timeout settings.']
 };
 const tabs = ['Overview', 'Settings', 'Triggers', 'Logs'];
-const query = new URLSearchParams(location.search);
 
-// The bridge hands the token to the tab through the URL on first launch and
-// through sessionStorage on reload. The authenticated browser context also
-// retains an origin-scoped recovery capability in localStorage, so a reload
-// after sessionStorage was cleared can re-acquire the token from /api/session.
-// Keep the value mutable so the recovered credential reaches
-// every request without a page reload, and read it through sessionToken() so
-// no caller can capture a stale empty value.
-let session = query.get('session') || sessionStorage.getItem('scriptd-session');
-function sessionToken() { return session; }
-
-// Repopulates a lost credential with the origin-scoped recovery capability.
-// A stored token can outlive the bridge process that issued it: the service
-// restarts, the old token is rejected with 401, and a page that keeps trusting
-// it renders stale data behind a disconnected banner. So the stored token is a
-// starting point, not a settled fact, and any rejection falls through to the
-// recovery capability instead of dead-ending.
-async function restoreSession(generation) {
-  try {
-    const capability = localStorage.getItem('scriptd-recovery');
-    if (!capability) return null;
-    const recovered = await fetch('/api/session', {
-      headers: { 'x-scriptd-recovery': capability }, cache: 'no-store'
-    }).then(r => r.json());
-    if (generation !== connectionGeneration) return null;
-    if (recovered && recovered.ok && recovered.session) {
-      session = recovered.session;
-      sessionStorage.setItem('scriptd-session', session);
-      return session;
-    }
-    if (recovered && recovered.ok && !recovered.session) {
-      // The server accepted the capability but no longer issues a token; the
-      // stored credential is unusable and recovery is already exhausted.
-      return null;
-    }
-  } catch (_) {}
-  return null;
-}
-if (session) {
-  sessionStorage.setItem('scriptd-session', session);
-  history.replaceState(null, '', location.pathname);
-  fetch('/api/session', {
-    headers: { 'x-scriptd-session': session }, cache: 'no-store'
-  }).then(r => r.json()).then(data => {
-    if (data && data.ok && data.recovery) localStorage.setItem('scriptd-recovery', data.recovery);
-  }).catch(() => {});
-}
+// Grant-based authorization. An unapproved browser sees an authorization
+// screen and receives a random grant credential only after the logged-in
+// user clicks Allow in a native macOS popup. The grant is origin-scoped
+// and survives browser or service restarts, so reconnect needs no prompt.
+let grant = localStorage.getItem('scriptd-grant');
+function grantCredential() { return grant; }
 
 let appState = {
   section: 'overview', module: null, tab: 'Overview', collapsed: false, mobileNavOpen: false,
   snapshot: null, drafts: {}, logs: [], severity: 'all', search: '',
   follow: true, message: '', error: '', loading: true, dialog: null,
-  saveDiff: null, serviceOnline: false, quitQueue: null, quitWorking: false
+  saveDiff: null, serviceOnline: false, quitQueue: null, quitWorking: false,
+  accessState: 'unknown', pendingIdentifier: null, browserProfiles: []
 };
-let eventSource;
+let eventStreamAbortController;
 let reconnectTimer;
 let reconnectDelay = 1000;
 let connectionGeneration = 0;
@@ -117,22 +77,24 @@ let settingsParseTimer;
 let logTimer;
 let saveReviewToken = 0;
 let quitOperationToken = 0;
+let approvalPollTimer = null;
+let pendingStatusTimer = null;
 
 function api(path, options) {
   const opts = options || {};
-  opts.headers = Object.assign({}, opts.headers || {}, { 'x-scriptd-session': sessionToken() || '' });
+  opts.headers = Object.assign({}, opts.headers || {});
+  const credential = grantCredential();
+  if (credential) opts.headers['x-scriptd-grant'] = credential;
   if (opts.body) {
     opts.headers['content-type'] = 'application/json';
-    opts.headers.origin = location.origin;
+    opts.headers['origin'] = location.origin;
   }
   return fetch(path, opts).then(async response => {
     const data = await response.json();
     if (!response.ok || data.ok === false) {
-      // The status lives on the response, not in the body text, so it must be
-      // carried through: a 401 that only reads "session was not accepted"
-      // looks identical to any other rejection when callers match on it.
       const error = new Error(data.message || ('Request failed (' + response.status + ')'));
       error.status = response.status;
+      error.state = data.state;
       throw error;
     }
     return data;
@@ -311,30 +273,145 @@ function draftModuleEnabled(moduleId, enabled) {
 function connect() {
   clearTimeout(reconnectTimer);
   reconnectTimer = null;
-  loadSnapshot(true);
+  checkAccess();
 }
 
 function scheduleReconnect() {
   if (reconnectTimer) return;
-  setState({ loading: false, serviceOnline: false, error: 'Connection interrupted. Reconnecting automatically…' });
+  setState({ error: 'Connection interrupted. Reconnecting automatically…' });
   reconnectTimer = setTimeout(connect, reconnectDelay);
   reconnectDelay = Math.min(reconnectDelay * 2, 10000);
 }
 
-// Attempts a snapshot load, recovering the credential once when the server
-// rejects the stored one. Without the recovery retry a tab that keeps a token
-// from a previous bridge process stays frozen on stale data with no way back.
-function loadSnapshot(allowRecovery) {
+// Reads the access state first. A grant-less browser must never be told the
+// service is offline: without access the bridge is simply unreachable.
+function checkAccess() {
   const generation = ++connectionGeneration;
-  if (eventSource) { eventSource.close(); eventSource = null; }
+  closeEventStream();
+  api('/api/access').then(data => {
+    if (generation !== connectionGeneration) return;
+    reconnectDelay = 1000;
+    const authorized = data.state === 'authorized';
+    setState({ accessState: data.state, pendingIdentifier: data.pending_identifier || null, loading: false,
+      serviceOnline: authorized ? appState.serviceOnline : false });
+    if (authorized) {
+      stopPendingStatusRefresh();
+      loadSnapshot();
+    } else {
+      const claim = sessionStorage.getItem('scriptd-access-claim');
+      if (claim) pollApproval(claim);
+      else if (data.state === 'pending') schedulePendingStatusRefresh();
+      else {
+        stopApprovalPolling();
+        stopPendingStatusRefresh();
+        sessionStorage.removeItem('scriptd-access-claim');
+      }
+    }
+  }).catch(error => {
+    if (generation !== connectionGeneration) return;
+    if (error.status === 401) setState({ accessState: 'unauthorized', loading: false });
+    else scheduleReconnect();
+  });
+}
+
+// Requests a native approval prompt. The tab then polls the private claim so
+// only this tab learns the grant; no credential ever travels through a URL.
+async function requestAccess() {
+  setState({ loading: true, error: '' });
+  try {
+    const data = await api('/api/access/request', {
+      method: 'POST',
+      body: JSON.stringify({ label: navigator.userAgent || 'Browser on this Mac' })
+    });
+    setState({ accessState: data.state, pendingIdentifier: data.identifier || null });
+    if (data.state === 'authorized' && data.grant) {
+      sessionStorage.removeItem('scriptd-access-claim');
+      grant = data.grant;
+      localStorage.setItem('scriptd-grant', grant);
+      loadSnapshot();
+    } else if (data.state === 'pending') {
+      if (data.claim) sessionStorage.setItem('scriptd-access-claim', data.claim);
+      pollApproval(data.claim);
+    } else {
+      setState({ loading: false, error: data.message || 'The request could not be opened.' });
+    }
+  } catch (error) {
+    setState({ loading: false, error: error.message, accessState: error.state || 'unauthorized' });
+  }
+}
+
+function stopApprovalPolling() {
+  if (approvalPollTimer) {
+    clearTimeout(approvalPollTimer);
+    approvalPollTimer = null;
+  }
+}
+
+function stopPendingStatusRefresh() {
+  if (pendingStatusTimer) {
+    clearTimeout(pendingStatusTimer);
+    pendingStatusTimer = null;
+  }
+}
+
+function schedulePendingStatusRefresh() {
+  stopPendingStatusRefresh();
+  pendingStatusTimer = setTimeout(() => {
+    pendingStatusTimer = null;
+    checkAccess();
+  }, 1000);
+}
+
+// Idempotent polling: a dropped response still reads the settled outcome
+// until the request expires, so no lost packet costs the user another popup.
+function pollApproval(claim) {
+  stopApprovalPolling();
+  stopPendingStatusRefresh();
+  const generation = connectionGeneration;
+  setState({ loading: false });
+  const poll = async () => {
+    if (generation !== connectionGeneration) {
+      stopApprovalPolling();
+      return;
+    }
+    try {
+      const data = await api('/api/access/poll', { method: 'POST', body: JSON.stringify({ claim }) });
+      if (generation !== connectionGeneration) return stopApprovalPolling();
+      if (data.state === 'authorized' && data.grant) {
+        stopApprovalPolling();
+        sessionStorage.removeItem('scriptd-access-claim');
+        grant = data.grant;
+        localStorage.setItem('scriptd-grant', grant);
+        setState({ accessState: 'authorized', pendingIdentifier: null });
+        loadSnapshot();
+      } else if (data.state !== 'pending') {
+        stopApprovalPolling();
+        sessionStorage.removeItem('scriptd-access-claim');
+        setState({ accessState: 'unauthorized', pendingIdentifier: null });
+      } else {
+        approvalPollTimer = setTimeout(poll, 500);
+      }
+    } catch (error) {
+      if (generation !== connectionGeneration) return stopApprovalPolling();
+      if (error.status === 401 || error.state === 'unauthorized') {
+        stopApprovalPolling();
+        sessionStorage.removeItem('scriptd-access-claim');
+        setState({ accessState: 'unauthorized', pendingIdentifier: null });
+        return;
+      }
+      // A transient failure must not discard the private claim; the settled
+      // result remains available for retry until the server expires it.
+      approvalPollTimer = setTimeout(poll, 1000);
+    }
+  };
+  poll();
+}
+
+function loadSnapshot() {
+  const generation = ++connectionGeneration;
   api('/api/snapshot').then(data => {
     if (generation !== connectionGeneration) return;
     reconnectDelay = 1000;
-    // Refresh the remembered capability after a successful bootstrap as well
-    // as initial launch, including tabs upgraded from an older bridge.
-    api('/api/session').then(data => {
-      if (data.recovery) localStorage.setItem('scriptd-recovery', data.recovery);
-    }).catch(() => {});
     const snapshot = data.snapshot || {};
     const drafts = Object.assign({}, JSON.parse(localStorage.getItem('scriptd-drafts') || '{}'), appState.drafts);
     appState = Object.assign({}, appState, { snapshot, drafts, serviceOnline: !!(snapshot.service && snapshot.service.running), loading: false, error: '' });
@@ -351,46 +428,89 @@ function loadSnapshot(allowRecovery) {
         }
       });
     }).catch(() => {});
-    openEvents(generation);
+    openEventStream(generation);
+    loadBrowserProfiles();
   }).catch(error => {
-    if (generation === connectionGeneration) handleSnapshotFailure(error, allowRecovery, generation);
-  });
-}
-
-function openEvents(generation) {
-  const source = new EventSource('/events?session=' + encodeURIComponent(sessionToken()));
-  eventSource = source;
-  source.addEventListener('snapshot', event => {
-    if (generation !== connectionGeneration || eventSource !== source) return;
-    try {
-      const data = JSON.parse(event.data);
-      if (!data.ok && data.message) return setState({ error: data.message });
-      appState = Object.assign({}, appState, { snapshot: data, serviceOnline: !!(data.service && data.service.running), error: '' });
-      renderApp();
-    } catch (_) {}
-  });
-  source.onerror = () => {
-    if (generation !== connectionGeneration || eventSource !== source) return;
-    source.close();
-    eventSource = null;
-    // Native SSE retries keep the old URL token. Re-bootstrap the snapshot so
-    // a new service generation can issue a token before opening a fresh stream.
+    if (generation !== connectionGeneration) return;
+    if (error.status === 401) {
+      grant = null;
+      localStorage.removeItem('scriptd-grant');
+      setState({ accessState: 'unauthorized', loading: false });
+      return;
+    }
     scheduleReconnect();
-  };
+  });
 }
 
-function handleSnapshotFailure(error, allowRecovery, generation) {
-  if (allowRecovery && error && error.status === 401) {
-    session = '';
-    sessionStorage.removeItem('scriptd-session');
-    restoreSession(generation).then(recovered => {
-      if (generation !== connectionGeneration) return;
-      if (recovered) loadSnapshot(false);
-      else scheduleReconnect();
-    });
-    return;
+function closeEventStream() {
+  if (eventStreamAbortController) {
+    eventStreamAbortController.abort();
+    eventStreamAbortController = null;
   }
-  scheduleReconnect();
+}
+
+// EventSource cannot carry a credential without putting it in the URL, so
+// live updates stream over an authenticated fetch and read the SSE frames
+// from the same origin with the grant header.
+function openEventStream(generation) {
+  closeEventStream();
+  const controller = new AbortController();
+  eventStreamAbortController = controller;
+  const credential = grantCredential();
+  fetch('/events', {
+    headers: { 'x-scriptd-grant': credential || '' },
+    signal: controller.signal,
+    cache: 'no-store'
+  }).then(async response => {
+    if (!response.ok) throw new Error('stream rejected');
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    while (generation === connectionGeneration) {
+      const { done, value } = await reader.read();
+      if (done) {
+        if (generation === connectionGeneration && !controller.signal.aborted) scheduleReconnect();
+        break;
+      }
+      buffer += decoder.decode(value, { stream: true });
+      const frames = buffer.split('\n\n');
+      buffer = frames.pop() || '';
+      for (const frame of frames) {
+        for (const line of frame.split('\n')) {
+          if (!line.startsWith('data: ')) continue;
+          try {
+            const data = JSON.parse(line.slice(6));
+            if (generation !== connectionGeneration) return;
+            if (!data.ok && data.message) {
+              setState({ error: data.message });
+              continue;
+            }
+            appState = Object.assign({}, appState, { snapshot: data, serviceOnline: !!(data.service && data.service.running), error: '' });
+            renderApp();
+          } catch (_) {}
+        }
+      }
+    }
+  }).catch(() => {
+    if (generation === connectionGeneration && !controller.signal.aborted) scheduleReconnect();
+  });
+}
+
+async function loadBrowserProfiles() {
+  try {
+    const data = await api('/api/access/list');
+    if (data.ok) setState({ browserProfiles: data.profiles || [] });
+  } catch (_) {}
+}
+
+async function revokeBrowserProfile(id) {
+  try {
+    await api('/api/access/revoke', { method: 'POST', body: JSON.stringify({ id }) });
+    setState({ message: 'Browser access revoked.' });
+    loadBrowserProfiles();
+  } catch (error) {
+    setState({ error: error.message });
+  }
 }
 
 function node(tag, props, children) { return h(tag, props || {}, ...(children || [])); }
@@ -548,6 +668,48 @@ function tabsView() {
   ));
 }
 
+function AuthorizeView() {
+  const { accessState, pendingIdentifier } = appState;
+  const isPending = accessState === 'pending';
+  const isUnauthorized = accessState === 'unauthorized';
+  const isUnavailable = accessState === 'unavailable';
+  return h('div', { class: 'content-stack' },
+    h('div', { class: 'welcome' },
+      h('p', { class: 'eyebrow' }, 'BROWSER ACCESS'),
+      h('h2', null, isPending ? 'Waiting for approval…' : 'Authorize this browser'),
+      isPending && pendingIdentifier ? h('p', { class: 'identifier' }, 'Identifier: ' + pendingIdentifier) : null,
+      h('p', null, isPending
+        ? 'Click Allow in the native macOS popup to grant this browser access to Scriptd. The request expires in two minutes.'
+        : isUnavailable
+        ? 'Scriptd cannot present the approval prompt in your current GUI session. Make sure you are logged in to an interactive desktop session.'
+        : 'This browser needs your approval to manage Scriptd. Click the button below to request access through a native macOS popup.'),
+      isPending
+        ? h('div', { class: 'spinner' }, 'Waiting…')
+        : button('Request access', requestAccess, 'button primary', { disabled: isUnavailable })),
+    h('div', { class: 'note-card' },
+      h('h3', null, 'About this access'),
+      h('p', null, 'Approved browsers are remembered until you revoke them. Access is limited to browsers on this Mac; remote access is not available through this interface.'),
+      h('p', null, 'The native popup asks whether to allow this browser to manage Scriptd. Deny is the default for security.'))
+  );
+}
+
+function BrowserAccessSettings() {
+  return h('div', { class: 'settings-group' },
+    h('h3', null, 'Browser access'),
+    h('p', { class: 'settings-note' }, 'Approved browser profiles can manage Scriptd without re-approval. Revoke a profile to require native approval again.'),
+    appState.browserProfiles.length === 0
+      ? h('p', { class: 'empty-state' }, 'No approved browsers yet.')
+      : h('div', { class: 'browser-profiles' },
+          appState.browserProfiles.map(profile =>
+            h('div', { class: 'browser-profile', key: profile.id },
+              h('div', { class: 'profile-info' },
+                h('span', { class: 'profile-label' }, profile.label || 'Browser'),
+                h('span', { class: 'profile-issued' }, 'Added ' + new Date(profile.issued_at * 1000).toLocaleDateString())),
+              button('Revoke', () => revokeBrowserProfile(profile.id), 'button danger-text'))
+          ))
+  );
+}
+
 function Overview() {
   const info = activeModule();
   const service = appState.snapshot && appState.snapshot.service || {};
@@ -638,6 +800,7 @@ function SettingsView() {
     h('div', { class: 'section-intro' }, h('div', null, h('h2', null, 'Configuration draft'),
       h('p', null, 'Changes stay in this draft until you review and save them. The service validates the document before applying it.')),
       isDirty(id) ? badge('Unsaved changes', 'warn') : badge('Saved', 'muted')),
+    !id ? BrowserAccessSettings() : null,
     h('section', { class: 'card guided-settings' }, h('div', { class: 'card-heading' }, h('h2', null, 'Guided settings')),
       h('p', { class: 'muted' }, moduleGuide(id)),
       h('h3', null, 'Basic'), h('div', { class: 'settings-grid' }, profile.basic.map(key => settingField(id, key, settings))),
@@ -871,6 +1034,7 @@ function ServiceView() {
 }
 
 function renderContent() {
+  if (appState.accessState !== 'authorized') return AuthorizeView();
   if (appState.section === 'service') {
     if (appState.tab === 'Settings') return SettingsView();
     if (appState.tab === 'Triggers') return TriggersView();
