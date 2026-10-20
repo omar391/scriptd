@@ -52,7 +52,6 @@ const SETTING_LABELS = {
   token_file: ['Session token file', 'Path used by the existing native session flow.'],
   remote: ['Remote router settings', 'API endpoint, client identity, HTTP status, and timeout settings.']
 };
-const tabs = ['Overview', 'Settings', 'Triggers', 'Logs'];
 
 // Grant-based authorization. An unapproved browser sees an authorization
 // screen and receives a random grant credential only after the logged-in
@@ -64,7 +63,7 @@ function grantCredential() { return grant; }
 let appState = {
   section: 'overview', module: null, tab: 'Overview', collapsed: false, mobileNavOpen: false,
   snapshot: null, drafts: {}, logs: [], severity: 'all', search: '',
-  follow: true, message: '', error: '', loading: true, dialog: null,
+  follow: true, message: '', error: '', observationDelayed: false, loading: true, dialog: null, dialogFocus: null,
   saveDiff: null, serviceOnline: false, quitQueue: null, quitWorking: false,
   accessState: 'unknown', pendingIdentifier: null, browserProfiles: []
 };
@@ -74,11 +73,11 @@ let reconnectDelay = 1000;
 let connectionGeneration = 0;
 let draftTimer;
 let settingsParseTimer;
-let logTimer;
 let saveReviewToken = 0;
 let quitOperationToken = 0;
 let approvalPollTimer = null;
 let pendingStatusTimer = null;
+let logRequestGeneration = 0;
 
 function api(path, options) {
   const opts = options || {};
@@ -108,6 +107,37 @@ function setState(patch) {
 
 function moduleInfo(id) {
   return (appState.snapshot && appState.snapshot.modules || []).find(item => item.id === id) || {};
+}
+
+function displayValue(value) {
+  if (value == null || value === '') return '—';
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return String(value);
+  try { return JSON.stringify(value); } catch (_) { return String(value); }
+}
+
+function formatTriggerState(value) {
+  if (value == null || value === '') return 'No evaluation recorded';
+  if (typeof value === 'string') return value;
+  return displayValue(value);
+}
+
+function moduleDisplayName(id) {
+  const info = moduleInfo(id);
+  if (info && info.name) return info.name;
+  const fallback = MODULES.find(item => item.id === id);
+  return (fallback && fallback.name) || id || 'Module';
+}
+
+function sectionTabs() {
+  if (appState.section === 'service') return ['Overview', 'Settings', 'Logs'];
+  return ['Overview', 'Settings', 'Triggers', 'Logs'];
+}
+
+function formatTimestamp(value) {
+  if (!value) return '—';
+  const date = value instanceof Date ? value : new Date(typeof value === 'number' && value < 1e12 ? value * 1000 : value);
+  if (Number.isNaN(date.getTime())) return displayValue(value);
+  return date.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'medium' });
 }
 
 function docKey(id) { return id ? 'module:' + id : 'service'; }
@@ -271,13 +301,14 @@ function draftModuleEnabled(moduleId, enabled) {
 }
 
 function connect() {
+  if (document.visibilityState === 'hidden') return;
   clearTimeout(reconnectTimer);
   reconnectTimer = null;
   checkAccess();
 }
 
 function scheduleReconnect() {
-  if (reconnectTimer) return;
+  if (document.visibilityState === 'hidden' || reconnectTimer) return;
   setState({ error: 'Connection interrupted. Reconnecting automatically…' });
   reconnectTimer = setTimeout(connect, reconnectDelay);
   reconnectDelay = Math.min(reconnectDelay * 2, 10000);
@@ -414,7 +445,7 @@ function loadSnapshot() {
     reconnectDelay = 1000;
     const snapshot = data.snapshot || {};
     const drafts = Object.assign({}, JSON.parse(localStorage.getItem('scriptd-drafts') || '{}'), appState.drafts);
-    appState = Object.assign({}, appState, { snapshot, drafts, serviceOnline: !!(snapshot.service && snapshot.service.running), loading: false, error: '' });
+    appState = Object.assign({}, appState, { snapshot, drafts, serviceOnline: !!(snapshot.service && snapshot.service.running), observationDelayed: snapshot.observation === 'delayed', loading: false, error: '' });
     renderApp();
     api('/api/drafts').then(saved => {
       appState = Object.assign({}, appState, { drafts: Object.assign({}, saved.drafts || {}, appState.drafts) });
@@ -429,6 +460,7 @@ function loadSnapshot() {
       });
     }).catch(() => {});
     openEventStream(generation);
+    if (appState.tab === 'Logs' && appState.follow) loadLogs({ force: true });
     loadBrowserProfiles();
   }).catch(error => {
     if (generation !== connectionGeneration) return;
@@ -453,11 +485,15 @@ function closeEventStream() {
 // live updates stream over an authenticated fetch and read the SSE frames
 // from the same origin with the grant header.
 function openEventStream(generation) {
+  if (document.visibilityState === 'hidden') return;
   closeEventStream();
   const controller = new AbortController();
   eventStreamAbortController = controller;
   const credential = grantCredential();
-  fetch('/events', {
+  const logModule = appState.tab === 'Logs' && appState.follow
+    ? (appState.section === 'service' ? 'service' : ((activeModule() && activeModule().id) || 'service')) : null;
+  const streamUrl = '/events' + (logModule ? '?log_module=' + encodeURIComponent(logModule) : '');
+  fetch(streamUrl, {
     headers: { 'x-scriptd-grant': credential || '' },
     signal: controller.signal,
     cache: 'no-store'
@@ -476,6 +512,22 @@ function openEventStream(generation) {
       const frames = buffer.split('\n\n');
       buffer = frames.pop() || '';
       for (const frame of frames) {
+        const eventName = (frame.split('\n').find(line => line.startsWith('event: ')) || '').slice(7);
+        if (eventName === 'logs_changed') { loadLogs(); continue; }
+        if (eventName === 'observation') {
+          for (const line of frame.split('\n')) {
+            if (!line.startsWith('data: ')) continue;
+            try {
+              const data = JSON.parse(line.slice(6));
+              if (generation !== connectionGeneration) return;
+              if (data.observation === 'delayed') setState({ observationDelayed: true });
+            } catch (_) {}
+          }
+          continue;
+        }
+        // A frame without an explicit name carries the snapshot payload, so
+        // a stream that omits the event type still refreshes the view.
+        if (eventName !== '' && eventName !== 'snapshot') continue;
         for (const line of frame.split('\n')) {
           if (!line.startsWith('data: ')) continue;
           try {
@@ -485,7 +537,7 @@ function openEventStream(generation) {
               setState({ error: data.message });
               continue;
             }
-            appState = Object.assign({}, appState, { snapshot: data, serviceOnline: !!(data.service && data.service.running), error: '' });
+            appState = Object.assign({}, appState, { snapshot: data, serviceOnline: !!(data.service && data.service.running), observationDelayed: data.observation === 'delayed', error: '' });
             renderApp();
           } catch (_) {}
         }
@@ -604,6 +656,24 @@ function focusMainContent() {
   if (main) main.focus();
 }
 
+function restoreDialogFocus(previous = appState.dialogFocus) {
+  appState.dialogFocus = null;
+  requestAnimationFrame(() => {
+    if (previous && typeof previous.focus === 'function') previous.focus();
+    else focusMainContent();
+  });
+}
+
+function closeDialog(patch, restoreFocus = true) {
+  const previous = appState.dialogFocus;
+  setState(Object.assign({ dialog: null, saveDiff: null, dialogFocus: null }, patch || {}));
+  if (restoreFocus) restoreDialogFocus(previous);
+}
+
+function closeConfirmation(patch) {
+  closeDialog(patch);
+}
+
 function Sidebar() {
   const info = appState.snapshot || {};
   const service = info.service || {};
@@ -614,7 +684,7 @@ function Sidebar() {
     ...MODULES.map(item => {
       const state = moduleInfo(item.id);
       return h('button', { type: 'button', class: 'nav-item ' + (appState.module === item.id ? 'selected' : ''), onClick: () => navigate(item.id) },
-        h('span', { class: 'nav-icon' }, item.icon), navName(item.name),
+        h('span', { class: 'nav-icon' }, item.icon), navName(moduleDisplayName(item.id)),
         h('span', { class: 'nav-health' }, statusLabel(state)));
     }),
     h('div', { class: 'nav-caption service-caption' }, 'SERVICE'),
@@ -622,6 +692,7 @@ function Sidebar() {
       const mobileNavigationWasOpen = appState.mobileNavOpen;
       appState = Object.assign({}, appState, { section: 'service', module: null, tab: 'Overview', mobileNavOpen: false });
       renderApp();
+      openEventStream(connectionGeneration);
       if (mobileNavigationWasOpen) focusMainContent();
     } },
       h('span', { class: 'nav-icon' }, '◉'), navName('Service'), badge(service.running ? 'Running' : (appState.snapshot ? 'Offline' : 'Unknown'), service.running ? 'good' : (appState.snapshot ? 'muted' : 'warn')))
@@ -631,8 +702,6 @@ function Sidebar() {
       button(sidebarToggleIcon(appState.collapsed), () => setState({ collapsed: !appState.collapsed }), 'icon-button desktop-sidebar-toggle', { 'aria-expanded': String(!appState.collapsed), 'aria-label': appState.collapsed ? 'Expand navigation' : 'Collapse navigation', title: appState.collapsed ? 'Expand navigation' : 'Collapse navigation' }),
       button(mobileNavigationIcon(appState.mobileNavOpen), () => setState({ mobileNavOpen: !appState.mobileNavOpen }), 'icon-button mobile-nav-toggle', { id: 'mobile-nav-toggle', 'aria-expanded': String(appState.mobileNavOpen), 'aria-controls': 'primary-navigation', 'aria-label': appState.mobileNavOpen ? 'Close navigation' : 'Open navigation', title: appState.mobileNavOpen ? 'Close navigation' : 'Open navigation' })),
     h('nav', { id: 'primary-navigation', class: 'nav-list', 'aria-label': 'Main' }, entries),
-    h('div', { class: 'sidebar-foot' }, h('span', { class: 'pulse ' + (serviceStatusTone() === 'good' ? 'on' : '') }),
-      service.running ? 'Service connected' : (appState.snapshot ? 'Service unavailable' : 'Service status unknown'))
   );
 }
 
@@ -640,56 +709,80 @@ function navigate(id) {
   const mobileNavigationWasOpen = appState.mobileNavOpen;
   appState = Object.assign({}, appState, { module: id, section: id ? 'module' : 'overview', tab: 'Overview', error: '', message: '', mobileNavOpen: false });
   renderApp();
+  openEventStream(connectionGeneration);
+  if (appState.tab === 'Logs' && appState.follow) loadLogs({ force: true });
   if (mobileNavigationWasOpen) focusMainContent();
-  if (id && appState.tab === 'Logs') loadLogs();
 }
 
 function Header() {
   const info = activeModule();
   const service = appState.snapshot && appState.snapshot.service || {};
-  const title = info ? (info.name || info.id) : (appState.section === 'service' ? 'Service' : 'Overview');
+  const title = info ? moduleDisplayName(info.id) : (appState.section === 'service' ? 'Service' : 'Overview');
   return h('header', { class: 'topbar' },
     h('div', { class: 'breadcrumbs' }, h('span', null, 'SCRIPTD'), h('span', { class: 'slash' }, '/'), h('h1', null, title),
       info ? h('code', null, info.id) : null),
     h('div', { class: 'topbar-status' }, badge(serviceStatusLabel(), serviceStatusTone()),
-      button('Refresh', refresh, 'button subtle'), button('Quit', requestQuit, 'button subtle'))
+      button('Refresh', refresh, 'button subtle'), button('Close control center', requestQuit, 'button subtle'))
   );
 }
 
 function navigateTab(tab) {
   appState = Object.assign({}, appState, { tab, error: '' });
   renderApp();
-  if (tab === 'Logs') loadLogs();
+  openEventStream(connectionGeneration);
+  if (tab === 'Logs') loadLogs({ force: true });
 }
 
 function tabsView() {
-  return h('nav', { class: 'tabs', 'aria-label': 'Module sections' }, tabs.map(tab =>
-    h('button', { type: 'button', class: 'tab ' + (appState.tab === tab ? 'active' : ''), 'aria-current': appState.tab === tab ? 'page' : null, onClick: () => navigateTab(tab) }, tab)
+  const available = sectionTabs();
+  if (available.indexOf(appState.tab) === -1) {
+    appState = Object.assign({}, appState, { tab: available[0] });
+  }
+  return h('nav', { class: 'tabs', 'aria-label': 'Module sections' }, available.map((tab, index) =>
+    h('button', {
+      type: 'button',
+      id: 'tab-' + tab.toLowerCase(),
+      class: 'tab ' + (appState.tab === tab ? 'active' : ''),
+      'aria-current': appState.tab === tab ? 'page' : null,
+      onClick: () => navigateTab(tab),
+      onKeyDown: event => {
+        const key = event.key;
+        if (key !== 'ArrowLeft' && key !== 'ArrowRight' && key !== 'Home' && key !== 'End') return;
+        event.preventDefault();
+        let next = index;
+        if (key === 'ArrowLeft') next = (index - 1 + available.length) % available.length;
+        if (key === 'ArrowRight') next = (index + 1) % available.length;
+        if (key === 'Home') next = 0;
+        if (key === 'End') next = available.length - 1;
+        navigateTab(available[next]);
+        const target = document.getElementById('tab-' + available[next].toLowerCase());
+        if (target) target.focus();
+      }
+    }, tab)
   ));
 }
 
 function AuthorizeView() {
   const { accessState, pendingIdentifier } = appState;
   const isPending = accessState === 'pending';
-  const isUnauthorized = accessState === 'unauthorized';
+  const isDenied = accessState === 'denied' || accessState === 'unauthorized';
   const isUnavailable = accessState === 'unavailable';
+  const title = isPending ? 'Waiting for approval' : isDenied ? 'Access denied' : isUnavailable ? 'Approval unavailable' : 'Authorize this browser';
+  const detail = isPending
+    ? 'Click Allow in the native macOS popup. Approved browsers stay remembered until revoked; Deny is the default and access is limited to this Mac.'
+    : isUnavailable
+    ? 'Scriptd cannot present the approval prompt in this GUI session. Sign in to an interactive desktop session, then try again.'
+    : isDenied
+    ? 'This browser was not approved. You can request access again, or revoke other profiles from Settings after another browser is authorized.'
+    : 'Request access through the native macOS popup. Approved browsers stay remembered until revoked; access is limited to this Mac.';
   return h('div', { class: 'content-stack' },
-    h('div', { class: 'welcome' },
-      h('p', { class: 'eyebrow' }, 'BROWSER ACCESS'),
-      h('h2', null, isPending ? 'Waiting for approval…' : 'Authorize this browser'),
+    h('section', { class: 'card authorization-panel' },
+      h('div', { class: 'card-heading' }, h('p', { class: 'eyebrow' }, 'BROWSER ACCESS'), h('h2', null, title)),
       isPending && pendingIdentifier ? h('p', { class: 'identifier' }, 'Identifier: ' + pendingIdentifier) : null,
-      h('p', null, isPending
-        ? 'Click Allow in the native macOS popup to grant this browser access to Scriptd. The request expires in two minutes.'
-        : isUnavailable
-        ? 'Scriptd cannot present the approval prompt in your current GUI session. Make sure you are logged in to an interactive desktop session.'
-        : 'This browser needs your approval to manage Scriptd. Click the button below to request access through a native macOS popup.'),
+      h('p', null, detail),
       isPending
-        ? h('div', { class: 'spinner' }, 'Waiting…')
-        : button('Request access', requestAccess, 'button primary', { disabled: isUnavailable })),
-    h('div', { class: 'note-card' },
-      h('h3', null, 'About this access'),
-      h('p', null, 'Approved browsers are remembered until you revoke them. Access is limited to browsers on this Mac; remote access is not available through this interface.'),
-      h('p', null, 'The native popup asks whether to allow this browser to manage Scriptd. Deny is the default for security.'))
+        ? h('div', { class: 'spinner', role: 'status' }, 'Waiting…')
+        : button(isDenied ? 'Request access again' : 'Request access', requestAccess, 'button primary', { disabled: isUnavailable }))
   );
 }
 
@@ -714,66 +807,69 @@ function Overview() {
   const info = activeModule();
   const service = appState.snapshot && appState.snapshot.service || {};
   if (!info) {
-    const modules = appState.snapshot && appState.snapshot.modules || [];
+    const modules = MODULES.map(item => {
+      const module = moduleInfo(item.id);
+      return Object.assign({}, item, { name: moduleDisplayName(item.id), module });
+    });
     return h('div', { class: 'content-stack' },
-      h('div', { class: 'welcome' }, h('p', { class: 'eyebrow' }, 'CONTROL CENTER'), h('h2', null, 'Your modules, one place.'),
-        h('p', null, 'Review service health, module configuration, scheduled work, and recent outcomes. The service runs independently of this browser.')),
-      h('div', { class: 'metric-grid' }, metric('Service', service.running ? 'Running' : (appState.snapshot ? 'Offline' : 'Unknown'), service.pid ? 'Process ' + service.pid : (appState.snapshot ? 'No active supervisor' : 'Not observed yet')),
-        metric('Modules', modules.length, 'Configured and discovered modules'),
+      h('div', { class: 'metric-grid compact-summary' },
+        metric('Service', service.running ? 'Running' : (appState.snapshot ? 'Offline' : 'Unknown'), service.pid ? 'PID ' + service.pid : (appState.snapshot ? 'No active supervisor' : 'Not observed yet')),
         metric('Configuration', configurationApplicationState(appState.snapshot), service.reload_error || 'Compared with the saved service document')),
-      card('Modules', h('div', { class: 'module-cards' }, MODULES.map(item => {
-        const module = moduleInfo(item.id);
-        return h('button', { type: 'button', class: 'module-card', onClick: () => navigate(item.id) },
-          h('span', { class: 'module-card-top' }, badge(item.id, 'module-id'), healthText(module)),
-          h('strong', null, item.name), h('span', { class: 'muted' }, module.message || module.last_error || 'Open module details'));
-      }))),
-      card('Service status', h('div', { class: 'key-values' },
-        row('Runtime', service.running ? 'Running' : (appState.snapshot ? 'Unavailable' : 'Not observed yet')),
-        row('PID', service.pid || '—'),
-        row('Loaded configuration', service.loaded_digest || 'Unknown'),
-        row('Last reload error', service.reload_error || 'None')
-      ), 'The browser reads observations from scriptd and never controls service lifetime.')
+      card('Modules', h('div', { class: 'module-cards' }, modules.map(item =>
+        h('button', { type: 'button', class: 'module-card', onClick: () => navigate(item.id) },
+          h('span', { class: 'module-card-top' }, badge(item.id, 'module-id'), healthText(item.module)),
+          h('strong', null, moduleDisplayName(item.id)),
+          h('span', { class: 'muted' }, item.module.message || item.module.last_error || 'Open module details'))
+      )))
     );
   }
   return moduleOverview(info);
 }
 
 function row(label, value) {
-  return h('div', { class: 'key-row' }, h('span', null, label), h('strong', null, value == null || value === '' ? '—' : String(value)));
+  return h('div', { class: 'key-row' }, h('span', null, label), h('strong', null, displayValue(value)));
 }
+
 function moduleOverview(info) {
-  const outcomes = info.outcomes || [];
+  const outcomes = Array.isArray(info.outcomes) ? info.outcomes : [];
   const last = outcomes.length ? outcomes[outcomes.length - 1] : null;
   const jobs = ((appState.snapshot && appState.snapshot.jobs) || []).filter(job => job.module === info.id);
   const lastJob = jobs.length ? jobs[jobs.length - 1] : null;
   const brew = info.id === 'mbrew';
   const packages = brew && info.outcomes && Array.isArray(info.outcomes.packages) ? info.outcomes.packages : [];
   const pending = packages.filter(item => item.retry);
+  const observed = info.module_status && typeof info.module_status === 'object'
+    ? Object.entries(info.module_status).map(([key, value]) => key + ': ' + displayValue(value)).join(' · ')
+    : displayValue(info.module_status);
+  const statusRows = [
+    row('Health', statusLabel(info)),
+    row('Enabled', info.enabled ? 'Yes' : 'No'),
+    row('Configuration', info.valid ? 'Valid' : 'Invalid'),
+    row('Last run', formatTimestamp(info.last_run_at)),
+    row('Next evaluation', formatTimestamp(info.next_run_at) === '—' ? 'Not scheduled' : formatTimestamp(info.next_run_at)),
+    row('Trigger state', formatTriggerState(info.trigger_state)),
+    observed && observed !== '—' ? row('Observed results', observed) : null,
+    last ? row('Last outcome', last.message || last.state || last.outcome || 'Recorded') : null
+  ].filter(Boolean);
   return h('div', { class: 'content-stack' },
-    h('div', { class: 'module-title-row' }, h('div', null, h('p', { class: 'eyebrow' }, info.id), h('h2', null, info.name || info.id)),
+    h('div', { class: 'module-title-row' }, h('div', null, h('p', { class: 'eyebrow' }, info.id), h('h2', null, moduleDisplayName(info.id))),
       h('div', { class: 'module-title-status' }, healthText(info), info.enabled ? badge('Enabled', 'good') : badge('Disabled', 'muted'))),
     h('div', { class: 'metric-grid' },
-      metric('Last run', info.last_run_at || 'No run recorded', last && (last.state || last.outcome)),
-      metric('Next evaluation', info.next_run_at || 'Not scheduled', info.trigger_state || 'From service scheduler'),
+      metric('Last run', formatTimestamp(info.last_run_at) === '—' ? 'No run recorded' : formatTimestamp(info.last_run_at), last && displayValue(last.state || last.outcome)),
+      metric('Next evaluation', formatTimestamp(info.next_run_at) === '—' ? 'Not scheduled' : formatTimestamp(info.next_run_at), formatTriggerState(info.trigger_state)),
       metric('Pending work', brew ? (pending.length || 'None') : (lastJob && ['queued', 'running'].includes(lastJob.state) ? lastJob.state : '—'),
         brew ? 'Casks waiting for retry' : 'Manual request state')),
     info.last_error ? h('div', { class: 'alert danger', role: 'status' }, h('strong', null, 'Needs attention'), h('span', null, info.last_error)) : null,
-    h('div', { class: 'two-col' },
-      card('Module status', h('div', { class: 'key-values' },
-        row('Health', statusLabel(info)), row('Configuration', info.valid ? 'Valid' : 'Invalid'),
-        row('Runtime status', info.module_status && typeof info.module_status === 'object'
-          ? Object.entries(info.module_status).map(([key, value]) => key + ': ' + (typeof value === 'object' ? JSON.stringify(value) : String(value))).join(' · ')
-          : info.module_status || 'Not reported'), row('Last outcome', last && (last.message || last.state) || 'No recorded outcome')
-      )),
-      card(brew ? 'Homebrew maintenance' : 'Recent outcome', h('div', { class: 'key-values' },
-        brew ? row('Privilege helper', info.privilege_helper || 'Not configured; privileged broker bridge is inactive') : row('Last successful action', last && last.action || '—'),
-        row('Updated', info.updated || '—'), row('Deferred', info.deferred || '—'),
-        row('Failed', info.failed || '—'),
-        brew ? row('Formula maintenance', info.outcomes && info.outcomes.formula_error || 'No stage error') : null,
-        brew ? row('Cask scan', info.outcomes && info.outcomes.cask_error || 'No stage error') : null,
-        brew ? row('Cleanup', info.outcomes && info.outcomes.cleanup_error || 'No stage error') : null
-      ))
-    ),
+    card('Module status', h('div', { class: 'key-values' }, statusRows)),
+    brew ? card('Homebrew maintenance', h('div', { class: 'key-values' },
+      row('Privilege helper', info.privilege_helper || 'Not configured; privileged broker bridge is inactive'),
+      info.updated != null ? row('Updated', info.updated) : null,
+      info.deferred != null ? row('Deferred', info.deferred) : null,
+      info.failed != null ? row('Failed', info.failed) : null,
+      row('Formula maintenance', info.outcomes && info.outcomes.formula_error || 'No stage error'),
+      row('Cask scan', info.outcomes && info.outcomes.cask_error || 'No stage error'),
+      row('Cleanup', info.outcomes && info.outcomes.cleanup_error || 'No stage error')
+    )) : null,
     brew && packages.length ? card('Cask retry ledger', h('ul', { class: 'activity-list' }, packages.slice(-8).reverse().map(item =>
       h('li', null, badge(item.state || 'record', item.state === 'attention' ? 'danger' : item.retry ? 'warn' : 'good'),
         h('span', null, item.name + (item.reason ? ' · ' + item.reason : '')),
@@ -782,10 +878,10 @@ function moduleOverview(info) {
       h('li', null, badge(job.state, job.state === 'failed' || job.state === 'interrupted' ? 'danger' : job.state === 'running' ? 'warn' : 'muted'),
         h('span', null, (job.action || 'manual run') + (job.message ? ' · ' + job.message : '')),
         h('time', null, job.id))))) : null,
-    card('Recent activity', Array.isArray(outcomes) && outcomes.length ? h('ul', { class: 'activity-list' }, outcomes.slice(-6).reverse().map(item =>
+    outcomes.length ? card('Recent activity', h('ul', { class: 'activity-list' }, outcomes.slice(-6).reverse().map(item =>
       h('li', null, badge(item.state || item.outcome || 'record', item.state === 'failed' ? 'danger' : 'muted'),
         h('span', null, item.message || item.package || item.action || 'Maintenance event'),
-        h('time', null, item.at || item.timestamp || '')))) : h('p', { class: 'empty-state' }, 'No recent module outcomes are available.'))
+        h('time', null, formatTimestamp(item.at || item.timestamp)))))) : null
   );
 }
 
@@ -806,12 +902,14 @@ function SettingsView() {
       h('h3', null, 'Basic'), h('div', { class: 'settings-grid' }, profile.basic.map(key => settingField(id, key, settings))),
       profile.advanced.length ? h('details', { class: 'advanced-settings' }, h('summary', null, 'Advanced settings'),
         h('div', { class: 'settings-grid' }, profile.advanced.map(key => settingField(id, key, settings)))) : null),
-    h('div', { class: 'editor-toolbar' }, h('span', null, id ? 'Module configuration · ' + id : 'Shared service configuration'),
-    h('span', null, sourceDigest(id) ? 'Base ' + sourceDigest(id).slice(0, 19) + '…' : (appState.snapshot ? 'Service unavailable' : 'Not observed yet'))),
-    h('label', { class: 'field-label', for: 'yaml-editor' }, 'YAML configuration'),
-    h('textarea', { id: 'yaml-editor', class: 'yaml-editor', spellcheck: false, autocapitalize: 'off', autocorrect: 'off',
-      value: current, onInput: event => updateDraft(id, event.currentTarget.value), 'aria-describedby': 'yaml-help' }),
-    h('p', { id: 'yaml-help', class: 'muted' }, 'The editor preserves the existing Rust parser and atomic save path. Use the module’s configuration file format.'),
+    h('details', { class: 'advanced-settings yaml-advanced' },
+      h('summary', null, 'Advanced YAML'),
+      h('div', { class: 'editor-toolbar' }, h('span', null, id ? 'Module configuration · ' + id : 'Shared service configuration'),
+        h('span', null, sourceDigest(id) ? 'Base ' + sourceDigest(id).slice(0, 19) + '…' : (appState.snapshot ? 'Service unavailable' : 'Not observed yet'))),
+      h('label', { class: 'field-label', for: 'yaml-editor' }, 'YAML configuration'),
+      h('textarea', { id: 'yaml-editor', class: 'yaml-editor', spellcheck: false, autocapitalize: 'off', autocorrect: 'off',
+        value: current, onInput: event => updateDraft(id, event.currentTarget.value), 'aria-describedby': 'yaml-help' }),
+      h('p', { id: 'yaml-help', class: 'muted' }, 'The editor preserves the existing Rust parser and atomic save path. Use the module’s configuration file format.')),
     h('div', { class: 'editor-actions' }, button('Review changes', () => reviewSave(id), 'button primary', { disabled: !isDirty(id) }),
       button('Reset draft', () => discardDraft(id), 'button subtle', { disabled: !isDirty(id) }))
   );
@@ -860,25 +958,32 @@ function TriggersView() {
   const info = activeModule();
   const moduleId = info && info.id;
   const triggers = info && info.triggers || {};
-  const serviceName = moduleId ? 'modules.' + moduleId + '.triggers' : 'modules';
+  const entries = Object.entries(triggers);
   return h('div', { class: 'content-stack' },
     h('div', { class: 'section-intro' }, h('div', null, h('h2', null, 'Trigger rules'),
-      h('p', null, 'The supervisor owns evaluation. Edit the service YAML to change schedules, AND/OR conditions, fire policies, or reset rules.')),
+      h('p', null, 'The supervisor owns evaluation. Edit schedules, conditions, fire policies, or reset rules here, then stage them into the shared service draft.')),
       badge('Backend evaluated', 'muted')),
     card('Current evaluation', h('div', { class: 'key-values' },
-      row('Scope', serviceName), row('Last result', info && JSON.stringify(info.trigger_state || {}) || 'No evaluation recorded'),
-      row('Next scheduled time', info && info.next_run_at || 'Not scheduled'))),
-    moduleId ? Object.entries(triggers).length ? Object.entries(triggers).map(([name, trigger]) =>
-      card(name, h('div', { class: 'trigger-meta' }, badge(trigger.enabled === false ? 'Disabled' : 'Enabled', trigger.enabled === false ? 'muted' : 'good'),
-        trigger.action ? badge('Action: ' + trigger.action, 'module-id') : null,
-        badge('Fire: ' + ((trigger.fire && trigger.fire.mode) || 'every_match'), 'muted')),
-        h('div', { class: 'condition-tree' }, renderCondition(trigger.when, 0)),
-        trigger.fire && trigger.fire.mode === 'latched' ? h('pre', { class: 'trigger-policy' }, JSON.stringify(trigger.fire, null, 2)) : null))
-      : card('No module triggers', h('p', { class: 'empty-state' }, 'No trigger definitions are configured for this module.')) : null,
+      row('Module', moduleDisplayName(moduleId)),
+      row('Last result', formatTriggerState(info && info.trigger_state)),
+      row('Next scheduled time', formatTimestamp(info && info.next_run_at) === '—' ? 'Not scheduled' : formatTimestamp(info && info.next_run_at)))),
+    moduleId ? (entries.length ? entries.map(([name, trigger]) =>
+      h('details', { class: 'trigger-rule card', key: name },
+        h('summary', { class: 'trigger-summary' },
+          h('strong', null, name),
+          badge(trigger.enabled === false ? 'Disabled' : 'Enabled', trigger.enabled === false ? 'muted' : 'good'),
+          trigger.action ? badge('Action: ' + displayValue(trigger.action), 'module-id') : null,
+          badge('Fire: ' + displayValue((trigger.fire && trigger.fire.mode) || 'every_match'), 'muted')),
+        h('div', { class: 'trigger-meta' },
+          h('div', { class: 'condition-tree' }, renderCondition(trigger.when, 0)),
+          trigger.fire && trigger.fire.mode === 'latched' ? h('details', { class: 'advanced-trigger-json' }, h('summary', null, 'Latch policy'), h('pre', { class: 'trigger-policy' }, displayValue(trigger.fire))) : null
+        )
+      )
+    ) : card('No module triggers', h('p', { class: 'empty-state' }, 'No trigger definitions are configured for this module.'))) : null,
     moduleId ? triggerEditor(moduleId, triggers) : null,
-    h('div', { class: 'alert info' }, h('strong', null, 'Edit shared triggers'),
-      h('span', null, 'Changes to this module’s trigger policy are part of service.yaml. Review and save from the shared configuration editor.')),
-    button('Open service configuration', () => { appState = Object.assign({}, appState, { module: null, section: 'service', tab: 'Settings' }); renderApp(); }, 'button')
+    h('div', { class: 'alert info' }, h('strong', null, 'Staging destination'),
+      h('span', null, 'Validated trigger edits become part of service.yaml. Review and save them from Service → Settings.')),
+    button('Open service configuration', () => { appState = Object.assign({}, appState, { module: null, section: 'service', tab: 'Settings' }); renderApp(); }, 'button primary')
   );
 }
 
@@ -1006,16 +1111,20 @@ function renderCondition(condition, depth) {
 
 function LogsView() {
   return h('div', { class: 'content-stack' },
-    h('div', { class: 'section-intro' }, h('div', null, h('h2', null, 'Logs'), h('p', null, 'Search the bounded service log tail. Browser observations do not sample module sensors.')),
-      h('label', { class: 'toggle' }, h('input', { type: 'checkbox', checked: appState.follow, onChange: event => setState({ follow: event.currentTarget.checked }) }), 'Follow')),
+    h('div', { class: 'section-intro' }, h('div', null, h('h2', null, 'Logs'), h('p', null, 'Search the bounded service log tail. Browser observations do not sample module sensors.'))),
     h('div', { class: 'log-controls' },
-      h('label', null, 'Severity', h('select', { value: appState.severity, onChange: event => { setState({ severity: event.currentTarget.value }); loadLogs(); } },
+      h('label', null, 'Severity', h('select', { value: appState.severity, onChange: event => { setState({ severity: event.currentTarget.value }); loadLogs({ force: true }); } },
         ['all', 'error', 'warn', 'info'].map(level => h('option', { value: level }, level)))),
-    h('label', { class: 'search-label' }, 'Search', h('input', { type: 'search', value: appState.search, onInput: event => setState({ search: event.currentTarget.value }), onKeyDown: event => { if (event.key === 'Enter') loadLogs(); }, placeholder: 'Filter log lines' })),
-      button('Search', loadLogs, 'button'))
-    ,
-    h('pre', { class: 'log-view', 'aria-live': appState.follow ? 'polite' : 'off' }, appState.logs.length ? appState.logs.join('\n') : 'No log entries loaded.'),
-    button('Load latest', loadLogs, 'button subtle')
+      h('label', { class: 'search-label' }, 'Search', h('input', { type: 'search', value: appState.search, onInput: event => setState({ search: event.currentTarget.value }), onKeyDown: event => { if (event.key === 'Enter') loadLogs({ force: true }); }, placeholder: 'Filter log lines' })),
+      h('label', { class: 'inline-check' }, h('input', { type: 'checkbox', checked: appState.follow, onChange: event => {
+        const follow = event.currentTarget.checked;
+        setState({ follow });
+        openEventStream(connectionGeneration);
+        if (follow) loadLogs({ force: true });
+      } }), 'Follow'),
+      button('Refresh', () => loadLogs({ force: true }), 'button')
+    ),
+    h('pre', { class: 'log-view', 'aria-live': appState.follow ? 'polite' : 'off' }, appState.logs.length ? appState.logs.join('\n') : 'No log entries loaded.')
   );
 }
 
@@ -1024,26 +1133,30 @@ function ServiceView() {
   return h('div', { class: 'content-stack' },
     h('div', { class: 'welcome compact' }, h('p', { class: 'eyebrow' }, 'RUNTIME'), h('h2', null, service.running ? 'The service is running.' : (appState.snapshot ? 'The service is not connected.' : 'The service has not been observed yet.')),
       h('p', null, 'This browser control center observes and sends explicit requests. It does not start, stop, or restart the service.')),
-    h('div', { class: 'metric-grid' }, metric('Status', service.running ? 'Running' : (appState.snapshot ? 'Offline' : 'Unknown'), service.pid ? 'PID ' + service.pid : ''),
-      metric('Loaded configuration', configurationApplicationState(appState.snapshot), service.loaded_digest || ''),
-      metric('Last reload error', service.reload_error ? 'Needs attention' : 'None', service.reload_error || 'No error reported')),
-    card('Service lifecycle', h('div', { class: 'key-values' }, row('Configuration saved', appState.snapshot && appState.snapshot.config_digest || 'Unknown'),
-      row('Configuration applied', service.loaded_digest || 'Unknown'), row('Restart required', service.restart_required ? 'Yes' : 'No')),
-      'Use the existing explicit CLI or launchd workflow to manage service lifecycle.')
+    card('Service details', h('div', { class: 'key-values' },
+      row('Status', service.running ? 'Running' : (appState.snapshot ? 'Offline' : 'Unknown')),
+      row('PID', service.pid || '—'),
+      row('Configuration application', configurationApplicationState(appState.snapshot)),
+      row('Configuration saved', appState.snapshot && appState.snapshot.config_digest || 'Unknown'),
+      row('Configuration applied', service.loaded_digest || 'Unknown'),
+      row('Restart required', service.restart_required ? 'Yes' : 'No'),
+      row('Last reload error', service.reload_error || 'None')
+    ), 'Use the existing explicit CLI or launchd workflow to manage service lifecycle.')
   );
 }
 
 function renderContent() {
   if (appState.accessState !== 'authorized') return AuthorizeView();
+  const available = sectionTabs();
+  const tab = available.indexOf(appState.tab) === -1 ? available[0] : appState.tab;
   if (appState.section === 'service') {
-    if (appState.tab === 'Settings') return SettingsView();
-    if (appState.tab === 'Triggers') return TriggersView();
-    if (appState.tab === 'Logs') return LogsView();
+    if (tab === 'Settings') return SettingsView();
+    if (tab === 'Logs') return LogsView();
     return ServiceView();
   }
-  if (appState.tab === 'Settings') return SettingsView();
-  if (appState.tab === 'Triggers') return TriggersView();
-  if (appState.tab === 'Logs') return LogsView();
+  if (tab === 'Settings') return SettingsView();
+  if (tab === 'Triggers') return TriggersView();
+  if (tab === 'Logs') return LogsView();
   return Overview();
 }
 
@@ -1068,6 +1181,7 @@ function Main() {
   return h('main', { id: 'content', class: 'main', tabIndex: -1 },
     h(Header),
     navigable ? h('div', { class: 'module-toolbar' }, tabsView(), navigateActions()) : null,
+    appState.observationDelayed ? h('div', { class: 'alert info', role: 'status' }, h('strong', null, 'Updates may be delayed'), h('span', null, 'Native file observation is unavailable. Changes may take up to 30 seconds to appear while this page remains open.')) : null,
     appState.message ? h('div', { class: 'alert info', role: 'status' }, appState.message, button('Dismiss', () => setState({ message: '' }), 'text-button')) : null,
     appState.error ? h('div', { class: 'alert danger', role: 'alert' }, appState.error, button('Retry', refresh, 'text-button')) : null,
     appState.loading ? h('div', { class: 'loading' }, 'Connecting to scriptd…') : renderContent()
@@ -1077,29 +1191,50 @@ function Main() {
 function Dialog() {
   const modalProps = {
     class: 'dialog',
-    ref: dialog => { if (dialog && !dialog.open) dialog.showModal(); }
+    ref: dialog => {
+      if (!dialog) return;
+      if (!dialog.open) {
+        if (!appState.dialogFocus) appState.dialogFocus = document.activeElement;
+        dialog.showModal();
+      }
+    }
   };
   if (appState.saveDiff) {
     const diff = appState.saveDiff;
-    return h('dialog', Object.assign({}, modalProps, { 'aria-labelledby': 'dialog-title', onCancel: event => { event.preventDefault(); cancelSaveReview(); } }),
+    return h('dialog', Object.assign({}, modalProps, {
+      'aria-labelledby': 'dialog-title',
+      'aria-describedby': 'dialog-description',
+      onCancel: event => { event.preventDefault(); cancelSaveReview(); }
+    }),
       h('h2', { id: 'dialog-title' }, 'Review configuration changes'),
-      h('p', null, 'The server will validate this document and compare its original digest before saving.'),
+      h('p', { id: 'dialog-description' }, 'The server will validate this document and compare its original digest before saving.'),
       h('pre', { class: 'diff-view', tabIndex: 0 }, diff.text || 'No line-by-line difference available.'),
       diff.conflict ? h('div', { class: 'alert danger' }, 'The file changed since this draft began. Reload the latest version before saving.') : null,
-      h('div', { class: 'dialog-actions' }, button('Cancel', cancelSaveReview, 'button subtle'),
+      h('div', { class: 'dialog-actions' },
+        button('Cancel', cancelSaveReview, 'button subtle'),
         button(diff.conflict ? 'Reload current file' : 'Save configuration', diff.conflict ? () => reloadDocument(diff.id) : () => saveDocument(diff.id), 'button primary', { disabled: !!diff.conflict })));
   }
-  if (appState.dialog && appState.dialog.type === 'quit') return h('dialog', Object.assign({}, modalProps, { 'aria-labelledby': 'quit-title', onCancel: event => { event.preventDefault(); stayInApp(); } }),
+  if (appState.dialog && appState.dialog.type === 'quit') return h('dialog', Object.assign({}, modalProps, {
+    'aria-labelledby': 'quit-title',
+    'aria-describedby': 'quit-description',
+    onCancel: event => { event.preventDefault(); stayInApp(); }
+  }),
     h('h2', { id: 'quit-title' }, 'Leave scriptd?'),
-    h('p', null, appState.dialog.count + (appState.dialog.count === 1 ? ' recoverable draft needs' : ' recoverable drafts need') + ' a choice. Saving reviews and validates every document before it is written.'),
+    h('p', { id: 'quit-description' }, appState.dialog.count + (appState.dialog.count === 1 ? ' recoverable draft needs' : ' recoverable drafts need') + ' a choice. Saving reviews and validates every document before it is written.'),
     appState.quitWorking ? h('p', { role: 'status' }, 'Preparing recoverable drafts…') : null,
     h('div', { class: 'dialog-actions' },
       button('Stay', stayInApp, 'button subtle', { disabled: appState.quitWorking }),
       button('Discard drafts', discardAllAndQuit, 'button danger', { disabled: appState.quitWorking }),
       button('Save drafts', saveAllAndQuit, 'button primary', { disabled: appState.quitWorking })));
-  if (appState.dialog) return h('dialog', Object.assign({}, modalProps, { 'aria-labelledby': 'confirm-title', onCancel: event => { event.preventDefault(); setState({ dialog: null }); } }),
-    h('h2', { id: 'confirm-title' }, appState.dialog.title), h('p', null, appState.dialog.text),
-    h('div', { class: 'dialog-actions' }, button('Cancel', () => setState({ dialog: null }), 'button subtle'),
+  if (appState.dialog) return h('dialog', Object.assign({}, modalProps, {
+    'aria-labelledby': 'confirm-title',
+    'aria-describedby': 'confirm-description',
+    onCancel: event => { event.preventDefault(); closeConfirmation(); }
+  }),
+    h('h2', { id: 'confirm-title' }, appState.dialog.title),
+    h('p', { id: 'confirm-description' }, appState.dialog.text),
+    h('div', { class: 'dialog-actions' },
+      button('Cancel', closeConfirmation, 'button subtle'),
       button(appState.dialog.confirmLabel, appState.dialog.onConfirm, 'button danger')));
   return null;
 }
@@ -1111,25 +1246,27 @@ function App() {
 
 function renderApp() {
   const active = activeModule();
-  document.title = (active ? active.name : appState.section === 'service' ? 'Service' : 'Overview') + ' | scriptd';
+  document.title = (active ? moduleDisplayName(active.id) : appState.section === 'service' ? 'Service' : 'Overview') + ' | scriptd';
   render(h(App), document.getElementById('app'));
-  const shouldFollowLogs = appState.tab === 'Logs' && appState.follow;
-  if (shouldFollowLogs && !logTimer) logTimer = setInterval(loadLogs, 3000);
-  if (!shouldFollowLogs && logTimer) { clearInterval(logTimer); logTimer = null; }
 }
 function refresh() { appState = Object.assign({}, appState, { loading: true }); renderApp(); connect(); }
-function loadLogs() {
+function loadLogs(options) {
+  const force = !!(options && options.force);
+  if (document.visibilityState === 'hidden' && !force) return;
+  const requestGeneration = ++logRequestGeneration;
+  const connectionAtStart = connectionGeneration;
   const info = activeModule();
   const module = info ? info.id : 'service';
   const params = new URLSearchParams({ module, severity: appState.severity, query: appState.search });
   api('/api/logs?' + params.toString()).then(data => {
+    if (requestGeneration !== logRequestGeneration || connectionAtStart !== connectionGeneration || document.visibilityState === 'hidden') return;
     const logText = data.logs || '';
     setState({ logs: logText.split('\n').filter(Boolean), error: '' });
     if (appState.follow) {
       const view = document.querySelector('.log-view');
       if (view) view.scrollTop = view.scrollHeight;
     }
-  }).catch(error => setState({ error: error.message }));
+  }).catch(error => { if (requestGeneration === logRequestGeneration && connectionAtStart === connectionGeneration) setState({ error: error.message }); });
 }
 function reviewSave(id) {
   const token = ++saveReviewToken;
@@ -1147,8 +1284,10 @@ function reviewSave(id) {
     setState({ saveDiff: { id, text: makeDiff(sourceYaml(id), draftYaml(id)), conflict: false }, error: '' });
   }).catch(error => {
     if (token !== saveReviewToken) return;
-    if (appState.quitQueue) appState = Object.assign({}, appState, { quitQueue: null, quitWorking: false });
+    const wasQuitQueue = !!appState.quitQueue;
+    if (wasQuitQueue) appState = Object.assign({}, appState, { quitQueue: null, quitWorking: false });
     setState({ error: 'Configuration validation failed: ' + error.message });
+    if (wasQuitQueue) restoreDialogFocus();
   });
 }
 function makeDiff(before, after) {
@@ -1186,15 +1325,17 @@ function saveDocument(id) {
         appState = Object.assign({}, appState, { quitQueue: null });
         persistDraftsImmediately(appState.drafts).then(closeControlCenter).catch(error => {
           setState({ quitWorking: false, error: 'Saved drafts, but could not clear their recovery copy: ' + error.message });
+          restoreDialogFocus();
         });
       }
     } else {
       persistDrafts();
+      restoreDialogFocus();
       refresh();
     }
   }).catch(error => {
     if (appState.quitQueue) appState = Object.assign({}, appState, { quitQueue: null, quitWorking: false });
-    setState({ saveDiff: null, error: error.message });
+    closeDialog({ error: error.message });
   });
 }
 function discardDraft(id) {
@@ -1207,6 +1348,7 @@ function reloadDocument(id) {
   const drafts = Object.assign({}, appState.drafts);
   delete drafts[docKey(id)];
   appState = Object.assign({}, appState, { drafts, saveDiff: null, quitQueue: null, quitWorking: false });
+  restoreDialogFocus();
   persistDrafts();
   refresh();
 }
@@ -1221,18 +1363,18 @@ function requestQuit() {
 function stayInApp() {
   quitOperationToken++;
   saveReviewToken++;
-  setState({ dialog: null, saveDiff: null, quitQueue: null, quitWorking: false });
+  closeDialog({ quitQueue: null, quitWorking: false });
 }
 
 function cancelSaveReview() {
   saveReviewToken++;
   if (appState.quitQueue) return stayInApp();
-  setState({ saveDiff: null });
+  closeDialog();
 }
 
 function closeControlCenter() {
   quitOperationToken++;
-  setState({ dialog: null, quitQueue: null, quitWorking: false, message: 'The service continues independently. Close this browser tab to leave scriptd.' });
+  closeDialog({ quitQueue: null, quitWorking: false, message: 'The service continues independently. Close this browser tab to leave scriptd.' }, false);
   window.close();
 }
 
@@ -1296,7 +1438,7 @@ async function saveAllAndQuit() {
     reviewSave(queue[0] === 'service' ? null : queue[0].slice('module:'.length));
   } catch (error) {
     if (token !== quitOperationToken) return;
-    setState({ dialog: null, quitWorking: false, quitQueue: null, error: 'Could not prepare every draft for saving: ' + error.message });
+    closeDialog({ quitWorking: false, quitQueue: null, error: 'Could not prepare every draft for saving: ' + error.message });
   }
 }
 function confirmRun(id, action) {
@@ -1309,12 +1451,22 @@ function confirmReboot(id) {
 }
 function runModule(id, action) { execute(id, action || null, 'bypass-global-triggers'); }
 function execute(id, action, confirm) {
-  setState({ dialog: null, error: '' });
+  closeConfirmation({ error: '' });
   const requestId = crypto.randomUUID();
   api('/api/run', { method: 'POST', body: JSON.stringify({ module: id, action, confirm, request_id: requestId }) })
     .then(response => setState({ message: 'Request ' + requestId + ' is ' + (response.state || 'accepted') + '.', error: '' }))
     .catch(error => setState({ error: error.message }));
 }
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') {
+    connectionGeneration++;
+    clearTimeout(reconnectTimer); reconnectTimer = null;
+    closeEventStream();
+    logRequestGeneration++;
+  } else {
+    connect();
+  }
+});
 window.addEventListener('beforeunload', event => {
   if (Object.keys(appState.drafts).some(key => appState.drafts[key].yaml !== undefined || appState.drafts[key].trigger_json !== undefined)) {
     event.preventDefault();
@@ -1322,11 +1474,7 @@ window.addEventListener('beforeunload', event => {
   }
 });
 window.addEventListener('keydown', event => {
-  if (event.key === 'Escape' && (appState.dialog || appState.saveDiff)) {
-    if (appState.quitQueue) stayInApp();
-    else if (appState.saveDiff) cancelSaveReview();
-    else setState({ dialog: null });
-  } else if (event.key === 'Escape' && appState.mobileNavOpen) {
+  if (event.key === 'Escape' && appState.mobileNavOpen && !appState.dialog && !appState.saveDiff) {
     event.preventDefault();
     const navigation = document.getElementById('primary-navigation');
     const toggle = document.getElementById('mobile-nav-toggle');

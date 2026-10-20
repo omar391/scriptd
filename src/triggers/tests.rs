@@ -139,6 +139,39 @@ fn sensor_requirements_follow_the_active_trigger_phase() {
 }
 
 #[test]
+fn time_windows_keep_continuous_evaluation_active_only_for_the_live_condition() {
+    let rule = parse_rule(
+        r#"
+enabled: true
+module: miwatch
+fire:
+  mode: latched
+  after: { consecutive_matches: 2, minimum_seconds: 30 }
+  reset:
+    after: { consecutive_matches: 1, minimum_seconds: 0 }
+    when: { schedule: { every_minutes: 5 } }
+when: { time_window: { timezone: UTC, start: "05:00", end: "06:00" } }
+"#,
+    );
+    let runtime = TriggerRuntime::new("miwatch.window".to_string(), rule.clone(), at(0), None);
+    assert!(runtime.requires_continuous_evaluation());
+
+    let latched = TriggerRuntime::new(
+        "miwatch.window".to_string(),
+        rule.clone(),
+        at(0),
+        Some(TriggerState {
+            phase: TriggerPhase::Latched,
+            ..TriggerState::default()
+        }),
+    );
+    assert!(!latched.requires_continuous_evaluation());
+
+    let scheduled = TriggerRuntime::new("miwatch.window".to_string(), miwatch_rule(), at(0), None);
+    assert!(scheduled.next_wake().is_some());
+}
+
+#[test]
 fn parser_rejects_empty_boolean_group() {
     let config: TriggerConfig = serde_yaml::from_str(
         r#"

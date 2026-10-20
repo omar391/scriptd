@@ -4,6 +4,7 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -186,7 +187,9 @@ struct RunningSupervisor {
     watcher: Option<RecommendedWatcher>,
     reload_receiver: Option<UnboundedReceiver<()>>,
     wifi_event_watcher: Option<WifiEventWatcher>,
+    wifi_event_sender: UnboundedSender<()>,
     wifi_event_receiver: Option<UnboundedReceiver<()>>,
+    control_wake: Arc<tokio::sync::Notify>,
     last_state_fingerprint: Option<String>,
     control_paths: ControlPaths,
     broker: std::sync::Arc<std::sync::Mutex<crate::broker::Broker>>,
@@ -339,7 +342,7 @@ impl RunningSupervisor {
         );
 
         let (wifi_sender, wifi_event_receiver) = unbounded_channel();
-        let wifi_event_watcher = SensorSuite::spawn_wifi_event_watcher(wifi_sender);
+        let control_wake = Arc::new(tokio::sync::Notify::new());
         let control_paths = control::paths_for(root, &config.state_dir);
         let caller_uid = control_peer_uid().unwrap_or_else(|_| unsafe { libc::geteuid() });
         let broker_policy =
@@ -372,7 +375,8 @@ impl RunningSupervisor {
             sensors: SensorSuite::default(),
             watcher: None,
             reload_receiver: None,
-            wifi_event_watcher,
+            wifi_event_watcher: None,
+            wifi_event_sender: wifi_sender,
             wifi_event_receiver: Some(wifi_event_receiver),
             last_state_fingerprint: None,
             control_paths,
@@ -384,8 +388,10 @@ impl RunningSupervisor {
             work: VecDeque::new(),
             inflight: BTreeSet::new(),
             worker: None,
+            control_wake: Arc::clone(&control_wake),
         };
         supervisor.update_module_next_wakes();
+        supervisor.reconcile_wifi_observation();
         Ok(supervisor)
     }
 
@@ -396,7 +402,10 @@ impl RunningSupervisor {
                 if let Ok(event) = event {
                     if matches!(
                         event.kind,
-                        EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
+                        EventKind::Any
+                            | EventKind::Create(_)
+                            | EventKind::Modify(_)
+                            | EventKind::Remove(_)
                     ) {
                         let _ = tx.send(());
                     }
@@ -479,11 +488,29 @@ impl RunningSupervisor {
             .collect();
         self.triggers = build_trigger_runtimes(&config, Utc::now(), Some(&prior));
         self.update_module_next_wakes();
+        self.reconcile_wifi_observation();
         Ok(())
     }
 
-    fn next_run_delay(&self, now: DateTime<Utc>) -> Duration {
-        self.triggers
+    fn needs_continuous_observation(&self) -> bool {
+        let (ssids, applications, needs_wifi_power) = self.collect_sensor_requirements();
+        needs_wifi_power || !ssids.is_empty() || !applications.is_empty()
+    }
+
+    fn needs_continuous_evaluation(&self) -> bool {
+        self.triggers.values().any(|trigger| {
+            trigger.enabled()
+                && self
+                    .modules
+                    .get(trigger.module())
+                    .is_some_and(|module| module.desired_enabled)
+                && trigger.requires_continuous_evaluation()
+        })
+    }
+
+    fn next_run_delay(&self, now: DateTime<Utc>) -> Option<Duration> {
+        let scheduled = self
+            .triggers
             .values()
             .filter(|trigger| {
                 trigger.enabled()
@@ -494,9 +521,16 @@ impl RunningSupervisor {
             })
             .filter_map(TriggerRuntime::next_wake)
             .map(|wake| wake.signed_duration_since(now).to_std().unwrap_or_default())
-            .min()
-            .unwrap_or(SENSOR_POLL_FALLBACK)
-            .min(SENSOR_POLL_FALLBACK)
+            .min();
+        if self.needs_continuous_observation() || self.needs_continuous_evaluation() {
+            Some(
+                scheduled
+                    .unwrap_or(SENSOR_POLL_FALLBACK)
+                    .min(SENSOR_POLL_FALLBACK),
+            )
+        } else {
+            scheduled
+        }
     }
 
     fn persisted_trigger_states(&self) -> BTreeMap<String, PersistedTriggerState> {
@@ -577,6 +611,21 @@ impl RunningSupervisor {
         .context("persist supervisor state")?;
         self.last_state_fingerprint = Some(fingerprint);
         Ok(())
+    }
+
+    fn reconcile_wifi_observation(&mut self) {
+        let needs_wifi = {
+            let (ssids, _, needs_wifi_power) = self.collect_sensor_requirements();
+            needs_wifi_power || !ssids.is_empty()
+        };
+        if needs_wifi {
+            if self.wifi_event_watcher.is_none() {
+                self.wifi_event_watcher =
+                    SensorSuite::spawn_wifi_event_watcher(self.wifi_event_sender.clone());
+            }
+        } else {
+            self.wifi_event_watcher = None;
+        }
     }
 
     fn collect_sensor_requirements(&self) -> (BTreeSet<String>, BTreeSet<String>, bool) {
@@ -680,19 +729,28 @@ impl RunningSupervisor {
             self.pump_execution()?;
             let mut delay = self.next_run_delay(Utc::now());
             if self.control_center && self.browser_bridge.is_none() {
-                delay = delay.min(Duration::from_secs(5));
+                let retry = Duration::from_secs(5)
+                    .saturating_sub(self.last_control_center_attempt.elapsed());
+                delay = Some(delay.unwrap_or(retry).min(retry));
             }
             if self.worker.is_some() || !self.work.is_empty() {
-                delay = delay.min(Duration::from_millis(250));
+                delay = Some(
+                    delay
+                        .unwrap_or(Duration::from_millis(250))
+                        .min(Duration::from_millis(250)),
+                );
             }
-            if delay == Duration::ZERO {
-                delay = Duration::from_millis(250);
-            }
+            let delay = match delay {
+                Some(Duration::ZERO) => Duration::from_millis(250),
+                Some(value) => value,
+                None => Duration::from_secs(60 * 60 * 24),
+            };
             let wakeup_at = Instant::now() + delay;
 
             if self.reload_receiver.is_some() {
                 select! {
                     _ = sleep_until(wakeup_at) => {}
+                    _ = self.control_wake.notified() => {}
                     event = receive_optional_event(&mut self.reload_receiver) => {
                         if event.is_some() {
                             sleep(Duration::from_millis(250)).await;
@@ -718,6 +776,7 @@ impl RunningSupervisor {
             } else {
                 select! {
                     _ = sleep_until(wakeup_at) => {}
+                    _ = self.control_wake.notified() => {}
                     event = receive_optional_event(&mut self.wifi_event_receiver) => {
                         if event.is_none() {
                             self.wifi_event_receiver = None;
@@ -1228,10 +1287,14 @@ async fn run_supervisor_async(root: PathBuf) -> Result<()> {
     let mut supervisor = RunningSupervisor::build(&root, config, registry, singleton_lock)?;
     let _ = control::recover_interrupted(&supervisor.control_paths);
     let uid = control_peer_uid()?;
+    let control_wake = Arc::clone(&supervisor.control_wake);
     supervisor.control_server = Some(control::spawn_server(
         supervisor.control_paths.clone(),
         uid,
         std::sync::Arc::clone(&supervisor.broker),
+        Arc::new(move || {
+            control_wake.notify_one();
+        }),
     )?);
     let digest = std::fs::read(&supervisor.config_path)
         .ok()

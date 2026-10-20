@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 
 use std::net::TcpStream;
@@ -18,6 +19,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::stream;
+use notify::{recommended_watcher, RecursiveMode, Watcher};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::{watch, Notify};
@@ -26,6 +28,7 @@ use crate::access::{self, AccessController, AccessState};
 use crate::control::{self, ControlPaths};
 use crate::grants::GrantsStore;
 use crate::paths::{self, write_private_atomic};
+use crate::snapshot_cache::{Snapshot, SnapshotCache};
 
 const INDEX: &str = include_str!("../assets/web/index.html");
 
@@ -53,6 +56,21 @@ pub fn host_allowed(value: &str, port: u16) -> bool {
     value == format!("127.0.0.1:{port}")
 }
 
+/// Parses an operator-supplied control-center port.
+fn parse_browser_port(raw: Option<&str>) -> Option<u16> {
+    raw.map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|port| *port > 0)
+}
+
+/// Loopback port for the control center. `SCRIPTD_BROWSER_PORT` selects another
+/// port so an isolated instance can run beside the service.
+pub fn browser_port() -> u16 {
+    parse_browser_port(std::env::var("SCRIPTD_BROWSER_PORT").ok().as_deref())
+        .unwrap_or(DEFAULT_BROWSER_PORT)
+}
+
 pub fn origin_allowed(value: Option<&str>, port: u16) -> bool {
     matches!(value, Some(origin) if origin == format!("http://127.0.0.1:{port}"))
 }
@@ -65,6 +83,11 @@ struct AppState {
     shutdown: Notify,
     stopping: watch::Sender<bool>,
     access: AccessController,
+    snapshot_cache: Arc<SnapshotCache>,
+    idle_changed: Notify,
+    logs_notify: watch::Sender<u64>,
+    auth_changed: Arc<Notify>,
+    observation_degraded: watch::Sender<bool>,
 }
 
 struct ConnectionGuard(Arc<AppState>);
@@ -75,13 +98,18 @@ impl Drop for ConnectionGuard {
         if let Ok(mut slot) = self.0.last_disconnect.lock() {
             *slot = Instant::now();
         }
+        self.0.idle_changed.notify_one();
     }
 }
 
+/// The persistent bridge runs until the service stops; only detached bridges
+/// apply the inactivity grace, so these helpers exist for the shutdown tests.
+#[cfg(test)]
 fn shutdown_due(connections: usize, last_disconnect: Instant, now: Instant) -> bool {
     connections == 0 && now.saturating_duration_since(last_disconnect) >= Duration::from_secs(600)
 }
 
+#[cfg(test)]
 fn detached_shutdown_due(
     persistent: bool,
     connections: usize,
@@ -109,15 +137,13 @@ pub fn open_control_center(root: &Path, log_dir: &Path) -> Result<()> {
         root,
         log_dir,
     )?;
+    let port = browser_port();
     for _ in 0..50 {
         if let Ok(_) = TcpStream::connect_timeout(
-            &format!("127.0.0.1:{}", DEFAULT_BROWSER_PORT)
-                .parse()
-                .ok()
-                .unwrap(),
+            &format!("127.0.0.1:{port}").parse().ok().unwrap(),
             Duration::from_millis(100),
         ) {
-            return open_url(&format!("http://127.0.0.1:{}", DEFAULT_BROWSER_PORT));
+            return open_url(&format!("http://127.0.0.1:{port}"));
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -127,6 +153,41 @@ pub fn open_control_center(root: &Path, log_dir: &Path) -> Result<()> {
 /// Starts a detached browser bridge process for `root`, reusing one that already answers.
 pub fn spawn_bridge(exe: &Path, root: &Path, log_dir: &Path) -> Result<()> {
     spawn_bridge_process(exe, root, log_dir).map(|_| ())
+}
+
+fn update_log_watch<W: Watcher>(
+    watcher: &mut W,
+    registered_targets: &mut HashSet<PathBuf>,
+    scope: &mut crate::observation::WatchScope,
+    log_dir: &Path,
+) -> bool {
+    let resolved = crate::observation::canonical(log_dir);
+    if resolved == scope.log_dir {
+        return true;
+    }
+
+    let next_scope = crate::observation::WatchScope::new(&scope.state_dir, &scope.repo, &resolved);
+    if !registered_targets.contains(&resolved)
+        && watcher
+            .watch(&resolved, RecursiveMode::NonRecursive)
+            .is_err()
+    {
+        return false;
+    }
+
+    let previous_log_dir = scope.log_dir.clone();
+    registered_targets.insert(resolved);
+    *scope = next_scope;
+
+    if !scope
+        .watch_targets()
+        .iter()
+        .any(|(path, _)| path == &previous_log_dir)
+        && registered_targets.remove(&previous_log_dir)
+    {
+        let _ = watcher.unwatch(&previous_log_dir);
+    }
+    true
 }
 
 /// Owns a service control-center bridge hosted on a thread in the supervisor process.
@@ -189,7 +250,7 @@ impl Drop for ServiceBridge {
 /// supervisor process, reusing the current browser session when possible.
 pub fn start_service_bridge(root: &Path) -> Result<ServiceBridge> {
     let paths = control::browser_paths_for(root, &paths::resolve_state_dir(), 0);
-    start_service_bridge_with(paths, Some(DEFAULT_BROWSER_PORT))
+    start_service_bridge_with(paths, Some(browser_port()))
 }
 
 fn start_service_bridge_with(
@@ -272,7 +333,7 @@ pub fn serve_bridge() -> Result<()> {
         .enable_all()
         .build()
         .context("build browser runtime")?;
-    runtime.block_on(serve(paths, false, Some(DEFAULT_BROWSER_PORT), None))
+    runtime.block_on(serve(paths, false, Some(browser_port()), None))
 }
 
 async fn serve(
@@ -283,13 +344,116 @@ async fn serve(
 ) -> Result<()> {
     fs::create_dir_all(&paths.state_dir)?;
     let _instance_lock = BridgeInstanceLock::acquire(&paths.state_dir.join("browser-bridge.lock"))?;
-    let listener = TcpListener::bind(("127.0.0.1", preferred_port.unwrap_or(DEFAULT_BROWSER_PORT)))
+    let listener = TcpListener::bind(("127.0.0.1", preferred_port.unwrap_or_else(browser_port)))
         .await
         .context("bind browser listener")?;
     let port = listener.local_addr()?.port();
     let grants = GrantsStore::load(&paths).context("load browser grants")?;
     let access = AccessController::new(grants);
     let (stopping, _) = watch::channel(false);
+    let snapshot_cache = Arc::new(SnapshotCache::new());
+    let (logs_notify, _) = watch::channel(0_u64);
+    let auth_changed = Arc::new(Notify::new());
+    let (observation_degraded, _) = watch::channel(false);
+    let (observer_stop, observer_stopping) = std::sync::mpsc::channel();
+    // Watch service configuration, state, and log files. Rebuild one shared
+    // snapshot after coalescing a burst of relevant filesystem events.
+    let log_dir = crate::config::read_service_config(&paths.repo)
+        .map(|config| config.expanded_log_dir())
+        .unwrap_or_else(|_| paths.state_dir.clone());
+    let mut scope = crate::observation::WatchScope::new(&paths.state_dir, &paths.repo, &log_dir);
+    let watch_cache = Arc::clone(&snapshot_cache);
+    let log_notify = logs_notify.clone();
+    let degraded = observation_degraded.clone();
+    let observer_thread = std::thread::spawn(move || {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut watcher = match recommended_watcher(move |res: notify::Result<notify::Event>| {
+            let _ = tx.send(res);
+        }) {
+            Ok(w) => w,
+            Err(_) => {
+                degraded.send_replace(true);
+                return;
+            }
+        };
+        let mut watching = true;
+        let mut registered_targets = HashSet::new();
+        for (path, recursive) in scope.watch_targets() {
+            let mode = if recursive {
+                RecursiveMode::Recursive
+            } else {
+                RecursiveMode::NonRecursive
+            };
+            if !path.is_dir() {
+                let _ = fs::create_dir_all(&path);
+            }
+            if watcher.watch(&path, mode).is_err() {
+                watching = false;
+            } else {
+                registered_targets.insert(path);
+            }
+        }
+        if !watching {
+            degraded.send_replace(true);
+        }
+        loop {
+            if observer_stopping.try_recv().is_ok() {
+                break;
+            }
+            let res = match rx.recv_timeout(Duration::from_millis(250)) {
+                Ok(res) => res,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            };
+            match res {
+                Ok(event) => {
+                    let config_changed = event.paths.iter().any(|path| {
+                        crate::observation::canonical(path) == scope.repo.join("service.yaml")
+                    });
+                    let mut snapshot_relevant = false;
+                    let mut logs_relevant = false;
+                    for path in &event.paths {
+                        let relevance = scope.classify(path);
+                        if relevance.snapshot {
+                            snapshot_relevant = true;
+                        }
+                        if relevance.logs {
+                            logs_relevant = true;
+                        }
+                    }
+                    if snapshot_relevant {
+                        watch_cache.invalidate();
+                    }
+                    if logs_relevant {
+                        log_notify.send_modify(|revision| *revision = revision.wrapping_add(1));
+                    }
+                    if config_changed {
+                        let new_log_dir = crate::config::read_service_config(&scope.repo)
+                            .map(|config| config.expanded_log_dir())
+                            .unwrap_or_else(|_| scope.state_dir.clone());
+                        let resolved = crate::observation::canonical(&new_log_dir);
+                        if resolved != scope.log_dir {
+                            if !resolved.is_dir() {
+                                let _ = fs::create_dir_all(&resolved);
+                            }
+                            if !update_log_watch(
+                                &mut watcher,
+                                &mut registered_targets,
+                                &mut scope,
+                                &resolved,
+                            ) {
+                                degraded.send_replace(true);
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    degraded.send_replace(true);
+                }
+            }
+        }
+        drop(watcher);
+    });
     let state = Arc::new(AppState {
         port,
         paths: paths.clone(),
@@ -298,6 +462,71 @@ async fn serve(
         shutdown: Notify::new(),
         stopping,
         access,
+        snapshot_cache: Arc::clone(&snapshot_cache),
+        idle_changed: Notify::new(),
+        logs_notify: logs_notify.clone(),
+        auth_changed: auth_changed.clone(),
+        observation_degraded,
+    });
+    let refresh_state = state.clone();
+    tokio::spawn(async move {
+        loop {
+            refresh_state.snapshot_cache.invalidated().notified().await;
+            tokio::time::sleep(Duration::from_millis(75)).await;
+            if refresh_state.connections.load(Ordering::SeqCst) > 0 {
+                let _ = refresh_state
+                    .snapshot_cache
+                    .ensure_current(|| service_snapshot(&refresh_state.paths))
+                    .await;
+            }
+        }
+    });
+    // Shared 30s fallback while subscribers remain and native observation failed.
+    let fallback_state = state.clone();
+    tokio::spawn(async move {
+        let mut degraded = fallback_state.observation_degraded.subscribe();
+        loop {
+            if !*degraded.borrow() {
+                tokio::select! {
+                    changed = degraded.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                    }
+                    _ = fallback_state.idle_changed.notified() => {}
+                }
+                continue;
+            }
+            if fallback_state.connections.load(Ordering::SeqCst) == 0 {
+                tokio::select! {
+                    changed = degraded.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                    }
+                    _ = fallback_state.idle_changed.notified() => {}
+                }
+                continue;
+            }
+            tokio::select! {
+                changed = degraded.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                }
+                _ = fallback_state.idle_changed.notified() => {}
+                _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                    if fallback_state.connections.load(Ordering::SeqCst) > 0
+                        && *fallback_state.observation_degraded.borrow()
+                    {
+                        fallback_state.snapshot_cache.invalidate();
+                        fallback_state
+                            .logs_notify
+                            .send_modify(|revision| *revision = revision.wrapping_add(1));
+                    }
+                }
+            }
+        }
     });
     if let Some(ready) = ready {
         if ready
@@ -310,23 +539,32 @@ async fn serve(
             state.shutdown.notify_one();
         }
     }
-    let shutdown = state.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            let connections = shutdown.connections.load(Ordering::SeqCst);
-            let expired = shutdown
-                .last_disconnect
-                .lock()
-                .map(|slot| detached_shutdown_due(persistent, connections, *slot, Instant::now()))
-                .unwrap_or(false);
-            if expired {
-                shutdown.stopping.send_replace(true);
-                shutdown.shutdown.notify_one();
-                break;
+    if !persistent {
+        let shutdown = state.clone();
+        tokio::spawn(async move {
+            loop {
+                if shutdown.connections.load(Ordering::SeqCst) > 0 {
+                    shutdown.idle_changed.notified().await;
+                    continue;
+                }
+                let deadline = shutdown
+                    .last_disconnect
+                    .lock()
+                    .map(|slot| *slot + Duration::from_secs(600))
+                    .unwrap_or_else(|_| Instant::now() + Duration::from_secs(600));
+                tokio::select! {
+                    _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                        if shutdown.connections.load(Ordering::SeqCst) == 0 {
+                            shutdown.stopping.send_replace(true);
+                            shutdown.shutdown.notify_one();
+                            break;
+                        }
+                    }
+                    _ = shutdown.idle_changed.notified() => {}
+                }
             }
-        }
-    });
+        });
+    }
     let router = bridge_router(state.clone());
     let shutdown = state.clone();
     let server = axum::serve(listener, router).with_graceful_shutdown(async move {
@@ -343,6 +581,8 @@ async fn serve(
             tokio::time::sleep(BRIDGE_DRAIN_TIMEOUT).await;
         } => Ok(()),
     };
+    let _ = observer_stop.send(());
+    let _ = tokio::task::spawn_blocking(move || observer_thread.join()).await;
     // Persist the grants store on shutdown
     if let Err(error) = state.access.snapshot().save(&state.paths) {
         eprintln!("Failed to save browser grants: {}", error);
@@ -353,6 +593,7 @@ async fn serve(
 fn bridge_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(index))
+        .route("/favicon.svg", get(favicon))
         .route("/styles.css", get(styles))
         .route("/app.js", get(script))
         .route("/vendor/preact.module.js", get(preact))
@@ -470,6 +711,13 @@ async fn service_snapshot(paths: &ControlPaths) -> Result<(String, Value)> {
     .context("read service snapshot")?
 }
 
+async fn cached_service_snapshot(state: &AppState) -> Result<Arc<Snapshot>> {
+    state
+        .snapshot_cache
+        .ensure_current(|| service_snapshot(&state.paths))
+        .await
+}
+
 async fn dispatch_control(
     paths: &ControlPaths,
     request: control::Request,
@@ -533,6 +781,28 @@ async fn styles(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl 
         return reject(StatusCode::FORBIDDEN, "host was not accepted").into_response();
     }
     ([("content-type", "text/css; charset=utf-8")], STYLES).into_response()
+}
+
+/// A small same-origin icon so the browser does not request /favicon.ico,
+/// which the control center does not serve. The content security policy
+/// forbids data URIs, so the icon is served from this origin instead.
+const FAVICON: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <rect width="32" height="32" rx="7" fill="#1f2933"/>
+  <path d="M9 22V10h3.2v4.6h7.6V10H23v12h-3.2v-4.7h-7.6V22z" fill="#e4e7eb"/>
+</svg>"##;
+
+async fn favicon(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
+    if !host_allowed(header(&headers, "host").unwrap_or(""), state.port) {
+        return reject(StatusCode::FORBIDDEN, "host was not accepted").into_response();
+    }
+    (
+        [
+            ("content-type", "image/svg+xml; charset=utf-8"),
+            ("cache-control", "no-store"),
+        ],
+        FAVICON,
+    )
+        .into_response()
 }
 
 async fn script(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
@@ -717,6 +987,7 @@ async fn access_revoke(
         )
         .into_response();
     }
+    state.auth_changed.notify_waiters();
     Json(json!({ "ok": true })).into_response()
 }
 
@@ -737,11 +1008,13 @@ async fn snapshot(State(state): State<Arc<AppState>>, headers: HeaderMap) -> imp
     if !authorized(&state, &headers) {
         return reject(StatusCode::UNAUTHORIZED, "session was not accepted").into_response();
     }
-    match service_snapshot(&state.paths).await {
-        Ok((digest, snapshot)) => {
-            Json(json!({ "ok": true, "config_digest": digest, "snapshot": snapshot }))
-                .into_response()
-        }
+    match cached_service_snapshot(&state).await {
+        Ok(snapshot) => Json(json!({
+            "ok": true,
+            "config_digest": snapshot.digest,
+            "snapshot": snapshot.value
+        }))
+        .into_response(),
         Err(error) => reject(StatusCode::BAD_GATEWAY, &error.to_string()).into_response(),
     }
 }
@@ -781,6 +1054,15 @@ struct SaveBody {
     module: Option<String>,
     yaml: String,
     base_digest: String,
+}
+
+/// Validation does not write anything, so it does not need the base digest
+/// that guards a save against a concurrent edit.
+#[derive(Deserialize)]
+struct ValidateBody {
+    document: String,
+    module: Option<String>,
+    yaml: String,
 }
 
 #[derive(Deserialize)]
@@ -844,7 +1126,7 @@ async fn save(
 async fn validate(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(body): Json<SaveBody>,
+    Json(body): Json<ValidateBody>,
 ) -> impl IntoResponse {
     if !mutating_allowed(&state, &headers) {
         return reject(StatusCode::FORBIDDEN, "origin or session was not accepted").into_response();
@@ -901,9 +1183,9 @@ async fn run_action(
     if body.confirm != expected {
         return reject(StatusCode::BAD_REQUEST, "confirmation did not match").into_response();
     }
-    let running = service_snapshot(&state.paths)
+    let running = cached_service_snapshot(&state)
         .await
-        .map(|(_, snapshot)| snapshot["service"]["running"] == true)
+        .map(|snapshot| snapshot.value["service"]["running"] == true)
         .unwrap_or(false);
     if !running {
         return reject(
@@ -964,42 +1246,157 @@ async fn write_drafts(
     }
 }
 
-async fn events(State(state): State<Arc<AppState>>, headers: HeaderMap) -> impl IntoResponse {
+#[derive(Deserialize)]
+struct EventsQuery {
+    log_module: Option<String>,
+}
+
+async fn events(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<EventsQuery>,
+) -> impl IntoResponse {
     if !authorized(&state, &headers) {
         return reject(StatusCode::UNAUTHORIZED, "session was not accepted").into_response();
     }
     state.connections.fetch_add(1, Ordering::SeqCst);
+    state.idle_changed.notify_one();
     let guard = ConnectionGuard(state.clone());
     let stopping = state.stopping.subscribe();
+    let snapshots = state.snapshot_cache.subscribe();
+    let logs = state.logs_notify.subscribe();
+    // Make the first event current even if changes accumulated while there were
+    // no connected tabs. A failed read leaves the last published value intact.
+    let _ = cached_service_snapshot(&state).await;
+    let mut degraded = state.observation_degraded.subscribe();
+    let _ = degraded.borrow_and_update();
     let stream_headers = headers.clone();
+    let log_module = query.log_module.filter(|value| {
+        matches!(
+            value.as_str(),
+            "service" | "mbrew" | "mcpu" | "mwifi" | "miwatch"
+        )
+    });
     let stream = stream::unfold(
-        (state, guard, stopping, stream_headers),
-        |(state, guard, mut stopping, headers)| async move {
-            tokio::select! {
-                changed = stopping.changed() => {
-                    if changed.is_err() || *stopping.borrow() {
-                        return None;
+        (
+            state,
+            guard,
+            stopping,
+            snapshots,
+            logs,
+            degraded,
+            stream_headers,
+            log_module,
+            true,
+            false,
+            false,
+        ),
+        |(
+            state,
+            guard,
+            mut stopping,
+            mut snapshots,
+            mut logs,
+            mut degraded,
+            headers,
+            log_module,
+            first,
+            emit_logs,
+            emit_degraded,
+        )| async move {
+            let mut next_emit_logs = false;
+            let mut next_emit_degraded = false;
+            if first {
+                next_emit_degraded = *state.observation_degraded.borrow();
+            } else if emit_logs {
+                // Deliver the pending logs_changed event before waiting again.
+            } else if emit_degraded {
+                // Deliver the pending delayed-update notice before waiting again.
+            } else {
+                let auth = state.auth_changed.notified();
+                tokio::select! {
+                    changed = stopping.changed() => {
+                        if changed.is_err() || *stopping.borrow() {
+                            return None;
+                        }
+                    }
+                    changed = snapshots.changed() => {
+                        if changed.is_err() {
+                            return None;
+                        }
+                    }
+                    _ = auth => {
+                        if !authorized(&state, &headers) {
+                            return None;
+                        }
+                        // Grant changed but this stream remains authorized; wait for
+                        // the next real snapshot/log/degraded event without emitting.
+                    }
+                    changed = logs.changed(), if log_module.is_some() => {
+                        if changed.is_err() {
+                            return None;
+                        }
+                        next_emit_logs = true;
+                    }
+                    changed = degraded.changed() => {
+                        if changed.is_err() {
+                            return None;
+                        }
+                        if *degraded.borrow() {
+                            next_emit_degraded = true;
+                        }
                     }
                 }
-                _ = tokio::time::sleep(Duration::from_secs(2)) => {}
             }
-            if *stopping.borrow() {
+            if *stopping.borrow() || !authorized(&state, &headers) {
                 return None;
             }
-            // A revoked profile loses an already-open stream on its next poll.
-            if !authorized(&state, &headers) {
-                return None;
+            if next_emit_logs {
+                let module = log_module.clone().unwrap_or_else(|| "service".to_string());
+                let event = Event::default()
+                    .event("logs_changed")
+                    .data(json!({ "ok": true, "module": module }).to_string());
+                return Some((
+                    Ok::<Event, std::convert::Infallible>(event),
+                    (
+                        state, guard, stopping, snapshots, logs, degraded, headers, log_module,
+                        false, false, false,
+                    ),
+                ));
             }
-            let data = service_snapshot(&state.paths)
-                .await
-                .map(|(_, snapshot)| snapshot.to_string())
-                .unwrap_or_else(|error| {
-                    json!({ "ok": false, "message": error.to_string() }).to_string()
-                });
-            let event = Event::default().event("snapshot").data(data);
+            if next_emit_degraded {
+                let event = Event::default().event("observation").data(
+                    json!({
+                        "ok": true,
+                        "observation": "delayed",
+                        "message": "Native file observation failed; updates may be delayed up to 30 seconds while this page remains open."
+                    })
+                    .to_string(),
+                );
+                return Some((
+                    Ok::<Event, std::convert::Infallible>(event),
+                    (
+                        state, guard, stopping, snapshots, logs, degraded, headers, log_module,
+                        false, false, false,
+                    ),
+                ));
+            }
+            let snapshot = snapshots.borrow_and_update().clone();
+            let mut data = snapshot
+                .map(|snapshot| snapshot.value.clone())
+                .unwrap_or_else(|| json!({"ok": false, "message": "service snapshot unavailable"}));
+            if *state.observation_degraded.borrow() {
+                if let Some(object) = data.as_object_mut() {
+                    object.insert("observation".to_string(), json!("delayed"));
+                }
+            }
+            let event = Event::default().event("snapshot").data(data.to_string());
             Some((
                 Ok::<Event, std::convert::Infallible>(event),
-                (state, guard, stopping, headers),
+                (
+                    state, guard, stopping, snapshots, logs, degraded, headers, log_module, false,
+                    false, false,
+                ),
             ))
         },
     );
@@ -1019,6 +1416,60 @@ mod tests {
         (dir, cloned)
     }
 
+    #[test]
+    fn reloading_log_directory_subscribes_to_native_log_changes() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let state_dir = root.path().join("state");
+        let repo = root.path().join("repo");
+        let old_log_dir = root.path().join("old-logs");
+        let new_log_dir = root.path().join("new-logs");
+        for path in [&state_dir, &repo, &old_log_dir, &new_log_dir] {
+            fs::create_dir_all(path).expect("create test directory");
+        }
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut watcher = recommended_watcher(move |result: notify::Result<notify::Event>| {
+            let _ = tx.send(result);
+        })
+        .expect("create filesystem watcher");
+        watcher
+            .watch(&old_log_dir, RecursiveMode::NonRecursive)
+            .expect("watch initial log directory");
+        let mut registered_targets = HashSet::from([crate::observation::canonical(&old_log_dir)]);
+        let mut scope = crate::observation::WatchScope::new(&state_dir, &repo, &old_log_dir);
+
+        assert!(update_log_watch(
+            &mut watcher,
+            &mut registered_targets,
+            &mut scope,
+            &new_log_dir,
+        ));
+        assert_eq!(scope.log_dir, crate::observation::canonical(&new_log_dir));
+        assert!(registered_targets.contains(&scope.log_dir));
+        assert!(!registered_targets.contains(&crate::observation::canonical(&old_log_dir)));
+
+        let log_path = new_log_dir.join("scriptd.log");
+        fs::write(&log_path, "reloaded marker").expect("write new log file");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut observed_log_change = false;
+        while Instant::now() < deadline {
+            match rx.recv_timeout(Duration::from_millis(250)) {
+                Ok(Ok(event)) => {
+                    observed_log_change = event.paths.iter().any(|path| scope.classify(path).logs);
+                    if observed_log_change {
+                        break;
+                    }
+                }
+                Ok(Err(_)) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        assert!(
+            observed_log_change,
+            "new log directory emitted no relevant event"
+        );
+    }
+
     /// An isolated AppState whose grant store is empty and never persisted to
     /// the real service state directory.
     fn test_state(port: u16) -> Arc<AppState> {
@@ -1033,6 +1484,11 @@ mod tests {
             shutdown: Notify::new(),
             stopping: watch::channel(false).0,
             access: AccessController::new(grants),
+            snapshot_cache: Arc::new(SnapshotCache::new()),
+            idle_changed: Notify::new(),
+            logs_notify: watch::channel(0_u64).0,
+            auth_changed: Arc::new(Notify::new()),
+            observation_degraded: watch::channel(false).0,
         })
     }
 
@@ -1405,6 +1861,18 @@ mod tests {
     }
 
     #[test]
+    fn a_browser_port_override_selects_another_loopback_port() {
+        // An operator override lets an isolated instance run beside the service.
+        assert_eq!(parse_browser_port(Some(" 15999 ")), Some(15999));
+        assert_eq!(parse_browser_port(Some("15999")), Some(15999));
+        assert_eq!(parse_browser_port(None), None);
+        assert_eq!(parse_browser_port(Some("")), None);
+        assert_eq!(parse_browser_port(Some("not-a-port")), None);
+        assert_eq!(parse_browser_port(Some("0")), None);
+        assert_eq!(parse_browser_port(Some("70000")), None);
+    }
+
+    #[test]
     fn only_one_browser_bridge_instance_can_hold_a_repository_lock() {
         let dir = tempfile::tempdir().expect("temporary state directory");
         let lock_path = dir.path().join("bridge.lock");
@@ -1523,6 +1991,11 @@ mod tests {
             shutdown: Notify::new(),
             stopping: watch::channel(false).0,
             access: AccessController::new(grants),
+            snapshot_cache: Arc::new(SnapshotCache::new()),
+            idle_changed: Notify::new(),
+            logs_notify: watch::channel(0_u64).0,
+            auth_changed: Arc::new(Notify::new()),
+            observation_degraded: watch::channel(false).0,
         });
         let first = ConnectionGuard(state.clone());
         drop(first);

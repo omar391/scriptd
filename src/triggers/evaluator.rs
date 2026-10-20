@@ -218,6 +218,11 @@ impl TriggerRuntime {
         }
     }
 
+    pub(crate) fn requires_continuous_evaluation(&self) -> bool {
+        Self::active_condition(&self.config, &self.state.phase)
+            .is_some_and(Condition::contains_time_window)
+    }
+
     pub fn snapshot_state(&self) -> TriggerState {
         let mut state = self.state.clone();
         state.next_schedule_deadlines = self

@@ -238,6 +238,23 @@ impl Condition {
             Self::Schedule(_) | Self::TimeWindow(_) => {}
         }
     }
+
+    /// True when the condition tree contains a time-window condition.
+    ///
+    /// A time window is continuous rather than pulsed, so a rule built only from
+    /// windows has no schedule deadline to wake on and no sensor to wait for.
+    pub fn contains_time_window(&self) -> bool {
+        match self {
+            Self::All(children) | Self::Any(children) => {
+                children.iter().any(Condition::contains_time_window)
+            }
+            Self::TimeWindow(_) => true,
+            Self::Schedule(_)
+            | Self::WifiPower(_)
+            | Self::WifiSsid(_)
+            | Self::ProcessNetwork(_) => false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]

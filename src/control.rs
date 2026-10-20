@@ -70,6 +70,11 @@ impl Drop for CrossProcessSaveLock {
 
 pub type SharedBroker = Arc<std::sync::Mutex<crate::broker::Broker>>;
 
+/// Invoked when a control request needs the supervisor to act soon. The
+/// supervisor sleeps until its next deadline, so requests that queue work or
+/// request a reload must wake it instead of waiting for the next poll.
+pub type ControlWakeup = Arc<dyn Fn() + Send + Sync>;
+
 pub fn empty_broker() -> SharedBroker {
     Arc::new(std::sync::Mutex::new(crate::broker::Broker::new(
         crate::broker::Policy::default(),
@@ -265,6 +270,7 @@ pub fn spawn_server(
     paths: ControlPaths,
     expected_uid: u32,
     broker: SharedBroker,
+    wake: ControlWakeup,
 ) -> Result<ServerHandle> {
     fs::create_dir_all(&paths.state_dir)?;
     if paths.socket.exists() {
@@ -299,7 +305,7 @@ pub fn spawn_server(
     let socket = paths.socket.clone();
     let thread = std::thread::Builder::new()
         .name("scriptd-control".to_string())
-        .spawn(move || serve(listener, paths, expected_uid, broker, flag))?;
+        .spawn(move || serve(listener, paths, expected_uid, broker, flag, wake))?;
     Ok(ServerHandle {
         stop,
         socket,
@@ -313,8 +319,10 @@ fn serve(
     expected_uid: u32,
     broker: SharedBroker,
     stop: Arc<AtomicBool>,
+    wake: ControlWakeup,
 ) {
     let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let wake = Arc::clone(&wake);
     while !stop.load(Ordering::Relaxed) {
         let stream = match listener.accept() {
             Ok((stream, _)) => stream,
@@ -332,6 +340,7 @@ fn serve(
         let paths = paths.clone();
         let request_broker = Arc::clone(&broker);
         let connection_active = Arc::clone(&active);
+        let request_wake = Arc::clone(&wake);
         if std::thread::Builder::new()
             .name("scriptd-control-request".to_string())
             .spawn(move || {
@@ -341,13 +350,20 @@ fn serve(
                 let _ = stream.set_write_timeout(Some(CONTROL_IO_TIMEOUT));
                 let peer_ok = peer_uid(&stream).ok() == Some(expected_uid);
                 let response = match read_request(&mut stream) {
-                    Ok(request) => dispatch_with_broker(
-                        &paths,
-                        request,
-                        peer_ok,
-                        peer_pid(&stream).unwrap_or(0),
-                        &request_broker,
-                    ),
+                    Ok(request) => {
+                        let op = request.op.clone();
+                        let response = dispatch_with_broker(
+                            &paths,
+                            request,
+                            peer_ok,
+                            peer_pid(&stream).unwrap_or(0),
+                            &request_broker,
+                        );
+                        if response.ok && matches!(op.as_str(), "reload" | "run" | "save") {
+                            request_wake();
+                        }
+                        response
+                    }
                     Err(error) => rejected("unknown", &error.to_string()),
                 };
                 let _ = write_response(&mut stream, &response);
@@ -1543,8 +1559,11 @@ fn with_jobs<T>(
     } else {
         JobFile::default()
     };
+    let before = file.jobs.clone();
     let value = mutate(&mut file.jobs);
-    write_private_atomic(jobs_path, serde_json::to_string_pretty(&file)?.as_bytes())?;
+    if file.jobs != before {
+        write_private_atomic(jobs_path, serde_json::to_string_pretty(&file)?.as_bytes())?;
+    }
     Ok(value)
 }
 
@@ -2271,6 +2290,58 @@ mod tests {
     }
 
     #[test]
+    fn queued_work_requests_wake_the_supervisor() {
+        let (_repo, _state, paths) = fixture();
+        let woken = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&woken);
+        let server = spawn_server(
+            paths.clone(),
+            unsafe { libc::geteuid() },
+            empty_broker(),
+            Arc::new(move || {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }),
+        )
+        .expect("server");
+        let request = Request {
+            v: PROTOCOL_VERSION,
+            id: "manual-run".to_string(),
+            op: "run".to_string(),
+            repo: paths.repo.to_string_lossy().to_string(),
+            document: None,
+            module: Some("mbrew".to_string()),
+            yaml: None,
+            base_digest: None,
+            request_id: Some("manual-run".to_string()),
+            bypass: true,
+            action: None,
+            max_lines: None,
+            severity: None,
+            query: None,
+        };
+        let response = transact(&paths.socket, &request).expect("run response");
+        assert!(response.ok, "{:?}", response.message);
+        assert_eq!(woken.load(Ordering::Relaxed), 1);
+
+        let snapshot = transact(
+            &paths.socket,
+            &Request {
+                id: "read-only".to_string(),
+                op: "snapshot".to_string(),
+                ..request.clone()
+            },
+        )
+        .expect("snapshot response");
+        assert!(snapshot.ok);
+        assert_eq!(
+            woken.load(Ordering::Relaxed),
+            1,
+            "read-only requests must not wake the supervisor"
+        );
+        drop(server);
+    }
+
+    #[test]
     fn browser_bridge_targets_root_service_socket_but_keeps_user_state() {
         let repo = tempfile::tempdir().expect("repo");
         let state = tempfile::tempdir().expect("browser user state");
@@ -2294,8 +2365,13 @@ mod tests {
         assert_eq!(browser_paths.socket, service_paths.socket);
 
         let expected_uid = unsafe { libc::geteuid() };
-        let server = spawn_server(service_paths.clone(), expected_uid, empty_broker())
-            .expect("service server");
+        let server = spawn_server(
+            service_paths.clone(),
+            expected_uid,
+            empty_broker(),
+            Arc::new(|| {}),
+        )
+        .expect("service server");
         let response = transact(
             &browser_paths.socket,
             &Request {
@@ -2323,8 +2399,13 @@ mod tests {
     #[test]
     fn incomplete_control_client_does_not_block_service_snapshots() {
         let (_repo, _state, paths) = fixture();
-        let server = spawn_server(paths.clone(), unsafe { libc::geteuid() }, empty_broker())
-            .expect("service server");
+        let server = spawn_server(
+            paths.clone(),
+            unsafe { libc::geteuid() },
+            empty_broker(),
+            Arc::new(|| {}),
+        )
+        .expect("service server");
         let mut stalled = UnixStream::connect(&paths.socket).expect("stalled client");
         stalled.write_all(b"{\"v\":1").expect("partial request");
 
@@ -3325,7 +3406,8 @@ mod tests {
         } else {
             0
         };
-        let server = spawn_server(paths.clone(), expected, empty_broker()).expect("server");
+        let server =
+            spawn_server(paths.clone(), expected, empty_broker(), Arc::new(|| {})).expect("server");
         let response = transact(
             &server.socket,
             &Request {
