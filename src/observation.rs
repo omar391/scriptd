@@ -31,6 +31,8 @@ pub struct WatchScope {
     pub state_dir: PathBuf,
     /// Other service-owned runtime directories a detached bridge can observe.
     pub additional_state_dirs: Vec<PathBuf>,
+    /// Whether a candidate service state directory is outside this process's watch coverage.
+    pub has_unobservable_state_dir: bool,
     /// Repository root that holds `service.yaml` and `modules/`.
     pub repo: PathBuf,
     /// Directory holding the `*.log` and `*.err` files.
@@ -40,16 +42,15 @@ pub struct WatchScope {
 impl WatchScope {
     /// Builds a scope with every path resolved to its canonical form.
     pub fn new(state_dir: &Path, repo: &Path, log_dir: &Path) -> Self {
+        let candidates = [PathBuf::from(
+            "/var/root/Library/Application Support/scriptd",
+        )];
+        let (additional_state_dirs, has_unobservable_state_dir) =
+            state_dir_coverage(state_dir, &candidates);
         Self {
             state_dir: canonical(state_dir),
-            additional_state_dirs: {
-                let root_state = PathBuf::from("/var/root/Library/Application Support/scriptd");
-                if root_state != canonical(state_dir) {
-                    vec![canonical(&root_state)]
-                } else {
-                    Vec::new()
-                }
-            },
+            additional_state_dirs,
+            has_unobservable_state_dir,
             repo: canonical(repo),
             log_dir: canonical(log_dir),
         }
@@ -145,6 +146,47 @@ impl WatchScope {
         };
         !is_atomic_temporary(name) && (name.ends_with(".log") || name.ends_with(".err"))
     }
+
+    /// True when the path carries inputs the snapshot depends on.
+    ///
+    /// Only these targets are required: failing to watch one means live
+    /// updates are genuinely unreliable. Additional service state directories
+    /// are optional, because a process may not be allowed to observe them
+    /// while still observing everything that matters.
+    pub fn is_required_target(&self, path: &Path) -> bool {
+        let resolved = canonical(path);
+        resolved == self.state_dir
+            || resolved == self.repo
+            || resolved == canonical(&self.repo.join("modules"))
+            || resolved == self.log_dir
+    }
+}
+
+/// Selects the extra service state directories this process can observe.
+///
+/// A service that runs as root keeps its state in `/var/root`, which an
+/// unprivileged bridge cannot traverse. Listing that path unconditionally
+/// would make one watch registration fail and would report native observation
+/// as degraded even though the directories that matter were all watched
+/// successfully. A candidate is offered only when it is a readable directory
+/// that is not already covered by the primary state directory.
+fn observable_state_dirs(state_dir: &Path, candidates: &[PathBuf]) -> Vec<PathBuf> {
+    let primary = canonical(state_dir);
+    candidates
+        .iter()
+        .filter(|candidate| std::fs::read_dir(candidate).is_ok())
+        .map(|candidate| canonical(candidate))
+        .filter(|candidate| *candidate != primary)
+        .collect()
+}
+
+/// Returns observable state directories and whether a distinct candidate is uncovered.
+fn state_dir_coverage(state_dir: &Path, candidates: &[PathBuf]) -> (Vec<PathBuf>, bool) {
+    let primary = canonical(state_dir);
+    let uncovered = candidates
+        .iter()
+        .any(|candidate| canonical(candidate) != primary && std::fs::read_dir(candidate).is_err());
+    (observable_state_dirs(state_dir, candidates), uncovered)
 }
 
 /// Which snapshot inputs a path affects.
@@ -215,6 +257,148 @@ mod tests {
             .iter()
             .any(|(path, _)| path == &canonical(&service_state)));
         assert!(scope.classify(&service_state.join("state.json")).snapshot);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_state_directories_are_not_offered_as_watch_targets() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("temporary root");
+        let state = root.path().join("state");
+        let unreadable = root.path().join("unreadable-state");
+        std::fs::create_dir_all(&state).expect("create state directory");
+        std::fs::create_dir_all(&unreadable).expect("create unreadable directory");
+
+        let original_permissions = std::fs::metadata(&unreadable)
+            .expect("read candidate permissions")
+            .permissions();
+        let mut denied_permissions = original_permissions.clone();
+        denied_permissions.set_mode(0o000);
+        std::fs::set_permissions(&unreadable, denied_permissions)
+            .expect("remove candidate permissions");
+
+        // Confirm the fixture really denies directory access before checking
+        // that it is excluded. This keeps the regression meaningful when run
+        // under a privileged account.
+        let access_denied = std::fs::read_dir(&unreadable).is_err();
+        let selected = observable_state_dirs(&state, std::slice::from_ref(&unreadable));
+        std::fs::set_permissions(&unreadable, original_permissions)
+            .expect("restore candidate permissions");
+
+        assert!(access_denied, "fixture must deny directory reads");
+        assert!(selected.is_empty(), "unreadable candidate must be excluded");
+
+        // A candidate that does not exist must also be skipped.
+        let missing = root.path().join("absent-state");
+        assert!(observable_state_dirs(&state, &[missing]).is_empty());
+    }
+
+    #[test]
+    fn the_primary_state_directory_is_not_repeated_as_an_additional_one() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let state = root.path().join("state");
+        std::fs::create_dir_all(&state).expect("create state directory");
+
+        assert!(observable_state_dirs(&state, std::slice::from_ref(&state)).is_empty());
+    }
+
+    #[test]
+    fn a_readable_additional_state_directory_is_offered() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let state = root.path().join("state");
+        let service_state = root.path().join("service-state");
+        for path in [&state, &service_state] {
+            std::fs::create_dir_all(path).expect("create state directory");
+        }
+
+        let selected = observable_state_dirs(&state, std::slice::from_ref(&service_state));
+        assert_eq!(selected, vec![canonical(&service_state)]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn distinct_unreadable_service_state_keeps_refresh_coverage_without_degrading() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("temporary root");
+        let bridge_state = root.path().join("bridge-state");
+        let service_state = root.path().join("service-state");
+        std::fs::create_dir_all(&bridge_state).expect("create bridge state directory");
+        std::fs::create_dir_all(&service_state).expect("create service state directory");
+        let original_permissions = std::fs::metadata(&service_state)
+            .expect("read service state permissions")
+            .permissions();
+        let mut denied_permissions = original_permissions.clone();
+        denied_permissions.set_mode(0o000);
+        std::fs::set_permissions(&service_state, denied_permissions)
+            .expect("deny service state access");
+
+        let (selected, uncovered) =
+            state_dir_coverage(&bridge_state, std::slice::from_ref(&service_state));
+        let access_denied = std::fs::read_dir(&service_state).is_err();
+        std::fs::set_permissions(&service_state, original_permissions)
+            .expect("restore service state permissions");
+
+        assert!(access_denied, "fixture must deny service state access");
+        assert!(selected.is_empty(), "unreadable state must not be watched");
+        assert!(
+            uncovered,
+            "unwatched service state still needs periodic refresh"
+        );
+    }
+
+    #[test]
+    fn the_scope_never_watches_a_state_directory_the_process_cannot_read() {
+        // The unprivileged service keeps its state under the user's home, so
+        // the root-owned state directory is neither relevant nor readable and
+        // must not appear among the watch targets.
+        let (_root, scope) = scope();
+        assert!(!scope
+            .watch_targets()
+            .iter()
+            .any(|(path, _)| path.starts_with("/var/root")));
+    }
+
+    #[test]
+    fn only_the_directories_the_snapshot_depends_on_are_required() {
+        let (root, mut scope) = scope();
+        assert!(scope.is_required_target(&scope.state_dir));
+        assert!(scope.is_required_target(&scope.repo));
+        assert!(scope.is_required_target(&scope.repo.join("modules")));
+        assert!(scope.is_required_target(&scope.log_dir));
+
+        let service_state = root.path().join("service-state");
+        std::fs::create_dir_all(&service_state).expect("create service state directory");
+        scope.additional_state_dirs.push(canonical(&service_state));
+        assert!(
+            !scope.is_required_target(&canonical(&service_state)),
+            "an optional state directory must not be able to degrade observation"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_modules_directory_remains_a_required_watch_target() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let state = root.path().join("state");
+        let repo = root.path().join("repo");
+        let logs = root.path().join("logs");
+        let actual_modules = root.path().join("actual-modules");
+        for path in [&state, &repo, &logs, &actual_modules] {
+            std::fs::create_dir_all(path).expect("create directory");
+        }
+        std::os::unix::fs::symlink(&actual_modules, repo.join("modules"))
+            .expect("symlink modules directory");
+        let scope = WatchScope::new(&state, &repo, &logs);
+        let modules_target = scope.repo.join("modules");
+
+        assert!(scope
+            .watch_targets()
+            .iter()
+            .any(|(path, recursive)| path == &modules_target && *recursive));
+        assert!(scope.is_required_target(&modules_target));
+        assert!(scope.is_required_target(&canonical(&modules_target)));
     }
 
     #[test]

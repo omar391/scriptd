@@ -88,6 +88,7 @@ struct AppState {
     logs_notify: watch::Sender<u64>,
     auth_changed: Arc<Notify>,
     observation_degraded: watch::Sender<bool>,
+    refresh_unwatched_state: watch::Sender<bool>,
 }
 
 struct ConnectionGuard(Arc<AppState>);
@@ -362,6 +363,8 @@ async fn serve(
         .map(|config| config.expanded_log_dir())
         .unwrap_or_else(|_| paths.state_dir.clone());
     let mut scope = crate::observation::WatchScope::new(&paths.state_dir, &paths.repo, &log_dir);
+    let (refresh_unwatched_state, _) = watch::channel(scope.has_unobservable_state_dir);
+    let refresh_flag = refresh_unwatched_state.clone();
     let watch_cache = Arc::clone(&snapshot_cache);
     let log_notify = logs_notify.clone();
     let degraded = observation_degraded.clone();
@@ -388,7 +391,16 @@ async fn serve(
                 let _ = fs::create_dir_all(&path);
             }
             if watcher.watch(&path, mode).is_err() {
-                watching = false;
+                // A directory this process cannot observe is not evidence that
+                // native observation as a whole failed. The remaining targets
+                // still cover the files the snapshot depends on, so the
+                // bridge keeps serving live updates instead of reporting that
+                // every change may be delayed.
+                if scope.is_required_target(&path) {
+                    watching = false;
+                } else if scope.additional_state_dirs.contains(&path) {
+                    refresh_flag.send_replace(true);
+                }
             } else {
                 registered_targets.insert(path);
             }
@@ -467,6 +479,7 @@ async fn serve(
         logs_notify: logs_notify.clone(),
         auth_changed: auth_changed.clone(),
         observation_degraded,
+        refresh_unwatched_state,
     });
     let refresh_state = state.clone();
     tokio::spawn(async move {
@@ -481,14 +494,22 @@ async fn serve(
             }
         }
     });
-    // Shared 30s fallback while subscribers remain and native observation failed.
+    // Refresh snapshots every 30s when either observation failed or a service
+    // state directory cannot be watched. Only genuine watcher failures emit
+    // the degraded banner.
     let fallback_state = state.clone();
     tokio::spawn(async move {
         let mut degraded = fallback_state.observation_degraded.subscribe();
+        let mut refresh_unwatched = fallback_state.refresh_unwatched_state.subscribe();
         loop {
-            if !*degraded.borrow() {
+            if !*degraded.borrow() && !*refresh_unwatched.borrow() {
                 tokio::select! {
                     changed = degraded.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                    }
+                    changed = refresh_unwatched.changed() => {
                         if changed.is_err() {
                             break;
                         }
@@ -504,6 +525,11 @@ async fn serve(
                             break;
                         }
                     }
+                    changed = refresh_unwatched.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                    }
                     _ = fallback_state.idle_changed.notified() => {}
                 }
                 continue;
@@ -514,15 +540,20 @@ async fn serve(
                         break;
                     }
                 }
+                changed = refresh_unwatched.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                }
                 _ = fallback_state.idle_changed.notified() => {}
                 _ = tokio::time::sleep(Duration::from_secs(30)) => {
-                    if fallback_state.connections.load(Ordering::SeqCst) > 0
-                        && *fallback_state.observation_degraded.borrow()
-                    {
+                    if fallback_state.connections.load(Ordering::SeqCst) > 0 {
                         fallback_state.snapshot_cache.invalidate();
-                        fallback_state
-                            .logs_notify
-                            .send_modify(|revision| *revision = revision.wrapping_add(1));
+                        if *fallback_state.observation_degraded.borrow() {
+                            fallback_state
+                                .logs_notify
+                                .send_modify(|revision| *revision = revision.wrapping_add(1));
+                        }
                     }
                 }
             }
@@ -1489,6 +1520,7 @@ mod tests {
             logs_notify: watch::channel(0_u64).0,
             auth_changed: Arc::new(Notify::new()),
             observation_degraded: watch::channel(false).0,
+            refresh_unwatched_state: watch::channel(false).0,
         })
     }
 
@@ -1996,6 +2028,7 @@ mod tests {
             logs_notify: watch::channel(0_u64).0,
             auth_changed: Arc::new(Notify::new()),
             observation_degraded: watch::channel(false).0,
+            refresh_unwatched_state: watch::channel(false).0,
         });
         let first = ConnectionGuard(state.clone());
         drop(first);
