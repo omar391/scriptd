@@ -313,3 +313,50 @@ test('the stream asks for log notifications only while a module log tab is follo
   await settle();
   assert.equal(tab.streams[0].url, '/events', 'the default stream asks for no log module');
 });
+
+test('brew casks that need a decision are shown with actions and never retried blindly', async () => {
+  const tab = browser();
+  await settle();
+
+  const packages = [
+    { name: 'opaque-cask', state: 'attention', reason: 'no trustworthy application identity', attempts: 0, retry: false },
+    { name: 'anydesk', state: 'deferred', reason: 'an application or helper is running', attempts: 0, retry: true },
+    { name: 'ignored-cask', state: 'dismissed', reason: 'dismissed by the user', attempts: 0, retry: false, dismissed: true }
+  ];
+  const snapshot = {
+    service: { running: true, pid: 'generation-1' },
+    modules: [{
+      id: 'mbrew', name: 'Brew Manager', enabled: true, valid: true,
+      outcomes: { packages }
+    }]
+  };
+  const before = JSON.stringify(snapshot);
+  tab.streams[0].sendFrame(snapshot);
+  await settle();
+
+  const state = tab.state();
+  assert.equal(state.snapshot.modules[0].id, 'mbrew');
+  assert.equal(JSON.stringify(state.snapshot), before, 'rendering must not mutate the snapshot');
+
+  const panel = vm.runInContext('CaskAttentionPanel(moduleInfo("mbrew"))', tab.context);
+  assert.ok(panel, 'a cask needing a decision opens the attention panel');
+
+  const rendered = JSON.stringify(panel);
+  assert.ok(rendered.includes('opaque-cask'), 'the attention cask is listed');
+  assert.ok(!rendered.includes('anydesk'), 'a merely retry-eligible cask is not an attention item');
+  assert.ok(!rendered.includes('ignored-cask'), 'a dismissed cask is not re-prompted');
+  assert.ok(rendered.includes('Approve'), 'the panel offers an approve action');
+  assert.ok(rendered.includes('Dismiss'), 'the panel offers a dismiss action');
+  assert.ok(rendered.includes('Retry pending casks'), 'the panel can request the existing retry action');
+
+  vm.runInContext("appState.caskAttention[JSON.stringify(['opaque-cask', 'no trustworthy application identity'])] = 'allowed'", tab.context);
+  const resolvedPanel = vm.runInContext('CaskAttentionPanel(moduleInfo("mbrew"))', tab.context);
+  assert.ok(JSON.stringify(resolvedPanel).includes('disabled'), 'a resolved episode keeps its decision state while attention remains');
+
+  tab.streams[0].sendFrame({ service: { running: true }, modules: [{ id: 'mbrew', outcomes: { packages: [] } }] });
+  await settle();
+  tab.streams[0].sendFrame(snapshot);
+  await settle();
+  const recurringPanel = vm.runInContext('CaskAttentionPanel(moduleInfo("mbrew"))', tab.context);
+  assert.ok(!JSON.stringify(recurringPanel).includes('allowed'), 'a later attention episode starts without the old decision');
+});

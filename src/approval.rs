@@ -16,6 +16,8 @@ pub enum ApprovalDecision {
     Allowed,
     /// The user explicitly denied this browser.
     Denied,
+    /// The user closed the prompt without choosing a decision.
+    Dismissed,
     /// The prompt could not be presented to the user.
     Unavailable,
 }
@@ -27,6 +29,7 @@ impl ApprovalDecision {
             Self::Allowed => "allowed",
             Self::Denied => "denied",
             Self::Unavailable => "unavailable",
+            Self::Dismissed => "dismissed",
         }
     }
 }
@@ -121,14 +124,14 @@ fn macos_prompt(title: &str, message: &str, timeout: Duration) -> ApprovalDecisi
     if status != 0 {
         return ApprovalDecision::Unavailable;
     }
-    // Deny is the default button, so anything other than an explicit Allow
-    // choice -- including a timeout, a dismissed alert, or an unexpected
-    // response flag -- is a denial.
+    // Deny is the default button; cancel/timeout responses are distinct.
     let response = response_flags & 0b11;
     if response == kCFUserNotificationAlternateResponse {
         ApprovalDecision::Allowed
-    } else {
+    } else if response == 0 {
         ApprovalDecision::Denied
+    } else {
+        ApprovalDecision::Dismissed
     }
 }
 

@@ -23,6 +23,151 @@ pub const SETTLED_REPLAY_TIMEOUT: Duration = Duration::from_secs(60);
 /// Quiet period after a denial or timeout before a new prompt may open.
 pub const COOLDOWN: Duration = Duration::from_secs(10);
 
+/// A cask requiring a user decision, copied from the Brew Manager ledger.
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+pub struct CaskAttentionItem {
+    pub name: String,
+    pub reason: String,
+}
+
+/// Private cask decision result; independent of browser authorization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaskAttentionState {
+    Waiting,
+    Allowed,
+    Denied,
+    Dismissed,
+    Expired,
+    Unavailable,
+}
+
+struct CaskAttentionRequest {
+    casks: Vec<CaskAttentionItem>,
+    state: CaskAttentionState,
+    opened_at: Instant,
+}
+
+#[derive(Default)]
+struct CaskAttentionRequests {
+    claims: HashMap<String, CaskAttentionRequest>,
+    prompted: HashMap<String, String>,
+    cooldown_until: Option<Instant>,
+}
+
+/// Cask decisions never read or modify the browser grant store.
+#[derive(Default)]
+pub struct CaskAttentionController {
+    requests: Mutex<CaskAttentionRequests>,
+    changed: tokio::sync::Notify,
+}
+
+impl CaskAttentionController {
+    /// Opens a private request once per cask name in this process.
+    pub fn open_request(
+        &self,
+        casks: Vec<CaskAttentionItem>,
+        dismiss: bool,
+    ) -> Result<RequestTicket, String> {
+        let mut requests = AccessController::lock(&self.requests);
+        let now = Instant::now();
+        requests.claims.retain(|_, request| {
+            now.duration_since(request.opened_at) < REQUEST_TIMEOUT + SETTLED_REPLAY_TIMEOUT
+        });
+        if requests.claims.values().any(|request| {
+            request.state == CaskAttentionState::Waiting
+                && now.duration_since(request.opened_at) < REQUEST_TIMEOUT
+        }) || requests.cooldown_until.is_some_and(|until| now < until)
+        {
+            return Err("a cask decision is waiting or cooling down".into());
+        }
+        if casks.is_empty()
+            || (!dismiss
+                && casks
+                    .iter()
+                    .any(|item| requests.prompted.get(&item.name) == Some(&item.reason)))
+        {
+            return Err("these casks were already prompted; pending work remains visible".into());
+        }
+        let claim = GrantsStore::random_credential().map_err(|error| error.to_string())?;
+        let identifier = GrantsStore::random_credential().map_err(|error| error.to_string())?;
+        let identifier = identifier[..12].to_string();
+        for item in &casks {
+            requests
+                .prompted
+                .insert(item.name.clone(), item.reason.clone());
+        }
+        requests.claims.insert(
+            claim.clone(),
+            CaskAttentionRequest {
+                casks,
+                state: CaskAttentionState::Waiting,
+                opened_at: now,
+            },
+        );
+        requests.cooldown_until = Some(now + COOLDOWN);
+        Ok(RequestTicket { claim, identifier })
+    }
+
+    /// Settles only a live private claim, retaining its casks for replay.
+    pub fn resolve_claim(&self, claim: &str, outcome: CaskAttentionState) {
+        let mut requests = AccessController::lock(&self.requests);
+        let mut approved_names = Vec::new();
+        if let Some(request) = requests.claims.get_mut(claim) {
+            if request.state == CaskAttentionState::Waiting {
+                request.state = if request.opened_at.elapsed() >= REQUEST_TIMEOUT {
+                    CaskAttentionState::Expired
+                } else {
+                    if outcome == CaskAttentionState::Allowed {
+                        approved_names =
+                            request.casks.iter().map(|item| item.name.clone()).collect();
+                    }
+                    outcome
+                };
+            }
+        }
+        for name in approved_names {
+            requests.prompted.remove(&name);
+        }
+        requests.cooldown_until = Some(Instant::now() + COOLDOWN);
+        drop(requests);
+        self.changed.notify_waiters();
+    }
+
+    /// Reads only the requesting tab's claim. Unknown and expired claims agree.
+    pub fn poll(&self, claim: &str) -> (CaskAttentionState, Vec<CaskAttentionItem>) {
+        let requests = AccessController::lock(&self.requests);
+        match requests.claims.get(claim) {
+            Some(request)
+                if request.opened_at.elapsed() < REQUEST_TIMEOUT + SETTLED_REPLAY_TIMEOUT =>
+            {
+                let state = if request.state == CaskAttentionState::Waiting
+                    && request.opened_at.elapsed() >= REQUEST_TIMEOUT
+                {
+                    CaskAttentionState::Expired
+                } else {
+                    request.state
+                };
+                (state, request.casks.clone())
+            }
+            _ => (CaskAttentionState::Expired, Vec::new()),
+        }
+    }
+
+    /// One event-driven wait; the browser never schedules a polling timer.
+    pub async fn wait(&self, claim: &str) -> (CaskAttentionState, Vec<CaskAttentionItem>) {
+        let changed = self.changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        let result = self.poll(claim);
+        if result.0 != CaskAttentionState::Waiting {
+            return result;
+        }
+        let _ = tokio::time::timeout(REQUEST_TIMEOUT, changed).await;
+        self.poll(claim)
+    }
+}
+
 /// Why a browser is not currently authorized.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccessState {
@@ -385,5 +530,83 @@ mod tests {
             access.poll(&second.claim),
             PollOutcome::Allowed(_)
         ));
+    }
+}
+
+#[cfg(test)]
+mod cask_attention_tests {
+    use super::*;
+
+    fn item() -> CaskAttentionItem {
+        CaskAttentionItem {
+            name: "example".into(),
+            reason: "Quit the running app".into(),
+        }
+    }
+
+    #[test]
+    fn cask_claim_is_private_and_denial_does_not_erase_work() {
+        let controller = CaskAttentionController::default();
+        let ticket = controller.open_request(vec![item()], false).unwrap();
+        assert_eq!(controller.poll("other-tab").0, CaskAttentionState::Expired);
+        assert_eq!(
+            controller.poll(&ticket.claim).0,
+            CaskAttentionState::Waiting
+        );
+        controller.resolve_claim(&ticket.claim, CaskAttentionState::Denied);
+        let (outcome, casks) = controller.poll(&ticket.claim);
+        assert_eq!(outcome, CaskAttentionState::Denied);
+        assert_eq!(casks[0].name, "example");
+        AccessController::lock(&controller.requests).cooldown_until = None;
+        assert!(controller.open_request(vec![item()], false).is_err());
+        let changed_reason = CaskAttentionItem {
+            name: "example".into(),
+            reason: "A different failure".into(),
+        };
+        assert!(controller.open_request(vec![changed_reason], false).is_ok());
+    }
+
+    #[test]
+    fn dismissal_and_expiry_never_reopen_a_prompt() {
+        let controller = CaskAttentionController::default();
+        let ticket = controller.open_request(vec![item()], true).unwrap();
+        assert_eq!(
+            controller.poll(&ticket.claim).0,
+            CaskAttentionState::Waiting
+        );
+        controller.resolve_claim(&ticket.claim, CaskAttentionState::Dismissed);
+        assert_eq!(
+            controller.poll(&ticket.claim).0,
+            CaskAttentionState::Dismissed
+        );
+        let mut requests = AccessController::lock(&controller.requests);
+        requests.cooldown_until = None;
+        requests.claims.get_mut(&ticket.claim).unwrap().opened_at =
+            Instant::now() - REQUEST_TIMEOUT - SETTLED_REPLAY_TIMEOUT;
+        drop(requests);
+        assert_eq!(
+            controller.poll(&ticket.claim).0,
+            CaskAttentionState::Expired
+        );
+        assert!(controller.open_request(vec![item()], false).is_err());
+    }
+
+    #[test]
+    fn approval_resets_suppression_but_unchanged_denial_stays_suppressed() {
+        let controller = CaskAttentionController::default();
+        let denied = controller.open_request(vec![item()], false).unwrap();
+        controller.resolve_claim(&denied.claim, CaskAttentionState::Denied);
+        AccessController::lock(&controller.requests).cooldown_until = None;
+        assert!(controller.open_request(vec![item()], false).is_err());
+
+        let approved_controller = CaskAttentionController::default();
+        let approved = approved_controller
+            .open_request(vec![item()], false)
+            .unwrap();
+        approved_controller.resolve_claim(&approved.claim, CaskAttentionState::Allowed);
+        AccessController::lock(&approved_controller.requests).cooldown_until = None;
+        assert!(approved_controller
+            .open_request(vec![item()], false)
+            .is_ok());
     }
 }

@@ -226,6 +226,16 @@ fn write_modules(root: &Path) {
 fn write_brew_module(root: &Path, homebrew_bin: &Path, askpass_path: &Path) {
     let module_dir = root.join("modules").join("mbrew");
     fs::create_dir_all(&module_dir).expect("create brew module dir");
+    // The askpass helper is a tracked repository asset; the deployment
+    // installs it from there into the configured askpass path.
+    fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("modules")
+            .join("mbrew")
+            .join("brew_askpass.sh"),
+        module_dir.join("brew_askpass.sh"),
+    )
+    .expect("install tracked askpass asset");
     fs::write(
         module_dir.join("module.yaml"),
         format!(

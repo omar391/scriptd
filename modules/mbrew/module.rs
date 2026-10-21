@@ -67,6 +67,31 @@ struct MbrewState {
 static STATE: once_cell::sync::Lazy<std::sync::Mutex<MbrewState>> =
     once_cell::sync::Lazy::new(|| std::sync::Mutex::new(MbrewState::default()));
 
+/// Serializes every ledger read-modify-write cycle so a control-center
+/// decision can be applied while a maintenance run is recording its outcome.
+static LEDGER_LOCK: once_cell::sync::Lazy<std::sync::Mutex<()>> =
+    once_cell::sync::Lazy::new(|| std::sync::Mutex::new(()));
+
+/// Holds the in-process ledger lock and an on-disk lock for the lifetime of a
+/// ledger transaction. The on-disk lock also serializes access from the
+/// control-center bridge when it runs as its own process.
+struct LedgerGuard {
+    _process: std::sync::MutexGuard<'static, ()>,
+    _file: crate::execution_lock::ExecutionLock,
+}
+
+fn lock_ledger(state_dir: &Path) -> anyhow::Result<LedgerGuard> {
+    let process = LEDGER_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let file = crate::execution_lock::ExecutionLock::acquire(&state_dir.join("mbrew-ledger.lock"))
+        .context("acquire the Homebrew outcome ledger lock")?;
+    Ok(LedgerGuard {
+        _process: process,
+        _file: file,
+    })
+}
+
 fn run_command(
     program: &str,
     args: &[&str],
@@ -136,21 +161,42 @@ fn homebrew_path(raw: &str) -> anyhow::Result<PathBuf> {
     Ok(PathBuf::from(raw))
 }
 
+/// Name of the tracked askpass helper that ships with the module.
+const ASKPASS_SOURCE: &str = "brew_askpass.sh";
+
+/// Repository root that holds the tracked module assets.
+fn tracked_root() -> PathBuf {
+    std::env::var_os("SCRIPTD_ROOT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+}
+
+/// Locates the tracked askpass helper inside the repository.
+///
+/// The helper is a repository asset, so the installed copy is always derived
+/// from the tracked source rather than generated from inline content.
+fn askpass_source_path() -> anyhow::Result<PathBuf> {
+    Ok(tracked_root()
+        .join("modules")
+        .join("mbrew")
+        .join(ASKPASS_SOURCE))
+}
+
 fn write_askpass(config: &MbrewConfig, logger: &ModuleLogger) -> anyhow::Result<()> {
     let path = homebrew_path(&config.askpass_path)?;
     if path.exists() {
         return Ok(());
     }
+    let source = askpass_source_path()?;
+    let script = fs::read(&source)
+        .with_context(|| format!("read tracked askpass helper {}", source.display()))?;
     fs::create_dir_all(path.parent().expect("path has parent"))?;
-    let mut file = fs::File::create(&path)?;
-    let script = "#!/bin/bash\n\
-echo \"scriptd mbrew sudoers setup is required\" >&2\n\
-exit 1\n";
-    file.write_all(script.as_bytes())?;
+    fs::write(&path, &script)
+        .with_context(|| format!("write askpass helper {}", path.display()))?;
     let _ = Command::new("chmod")
         .args(["+x", &path.to_string_lossy()])
         .status();
-    logger.info(&format!("wrote askpass helper {}", path.display()));
+    logger.info(&format!("installed askpass helper {}", path.display()));
     Ok(())
 }
 
@@ -571,6 +617,12 @@ struct BrewMaintenanceOutcome {
     failed_casks: Vec<String>,
     retryable_casks: BTreeSet<String>,
     attention_casks: BTreeSet<String>,
+    /// Casks the user dismissed: still outstanding, but never re-prompted and
+    /// never retried automatically.
+    dismissed_casks: BTreeSet<String>,
+    /// Casks for which a real `brew upgrade` was actually launched. Only these
+    /// count towards the ledger attempt counter.
+    attempted_casks: BTreeSet<String>,
     reasons: BTreeMap<String, String>,
     cask_error: Option<String>,
     formula_error: Option<String>,
@@ -1450,7 +1502,8 @@ fn broker_control_call(
         &crate::control::broker_socket_path(repo, uid),
         &request,
         Duration::from_secs(15 * 60 + 10),
-    )?;
+    )
+    .context("broker control transport error")?;
     if !response.ok {
         bail!(
             "privilege broker rejected the request: {}",
@@ -1568,26 +1621,35 @@ fn brokered_cask_upgrade(
     ) {
         Ok(response) => response,
         Err(error) => {
-            let _ = broker_control_call(
-                Path::new(repository),
-                "broker_complete",
-                Some(&job_id),
-                None,
-                Some(&token),
-            );
-            return Ok(BrokerUpgradeResult::Deferred(format!(
-                "helper-launched Homebrew worker was unavailable: {error}"
-            )));
+            let failure = broker_launch_error_status(&error);
+            if failure == BrokerLaunchFailure::NotStarted {
+                let _ = broker_control_call(
+                    Path::new(repository),
+                    "broker_complete",
+                    Some(&job_id),
+                    None,
+                    Some(&token),
+                );
+            }
+            return Ok(broker_launch_failure_result(failure, &error));
         }
     };
-    let snapshot = response
-        .snapshot
-        .context("privilege broker returned no Homebrew worker result")?;
-    let status = snapshot
+    // The Homebrew worker was launched, so the upgrade was really attempted
+    // even when its result cannot be read back.
+    let Some(snapshot) = response.snapshot else {
+        return Ok(BrokerUpgradeResult::Failed(
+            "privilege broker returned no Homebrew worker result".into(),
+        ));
+    };
+    let Some(status) = snapshot
         .get("status")
         .and_then(serde_json::Value::as_i64)
         .and_then(|status| i32::try_from(status).ok())
-        .context("privilege broker returned an invalid Homebrew worker status")?;
+    else {
+        return Ok(BrokerUpgradeResult::Failed(
+            "privilege broker returned an invalid Homebrew worker status".into(),
+        ));
+    };
     let decode_output = |key: &str| -> anyhow::Result<Vec<u8>> {
         use base64::Engine;
         let Some(encoded) = snapshot.get(key).and_then(serde_json::Value::as_str) else {
@@ -1597,13 +1659,69 @@ fn brokered_cask_upgrade(
             .decode(encoded)
             .with_context(|| format!("privilege broker returned invalid {key}"))
     };
-    let stdout = String::from_utf8_lossy(&decode_output("stdout")?).into_owned();
-    let stderr = String::from_utf8_lossy(&decode_output("stderr")?).into_owned();
+    let stdout = String::from_utf8_lossy(&decode_output("stdout").unwrap_or_default()).into_owned();
+    let stderr = String::from_utf8_lossy(&decode_output("stderr").unwrap_or_default()).into_owned();
     Ok(BrokerUpgradeResult::Completed((stdout, stderr, status)))
 }
 
+/// Preserves the launch boundary when the broker reports an error. Failures
+/// before connecting are known not to have launched a worker; other transport
+/// failures are ambiguous and need attention without counting an attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrokerLaunchFailure {
+    NotStarted,
+    Started,
+    Unknown,
+}
+
+fn broker_launch_error_status(error: &anyhow::Error) -> BrokerLaunchFailure {
+    let text = format!("{error:#}");
+    if text.contains("wait for helper-launched Homebrew worker")
+        || (text.contains("persist broker job completion")
+            && !text.contains("broker job completion also failed"))
+    {
+        BrokerLaunchFailure::Started
+    } else if text.contains(": connect ") && error.chain().any(|cause| cause.is::<std::io::Error>())
+    {
+        BrokerLaunchFailure::NotStarted
+    } else if error
+        .chain()
+        .any(|cause| cause.to_string().contains("broker control transport error"))
+    {
+        BrokerLaunchFailure::Unknown
+    } else {
+        BrokerLaunchFailure::NotStarted
+    }
+}
+
+fn broker_launch_failure_result(
+    failure: BrokerLaunchFailure,
+    error: &anyhow::Error,
+) -> BrokerUpgradeResult {
+    match failure {
+        BrokerLaunchFailure::Started => BrokerUpgradeResult::Failed(format!(
+            "Homebrew worker launch result was unsuccessful: {error}"
+        )),
+        BrokerLaunchFailure::Unknown => BrokerUpgradeResult::Unconfirmed(format!(
+            "Homebrew worker launch result is unknown: {error}"
+        )),
+        BrokerLaunchFailure::NotStarted => BrokerUpgradeResult::Deferred(format!(
+            "helper-launched Homebrew worker was unavailable: {error}"
+        )),
+    }
+}
+
 enum BrokerUpgradeResult {
+    /// The privileged worker ran the upgrade and reported its result. The
+    /// upgrade was really attempted, whatever the exit status was.
     Completed((String, String, i32)),
+    /// The worker launch is confirmed, but the final result is unavailable.
+    Failed(String),
+    /// The launch outcome cannot be confirmed. Require an explicit decision
+    /// before retrying, but do not count an unconfirmed launch as an attempt.
+    Unconfirmed(String),
+    /// The upgrade was never launched (bridge missing, broker inactive,
+    /// privilege not granted). No upgrade was attempted.
     Deferred(String),
 }
 
@@ -1652,8 +1770,9 @@ fn brew_cask_maintenance(
     config: &MbrewConfig,
     logger: &ModuleLogger,
     only: Option<&std::collections::BTreeSet<String>>,
+    skip: &std::collections::BTreeSet<String>,
 ) -> anyhow::Result<BrewMaintenanceOutcome> {
-    brew_cask_maintenance_with_broker(config, logger, only, None)
+    brew_cask_maintenance_with_broker(config, logger, only, None, skip)
 }
 
 fn brew_cask_maintenance_with_broker(
@@ -1661,6 +1780,7 @@ fn brew_cask_maintenance_with_broker(
     logger: &ModuleLogger,
     only: Option<&std::collections::BTreeSet<String>>,
     broker: Option<&crate::control::SharedBroker>,
+    skip: &std::collections::BTreeSet<String>,
 ) -> anyhow::Result<BrewMaintenanceOutcome> {
     let (outdated_out, outdated_err, outdated_status) = command_for_brew(
         config,
@@ -1681,6 +1801,7 @@ fn brew_cask_maintenance_with_broker(
     if let Some(only) = only {
         casks.retain(|cask| only.contains(cask));
     }
+    casks.retain(|cask| !skip.contains(cask));
     let mut outcome = BrewMaintenanceOutcome::default();
 
     for cask in casks {
@@ -1714,9 +1835,20 @@ fn brew_cask_maintenance_with_broker(
             continue;
         };
         let upgrade = match brokered_cask_upgrade(config, &cask, &metadata.identity, broker) {
-            Ok(BrokerUpgradeResult::Completed(output)) => Ok(output),
+            Ok(BrokerUpgradeResult::Completed(output)) => {
+                outcome.attempted_casks.insert(cask.clone());
+                Ok(output)
+            }
+            Ok(BrokerUpgradeResult::Failed(reason)) => {
+                outcome.attempted_casks.insert(cask.clone());
+                Err(anyhow::anyhow!(reason))
+            }
             Ok(BrokerUpgradeResult::Deferred(reason)) => {
                 defer_cask(&mut outcome, logger, &cask, &reason);
+                continue;
+            }
+            Ok(BrokerUpgradeResult::Unconfirmed(reason)) => {
+                defer_cask_for_attention(&mut outcome, logger, &cask, &reason);
                 continue;
             }
             Err(error) => Err(error),
@@ -1799,8 +1931,9 @@ fn brew_maintenance(
     config: &MbrewConfig,
     logger: &ModuleLogger,
     action: Option<&str>,
+    state_dir: &Path,
 ) -> anyhow::Result<BrewMaintenanceOutcome> {
-    brew_maintenance_with_broker(config, logger, action, None)
+    brew_maintenance_with_broker(config, logger, action, None, state_dir)
 }
 
 fn brew_maintenance_with_broker(
@@ -1808,17 +1941,20 @@ fn brew_maintenance_with_broker(
     logger: &ModuleLogger,
     action: Option<&str>,
     broker: Option<&crate::control::SharedBroker>,
+    state_dir: &Path,
 ) -> anyhow::Result<BrewMaintenanceOutcome> {
     if action == Some("retry_pending") {
-        let only = retry_candidates()?;
-        let outcome = brew_cask_maintenance_with_broker(config, logger, Some(&only), broker)
-            .unwrap_or_else(|error| BrewMaintenanceOutcome {
-                cask_error: Some(error.to_string()),
-                ..BrewMaintenanceOutcome::default()
-            });
-        record_cask_ledger(&outcome, true)?;
+        let only = retry_candidates(state_dir)?;
+        let dismissed = dismissed_casks(state_dir)?;
+        let outcome =
+            brew_cask_maintenance_with_broker(config, logger, Some(&only), broker, &dismissed)
+                .unwrap_or_else(|error| BrewMaintenanceOutcome {
+                    cask_error: Some(error.to_string()),
+                    ..BrewMaintenanceOutcome::default()
+                });
+        record_cask_ledger(state_dir, &outcome, true)?;
         if outcome.cask_error.is_none() {
-            clear_resolved_retries(&only, &outcome)?;
+            clear_resolved_retries(state_dir, &only, &outcome)?;
         }
         if let Some(error) = outcome.cask_error.as_deref() {
             bail!("{error}");
@@ -1853,7 +1989,9 @@ fn brew_maintenance_with_broker(
     if !formula_out.trim().is_empty() {
         logger.info(formula_out.trim());
     }
-    let mut outcome = brew_cask_maintenance_with_broker(config, logger, None, broker)
+    let mut excluded = dismissed_casks(state_dir)?;
+    excluded.extend(attention_casks(state_dir)?);
+    let mut outcome = brew_cask_maintenance_with_broker(config, logger, None, broker, &excluded)
         .unwrap_or_else(|error| BrewMaintenanceOutcome {
             cask_error: Some(error.to_string()),
             ..BrewMaintenanceOutcome::default()
@@ -1868,7 +2006,7 @@ fn brew_maintenance_with_broker(
     if let Err(error) = run_cleanup(config, logger) {
         outcome.cleanup_error = Some(error.to_string());
     }
-    record_cask_ledger(&outcome, false)?;
+    record_cask_ledger(state_dir, &outcome, false)?;
     Ok(outcome)
 }
 
@@ -1888,11 +2026,17 @@ struct PackageRecord {
     name: String,
     state: String,
     reason: Option<String>,
+    /// Number of REAL upgrade attempts (a launched `brew upgrade`) for this
+    /// cask. Pure deferrals never increase it.
     attempts: u32,
     retry: bool,
+    /// Set when the user dismissed this cask: it stays visible in the ledger
+    /// but is never re-prompted and never retried automatically.
+    #[serde(default)]
+    dismissed: bool,
 }
-fn ledger_path() -> std::path::PathBuf {
-    crate::paths::resolve_state_dir().join("mbrew-outcomes.json")
+fn ledger_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("mbrew-outcomes.json")
 }
 fn read_ledger(path: &Path) -> anyhow::Result<PackageLedger> {
     match std::fs::read_to_string(path) {
@@ -1903,14 +2047,30 @@ fn read_ledger(path: &Path) -> anyhow::Result<PackageLedger> {
             .with_context(|| format!("read Homebrew outcome ledger at {}", path.display())),
     }
 }
-fn load_ledger() -> anyhow::Result<PackageLedger> {
-    read_ledger(&ledger_path())
+fn load_ledger(state_dir: &Path) -> anyhow::Result<PackageLedger> {
+    read_ledger(&ledger_path(state_dir))
 }
-fn retry_candidates() -> anyhow::Result<std::collections::BTreeSet<String>> {
-    Ok(load_ledger()?
+fn retry_candidates(state_dir: &Path) -> anyhow::Result<std::collections::BTreeSet<String>> {
+    Ok(load_ledger(state_dir)?
         .packages
         .into_iter()
-        .filter(|record| record.retry)
+        .filter(|record| record.retry && !record.dismissed)
+        .map(|record| record.name)
+        .collect())
+}
+fn dismissed_casks(state_dir: &Path) -> anyhow::Result<std::collections::BTreeSet<String>> {
+    Ok(load_ledger(state_dir)?
+        .packages
+        .into_iter()
+        .filter(|record| record.dismissed)
+        .map(|record| record.name)
+        .collect())
+}
+fn attention_casks(state_dir: &Path) -> anyhow::Result<std::collections::BTreeSet<String>> {
+    Ok(load_ledger(state_dir)?
+        .packages
+        .into_iter()
+        .filter(|record| record.state == "attention")
         .map(|record| record.name)
         .collect())
 }
@@ -1920,8 +2080,13 @@ fn persist_ledger(path: &Path, ledger: &PackageLedger) -> anyhow::Result<()> {
         .with_context(|| format!("persist Homebrew outcome ledger at {}", path.display()))
 }
 
-fn record_cask_ledger(outcome: &BrewMaintenanceOutcome, pending_retry: bool) -> anyhow::Result<()> {
-    let mut ledger = load_ledger()?;
+fn record_cask_ledger(
+    state_dir: &Path,
+    outcome: &BrewMaintenanceOutcome,
+    pending_retry: bool,
+) -> anyhow::Result<()> {
+    let _guard = lock_ledger(state_dir)?;
+    let mut ledger = load_ledger(state_dir)?;
     if !pending_retry {
         ledger.formula_error = outcome.formula_error.clone();
         ledger.cleanup_error = outcome.cleanup_error.clone();
@@ -1950,35 +2115,55 @@ fn record_cask_ledger(outcome: &BrewMaintenanceOutcome, pending_retry: bool) -> 
                 .map(|name| (name.clone(), "attention".to_string(), false)),
         );
     for (name, state, retry) in updates {
-        let attempts = ledger
+        let previous = ledger
             .packages
             .iter()
             .find(|record| record.name == name)
-            .map(|record| record.attempts.saturating_add(1))
-            .unwrap_or(1);
+            .cloned();
+        // `attempts` counts REAL upgrade attempts only. A cask that is merely
+        // deferred (an app is running, the broker is unavailable, metadata is
+        // unusable) never had an upgrade launched for it, so it must not
+        // accumulate attempts. A repaired or failed cask did have a real
+        // upgrade attempt and therefore counts as one.
+        let attempts = if outcome.attempted_casks.contains(&name) {
+            previous
+                .as_ref()
+                .map(|record| record.attempts.saturating_add(1))
+                .unwrap_or(1)
+        } else {
+            previous.as_ref().map(|record| record.attempts).unwrap_or(0)
+        };
+        let dismissed = previous
+            .as_ref()
+            .map(|record| record.dismissed)
+            .unwrap_or(false)
+            || outcome.dismissed_casks.contains(&name);
         ledger.packages.retain(|record| record.name != name);
         ledger.packages.push(PackageRecord {
             reason: outcome.reasons.get(&name).cloned(),
             name,
             state,
             attempts,
-            retry,
+            retry: retry && !dismissed,
+            dismissed,
         });
     }
-    persist_ledger(&ledger_path(), &ledger)
+    persist_ledger(&ledger_path(state_dir), &ledger)
 }
 
 fn clear_resolved_retries(
+    state_dir: &Path,
     candidates: &std::collections::BTreeSet<String>,
     outcome: &BrewMaintenanceOutcome,
 ) -> anyhow::Result<()> {
+    let _guard = lock_ledger(state_dir)?;
     let observed = outcome
         .repaired_casks
         .iter()
         .chain(&outcome.deferred_casks)
         .chain(&outcome.failed_casks)
         .collect::<BTreeSet<_>>();
-    let mut ledger = load_ledger()?;
+    let mut ledger = load_ledger(state_dir)?;
     for record in &mut ledger.packages {
         if candidates.contains(&record.name) && !observed.contains(&record.name) {
             record.state = "current".to_string();
@@ -1986,7 +2171,87 @@ fn clear_resolved_retries(
             record.retry = false;
         }
     }
-    persist_ledger(&ledger_path(), &ledger)
+    persist_ledger(&ledger_path(state_dir), &ledger)
+}
+
+/// A user decision about a single cask that is waiting for attention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaskDecision {
+    /// The user approves the work: clear the attention state so the next
+    /// maintenance or retry run attempts the cask again.
+    Approve,
+    /// The user dismisses the cask: keep it visible in the ledger, but never
+    /// re-prompt for it and never retry it automatically.
+    Dismiss,
+    /// The user asks for another attempt: make the cask eligible again.
+    Retry,
+}
+
+impl CaskDecision {
+    /// Parses the decision names accepted by the control center.
+    pub fn parse(raw: &str) -> anyhow::Result<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "approve" | "approved" | "allow" => Ok(Self::Approve),
+            "dismiss" | "dismissed" | "deny" | "denied" => Ok(Self::Dismiss),
+            "retry" | "retry_pending" => Ok(Self::Retry),
+            other => anyhow::bail!("unsupported cask decision \"{other}\""),
+        }
+    }
+}
+
+/// Applies a user decision about one cask to the Homebrew outcome ledger.
+///
+/// The decision is persisted in the ledger file, so it survives a restart of
+/// the service. The call is safe to make while a maintenance run is in
+/// progress: the ledger read-modify-write cycle is serialized.
+pub fn apply_cask_decision(
+    state_dir: &Path,
+    cask: &str,
+    decision: CaskDecision,
+) -> anyhow::Result<()> {
+    let cask = cask.trim();
+    if cask.is_empty() {
+        anyhow::bail!("a cask name is required");
+    }
+    let _guard = lock_ledger(state_dir)?;
+    let mut ledger = load_ledger(state_dir)?;
+    let Some(record) = ledger
+        .packages
+        .iter_mut()
+        .find(|record| record.name == cask)
+    else {
+        anyhow::bail!("cask \"{cask}\" is not present in the Homebrew outcome ledger");
+    };
+    match decision {
+        CaskDecision::Approve => {
+            // The cask no longer needs a decision: clear the attention state so
+            // the next run attempts it again, and let it be retried.
+            record.dismissed = false;
+            if record.state == "attention" {
+                record.state = "deferred".to_string();
+            }
+            record.retry = true;
+        }
+        CaskDecision::Dismiss => {
+            // The cask stays visible in the ledger, but it is never re-prompted
+            // and never retried automatically.
+            record.dismissed = true;
+            record.retry = false;
+            if record.state == "attention" {
+                record.state = "dismissed".to_string();
+            }
+        }
+        CaskDecision::Retry => {
+            // Re-running is driven by the `retry_pending` action; the hook only
+            // has to make the cask eligible again.
+            record.dismissed = false;
+            record.retry = true;
+            if record.state == "attention" {
+                record.state = "deferred".to_string();
+            }
+        }
+    }
+    persist_ledger(&ledger_path(state_dir), &ledger)
 }
 
 pub fn setup(context: &mut ModuleContext) -> anyhow::Result<()> {
@@ -2001,11 +2266,16 @@ pub fn setup(context: &mut ModuleContext) -> anyhow::Result<()> {
 
 pub fn run_once(context: &mut ModuleContext) -> anyhow::Result<Option<ModuleStatus>> {
     let config = update_from_config(context)?;
+    // Resolve the production state directory once, at the entry point, and
+    // thread it down. Tests call the lower level helpers with a temp dir so
+    // they never touch the real ledger.
+    let state_dir = crate::paths::resolve_state_dir();
     let result = brew_maintenance_with_broker(
         &config,
         &context.logger,
         context.action.as_deref(),
         context.broker.as_ref(),
+        &state_dir,
     );
     let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
 
@@ -2651,6 +2921,7 @@ exit 1
             &config,
             &ModuleLogger::new(root.path().to_path_buf(), "mbrew", false),
             None,
+            root.path(),
         )?;
 
         let log = fs::read_to_string(log)?;
@@ -2681,6 +2952,7 @@ exit 1
             &config,
             &ModuleLogger::new(root.path().to_path_buf(), "mbrew", false),
             None,
+            root.path(),
         )
         .expect_err("untrusted entries must stop maintenance");
 
@@ -2747,6 +3019,10 @@ exit 1
         osascript_body: &str,
     ) -> anyhow::Result<(BrewMaintenanceOutcome, String)> {
         let root = tempdir()?;
+        // The ledger lives in a task-local state directory: a unit test must
+        // never write the production ledger under ~/Library/Application Support.
+        let state_dir = root.path().join("state");
+        fs::create_dir_all(&state_dir)?;
         let fake_bin = root.path().join("bin");
         fs::create_dir_all(&fake_bin)?;
         let brew = fake_bin.join("brew");
@@ -2764,6 +3040,7 @@ exit 1
                 &config,
                 &ModuleLogger::new(root.path().to_path_buf(), "mbrew", false),
                 None,
+                &state_dir,
             )
         });
         if let Some(value) = previous_log {
@@ -2820,6 +3097,7 @@ exit 1
                         reason: Some("application running".to_string()),
                         attempts: 2,
                         retry: true,
+                        dismissed: false,
                     },
                     PackageRecord {
                         name: "attention-cask".to_string(),
@@ -2827,6 +3105,7 @@ exit 1
                         reason: Some("metadata unavailable".to_string()),
                         attempts: 1,
                         retry: false,
+                        dismissed: false,
                     },
                     PackageRecord {
                         name: "stale-cask".to_string(),
@@ -2834,6 +3113,7 @@ exit 1
                         reason: Some("application running".to_string()),
                         attempts: 3,
                         retry: true,
+                        dismissed: false,
                     },
                 ],
                 formula_error: Some("prior formula warning".to_string()),
@@ -2851,6 +3131,7 @@ exit 1
                 &config,
                 &ModuleLogger::new(root.path().to_path_buf(), "mbrew", false),
                 Some("retry_pending"),
+                &state_dir,
             )
         });
         if let Some(value) = previous_home {
@@ -2980,6 +3261,11 @@ exit 1
         let config = default_config(root.path(), &root.path().join("brew"), &askpass);
         crate::credentials::store_admin_password("super-secret")?;
 
+        let tracked = askpass_source_path()?;
+        let tracked_content = fs::read(&tracked)
+            .with_context(|| format!("read tracked askpass helper {}", tracked.display()))?;
+        let previous_root = std::env::var_os("SCRIPTD_ROOT_DIR");
+        std::env::set_var("SCRIPTD_ROOT_DIR", tracked_root());
         with_path_scope(&fake_bin, || {
             assert!(!askpass.exists());
             ensure_askpass(
@@ -2989,8 +3275,15 @@ exit 1
             .expect("askpass written");
             assert!(askpass.exists());
         });
-        let content = fs::read_to_string(&askpass)?;
-        assert!(content.contains("sudoers setup is required"));
+        match previous_root {
+            Some(value) => std::env::set_var("SCRIPTD_ROOT_DIR", value),
+            None => std::env::remove_var("SCRIPTD_ROOT_DIR"),
+        }
+        let content = fs::read(&askpass)?;
+        assert_eq!(
+            content, tracked_content,
+            "the installed askpass helper must match the tracked repository asset"
+        );
         Ok(())
     }
 
@@ -3071,6 +3364,447 @@ exit 1
         assert_eq!(args, expected);
         assert!(build_brew_command(&config, &["upgrade"], 0, Some(0)).is_err());
         assert!(build_brew_command(&config, &["upgrade"], 0, None).is_err());
+        Ok(())
+    }
+
+    fn seed_ledger(state_dir: &Path, packages: Vec<PackageRecord>) -> anyhow::Result<()> {
+        fs::create_dir_all(state_dir)?;
+        fs::write(
+            ledger_path(state_dir),
+            serde_json::to_vec(&PackageLedger {
+                packages,
+                formula_error: None,
+                cleanup_error: None,
+                cask_error: None,
+            })?,
+        )?;
+        Ok(())
+    }
+
+    fn record(name: &str, state: &str, attempts: u32, retry: bool) -> PackageRecord {
+        PackageRecord {
+            name: name.to_string(),
+            state: state.to_string(),
+            reason: Some("reason".to_string()),
+            attempts,
+            retry,
+            dismissed: false,
+        }
+    }
+
+    #[test]
+    fn deferred_casks_do_not_accumulate_upgrade_attempts() -> anyhow::Result<()> {
+        let root = tempdir()?;
+        let state_dir = root.path().join("state");
+        seed_ledger(
+            &state_dir,
+            vec![record("deferred-cask", "deferred", 4, true)],
+        )?;
+
+        // A pure deferral: the cask was never upgraded, so no attempt is made.
+        let outcome = BrewMaintenanceOutcome {
+            deferred_casks: vec!["deferred-cask".to_string()],
+            retryable_casks: BTreeSet::from(["deferred-cask".to_string()]),
+            reasons: BTreeMap::from([("deferred-cask".to_string(), "app running".to_string())]),
+            ..BrewMaintenanceOutcome::default()
+        };
+        record_cask_ledger(&state_dir, &outcome, false)?;
+
+        let ledger = load_ledger(&state_dir)?;
+        let entry = ledger
+            .packages
+            .iter()
+            .find(|item| item.name == "deferred-cask")
+            .expect("deferred cask stays in the ledger");
+        assert_eq!(entry.attempts, 4, "a deferral is not an upgrade attempt");
+        assert_eq!(entry.state, "deferred");
+        assert!(entry.retry);
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_deferrals_never_raise_the_attempt_counter() -> anyhow::Result<()> {
+        let root = tempdir()?;
+        let state_dir = root.path().join("state");
+        seed_ledger(
+            &state_dir,
+            vec![record("deferred-cask", "deferred", 0, true)],
+        )?;
+
+        for _ in 0..5 {
+            let outcome = BrewMaintenanceOutcome {
+                deferred_casks: vec!["deferred-cask".to_string()],
+                retryable_casks: BTreeSet::from(["deferred-cask".to_string()]),
+                ..BrewMaintenanceOutcome::default()
+            };
+            record_cask_ledger(&state_dir, &outcome, false)?;
+        }
+
+        let ledger = load_ledger(&state_dir)?;
+        let entry = ledger
+            .packages
+            .iter()
+            .find(|item| item.name == "deferred-cask")
+            .expect("deferred cask stays in the ledger");
+        assert_eq!(entry.attempts, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn a_real_upgrade_attempt_counts_once_and_a_repair_counts_once() -> anyhow::Result<()> {
+        let root = tempdir()?;
+        let state_dir = root.path().join("state");
+        seed_ledger(
+            &state_dir,
+            vec![record("repaired-cask", "deferred", 2, true)],
+        )?;
+
+        let outcome = BrewMaintenanceOutcome {
+            repaired_casks: vec!["repaired-cask".to_string()],
+            attempted_casks: BTreeSet::from(["repaired-cask".to_string()]),
+            ..BrewMaintenanceOutcome::default()
+        };
+        record_cask_ledger(&state_dir, &outcome, false)?;
+
+        let ledger = load_ledger(&state_dir)?;
+        let entry = ledger
+            .packages
+            .iter()
+            .find(|item| item.name == "repaired-cask")
+            .expect("repaired cask stays in the ledger");
+        assert_eq!(entry.attempts, 3, "a real upgrade attempt counts once");
+        assert_eq!(entry.state, "updated");
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_upgrade_counts_as_one_attempt() -> anyhow::Result<()> {
+        let root = tempdir()?;
+        let state_dir = root.path().join("state");
+        seed_ledger(&state_dir, vec![record("failed-cask", "deferred", 1, true)])?;
+
+        let outcome = BrewMaintenanceOutcome {
+            failed_casks: vec!["failed-cask".to_string()],
+            attention_casks: BTreeSet::from(["failed-cask".to_string()]),
+            attempted_casks: BTreeSet::from(["failed-cask".to_string()]),
+            ..BrewMaintenanceOutcome::default()
+        };
+        record_cask_ledger(&state_dir, &outcome, false)?;
+
+        let ledger = load_ledger(&state_dir)?;
+        let entry = ledger
+            .packages
+            .iter()
+            .find(|item| item.name == "failed-cask")
+            .expect("failed cask stays in the ledger");
+        assert_eq!(entry.attempts, 2);
+        assert_eq!(entry.state, "attention");
+        assert!(!entry.retry);
+        Ok(())
+    }
+
+    #[test]
+    fn prelaunch_failure_does_not_increment_the_attempt_counter() -> anyhow::Result<()> {
+        let root = tempdir()?;
+        let state_dir = root.path().join("state");
+        seed_ledger(&state_dir, vec![record("failed-cask", "deferred", 3, true)])?;
+
+        let outcome = BrewMaintenanceOutcome {
+            failed_casks: vec!["failed-cask".to_string()],
+            attention_casks: BTreeSet::from(["failed-cask".to_string()]),
+            ..BrewMaintenanceOutcome::default()
+        };
+        record_cask_ledger(&state_dir, &outcome, false)?;
+
+        let entry = load_ledger(&state_dir)?.packages.remove(0);
+        assert_eq!(entry.attempts, 3);
+        assert_eq!(entry.state, "attention");
+        Ok(())
+    }
+
+    #[test]
+    fn broker_launch_errors_preserve_confirmed_attempt_boundary() {
+        let launched = anyhow::anyhow!("wait for helper-launched Homebrew worker: interrupted");
+        assert_eq!(
+            broker_launch_error_status(&launched),
+            BrokerLaunchFailure::Started
+        );
+        assert!(matches!(
+            broker_launch_failure_result(BrokerLaunchFailure::Started, &launched),
+            BrokerUpgradeResult::Failed(_)
+        ));
+        let completion = anyhow::anyhow!("persist broker job completion: audit file unavailable");
+        assert_eq!(
+            broker_launch_error_status(&completion),
+            BrokerLaunchFailure::Started
+        );
+        let release = anyhow::anyhow!("release the authenticated Homebrew worker: partial write");
+        assert_eq!(
+            broker_launch_error_status(&release),
+            BrokerLaunchFailure::NotStarted
+        );
+        let spawn = anyhow::anyhow!("launch the normal-user Homebrew worker: executable missing");
+        assert_eq!(
+            broker_launch_error_status(&spawn),
+            BrokerLaunchFailure::NotStarted
+        );
+        let bind = anyhow::anyhow!("bind the helper-launched Homebrew worker: rejected");
+        assert_eq!(
+            broker_launch_error_status(&bind),
+            BrokerLaunchFailure::NotStarted
+        );
+        let compound =
+            anyhow::anyhow!("broker job completion also failed: persist broker job completion");
+        assert_eq!(
+            broker_launch_error_status(&compound),
+            BrokerLaunchFailure::NotStarted
+        );
+        let connection_refused = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "connection refused",
+        ))
+        .context("connect /tmp/scriptd-broker.sock")
+        .context("broker control transport error");
+        assert_eq!(
+            broker_launch_error_status(&connection_refused),
+            BrokerLaunchFailure::NotStarted
+        );
+        assert!(matches!(
+            broker_launch_failure_result(BrokerLaunchFailure::NotStarted, &connection_refused),
+            BrokerUpgradeResult::Deferred(_)
+        ));
+
+        let lost_response = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "broker closed the connection after launching the worker",
+        ))
+        .context("read broker response")
+        .context("broker control transport error");
+        assert_eq!(
+            broker_launch_error_status(&lost_response),
+            BrokerLaunchFailure::Unknown
+        );
+        assert!(matches!(
+            broker_launch_failure_result(
+                broker_launch_error_status(&lost_response),
+                &lost_response
+            ),
+            BrokerUpgradeResult::Unconfirmed(_)
+        ));
+    }
+
+    #[test]
+    fn unconfirmed_broker_launch_requires_attention_without_counting_attempt() -> anyhow::Result<()>
+    {
+        let root = tempdir()?;
+        let state_dir = root.path().join("state");
+        seed_ledger(
+            &state_dir,
+            vec![record("uncertain-cask", "deferred", 4, true)],
+        )?;
+        let logger = ModuleLogger::new(root.path().to_path_buf(), "mbrew", false);
+        let error = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "broker closed the connection after launching the worker",
+        ))
+        .context("read broker response")
+        .context("broker control transport error");
+        let result = broker_launch_failure_result(broker_launch_error_status(&error), &error);
+        let mut outcome = BrewMaintenanceOutcome::default();
+        let BrokerUpgradeResult::Unconfirmed(reason) = result else {
+            panic!("a lost broker response must remain unconfirmed");
+        };
+        defer_cask_for_attention(&mut outcome, &logger, "uncertain-cask", &reason);
+
+        assert!(outcome.attempted_casks.is_empty());
+        assert!(!outcome.retryable_casks.contains("uncertain-cask"));
+        assert!(outcome.attention_casks.contains("uncertain-cask"));
+        record_cask_ledger(&state_dir, &outcome, false)?;
+        let entry = load_ledger(&state_dir)?.packages.remove(0);
+        assert_eq!(entry.attempts, 4);
+        assert_eq!(entry.state, "attention");
+        assert!(!entry.retry);
+        Ok(())
+    }
+
+    #[test]
+    fn unresolved_attention_is_excluded_until_a_decision_approves_it() -> anyhow::Result<()> {
+        let root = tempdir()?;
+        let state_dir = root.path().join("state");
+        seed_ledger(
+            &state_dir,
+            vec![record("attention-cask", "attention", 1, false)],
+        )?;
+
+        assert!(attention_casks(&state_dir)?.contains("attention-cask"));
+        apply_cask_decision(&state_dir, "attention-cask", CaskDecision::Approve)?;
+        assert!(!attention_casks(&state_dir)?.contains("attention-cask"));
+        assert!(retry_candidates(&state_dir)?.contains("attention-cask"));
+        Ok(())
+    }
+
+    #[test]
+    fn dismissed_casks_stay_excluded_after_reopening_the_ledger() -> anyhow::Result<()> {
+        let root = tempdir()?;
+        let state_dir = root.path().join("state");
+        seed_ledger(
+            &state_dir,
+            vec![record("attention-cask", "attention", 1, false)],
+        )?;
+
+        apply_cask_decision(&state_dir, "attention-cask", CaskDecision::Dismiss)?;
+
+        let reopened = read_ledger(&ledger_path(&state_dir))?;
+        let entry = reopened
+            .packages
+            .iter()
+            .find(|entry| entry.name == "attention-cask")
+            .expect("dismissed cask remains in the reopened ledger");
+        assert!(entry.dismissed);
+        assert!(!entry.retry);
+        assert!(!retry_candidates(&state_dir)?.contains("attention-cask"));
+        Ok(())
+    }
+
+    #[test]
+    fn approving_a_cask_clears_attention_and_makes_it_eligible_again() -> anyhow::Result<()> {
+        let root = tempdir()?;
+        let state_dir = root.path().join("state");
+        seed_ledger(
+            &state_dir,
+            vec![record("attention-cask", "attention", 2, false)],
+        )?;
+
+        apply_cask_decision(&state_dir, "attention-cask", CaskDecision::Approve)?;
+
+        let ledger = load_ledger(&state_dir)?;
+        let entry = ledger
+            .packages
+            .iter()
+            .find(|item| item.name == "attention-cask")
+            .expect("the cask stays visible in the ledger");
+        assert_eq!(entry.state, "deferred");
+        assert!(entry.retry, "an approved cask is retried by the next run");
+        assert!(!entry.dismissed);
+        assert_eq!(entry.attempts, 2, "a decision is not an upgrade attempt");
+        Ok(())
+    }
+
+    #[test]
+    fn dismissing_a_cask_keeps_it_visible_but_stops_retry_and_prompting() -> anyhow::Result<()> {
+        let root = tempdir()?;
+        let state_dir = root.path().join("state");
+        seed_ledger(
+            &state_dir,
+            vec![record("attention-cask", "attention", 1, false)],
+        )?;
+
+        apply_cask_decision(&state_dir, "attention-cask", CaskDecision::Dismiss)?;
+
+        let ledger = load_ledger(&state_dir)?;
+        let entry = ledger
+            .packages
+            .iter()
+            .find(|item| item.name == "attention-cask")
+            .expect("a dismissed cask is still visible in the ledger");
+        assert!(entry.dismissed);
+        assert!(!entry.retry);
+        assert_ne!(
+            entry.state, "attention",
+            "a dismissed cask is not re-prompted"
+        );
+        assert!(!retry_candidates(&state_dir)?.contains("attention-cask"));
+        assert!(dismissed_casks(&state_dir)?.contains("attention-cask"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_decision_for_an_unknown_cask_is_rejected() -> anyhow::Result<()> {
+        let root = tempdir()?;
+        let state_dir = root.path().join("state");
+        seed_ledger(
+            &state_dir,
+            vec![record("attention-cask", "attention", 1, false)],
+        )?;
+
+        let error = apply_cask_decision(&state_dir, "missing-cask", CaskDecision::Approve)
+            .expect_err("an unknown cask must be rejected");
+        assert!(error.to_string().contains("missing-cask"));
+        assert!(apply_cask_decision(&state_dir, "  ", CaskDecision::Approve).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn cask_decision_names_are_parsed() -> anyhow::Result<()> {
+        assert_eq!(CaskDecision::parse("approve")?, CaskDecision::Approve);
+        assert_eq!(CaskDecision::parse("Dismiss")?, CaskDecision::Dismiss);
+        assert_eq!(CaskDecision::parse("retry")?, CaskDecision::Retry);
+        assert!(CaskDecision::parse("nonsense").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn unit_tests_never_write_the_production_ledger() -> anyhow::Result<()> {
+        // The production ledger must never be a target of a unit test: the
+        // module threads an explicit state directory through every ledger
+        // call, so the real file is only reachable from the production entry
+        // point that resolves the state directory itself.
+        let root = tempdir()?;
+        let state_dir = root.path().join("state");
+        seed_ledger(
+            &state_dir,
+            vec![record("deferred-cask", "deferred", 0, true)],
+        )?;
+        let outcome = BrewMaintenanceOutcome {
+            deferred_casks: vec!["deferred-cask".to_string()],
+            retryable_casks: BTreeSet::from(["deferred-cask".to_string()]),
+            ..BrewMaintenanceOutcome::default()
+        };
+        record_cask_ledger(&state_dir, &outcome, false)?;
+
+        assert!(ledger_path(&state_dir).starts_with(&state_dir));
+        assert!(ledger_path(&state_dir).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn a_decision_is_safe_while_a_run_records_its_outcome() -> anyhow::Result<()> {
+        let root = tempdir()?;
+        let state_dir = root.path().join("state");
+        seed_ledger(
+            &state_dir,
+            vec![record("attention-cask", "attention", 1, false)],
+        )?;
+
+        // A decision and a maintenance run both take the ledger lock, so the
+        // two read-modify-write cycles never interleave.
+        let decision = std::thread::spawn({
+            let state_dir = state_dir.clone();
+            move || apply_cask_decision(&state_dir, "attention-cask", CaskDecision::Approve)
+        });
+        let record_outcome = std::thread::spawn({
+            let state_dir = state_dir.clone();
+            move || {
+                let outcome = BrewMaintenanceOutcome {
+                    deferred_casks: vec!["other-cask".to_string()],
+                    retryable_casks: BTreeSet::from(["other-cask".to_string()]),
+                    ..BrewMaintenanceOutcome::default()
+                };
+                record_cask_ledger(&state_dir, &outcome, false)
+            }
+        });
+        decision.join().expect("decision thread")?;
+        record_outcome.join().expect("recording thread")?;
+
+        let ledger = load_ledger(&state_dir)?;
+        assert!(ledger
+            .packages
+            .iter()
+            .any(|item| item.name == "attention-cask" && item.state == "deferred"));
+        assert!(ledger
+            .packages
+            .iter()
+            .any(|item| item.name == "other-cask" && item.state == "deferred"));
         Ok(())
     }
 }

@@ -19,13 +19,6 @@ modules:
           schedule:
             daily_at: "00:00"
             timezone: Asia/Dhaka
-      retry:
-        action: retry_pending
-        fire:
-          mode: every_match
-        when:
-          schedule:
-            every_minutes: 60
 
   mcpu:
     enabled: true

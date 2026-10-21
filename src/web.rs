@@ -83,6 +83,7 @@ struct AppState {
     shutdown: Notify,
     stopping: watch::Sender<bool>,
     access: AccessController,
+    cask_attention: access::CaskAttentionController,
     snapshot_cache: Arc<SnapshotCache>,
     idle_changed: Notify,
     logs_notify: watch::Sender<u64>,
@@ -474,6 +475,7 @@ async fn serve(
         shutdown: Notify::new(),
         stopping,
         access,
+        cask_attention: access::CaskAttentionController::default(),
         snapshot_cache: Arc::clone(&snapshot_cache),
         idle_changed: Notify::new(),
         logs_notify: logs_notify.clone(),
@@ -640,6 +642,8 @@ fn bridge_router(state: Arc<AppState>) -> Router {
         .route("/api/access", get(access_status))
         .route("/api/access/request", post(access_request))
         .route("/api/access/poll", post(access_poll))
+        .route("/api/cask-attention/request", post(cask_attention_request))
+        .route("/api/cask-attention/poll", post(cask_attention_poll))
         .route("/api/access/revoke", post(access_revoke))
         .route("/api/access/list", get(access_list))
         .route("/events", get(events))
@@ -943,7 +947,11 @@ Label: {}",
             Ok(crate::approval::ApprovalDecision::Denied) => {
                 let _ = pending_state.access.resolve_claim(&claim, false);
             }
-            Ok(crate::approval::ApprovalDecision::Unavailable) | Err(_) => {
+            Ok(
+                crate::approval::ApprovalDecision::Unavailable
+                | crate::approval::ApprovalDecision::Dismissed,
+            )
+            | Err(_) => {
                 pending_state.access.cancel_claim(&claim);
             }
         }
@@ -994,6 +1002,197 @@ async fn access_poll(
         axum::http::HeaderValue::from_static("no-store"),
     );
     response
+}
+
+#[derive(Deserialize)]
+struct CaskAttentionBody {
+    casks: Vec<String>,
+    #[serde(default)]
+    dismiss: bool,
+}
+
+fn cask_attention_response(response: impl IntoResponse) -> axum::response::Response {
+    let mut response = response.into_response();
+    response.headers_mut().insert(
+        "cache-control",
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+/// Applies a user decision to each named cask in the Homebrew outcome ledger.
+///
+/// The decision is recorded in the ledger, so it survives a service restart.
+/// Fail closed: a cask whose decision cannot be applied stays pending, and the
+/// caller must not report the work as approved.
+fn apply_cask_decision(
+    state_dir: &Path,
+    casks: &[String],
+    decision: crate::modules::mbrew::CaskDecision,
+) -> Result<(), String> {
+    for cask in casks {
+        crate::modules::mbrew::apply_cask_decision(state_dir, cask, decision)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+async fn cask_attention_request(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<CaskAttentionBody>,
+) -> axum::response::Response {
+    if !authorized(&state, &headers) || !origin_allowed(header(&headers, "origin"), state.port) {
+        return cask_attention_response(reject(
+            StatusCode::FORBIDDEN,
+            "host, origin or grant was not accepted",
+        ));
+    }
+    if body.casks.is_empty() || body.casks.len() > 64 {
+        return cask_attention_response(reject(
+            StatusCode::BAD_REQUEST,
+            "select between 1 and 64 attention casks",
+        ));
+    }
+    let snapshot = match cached_service_snapshot(&state).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            return cask_attention_response(reject(StatusCode::BAD_GATEWAY, &error.to_string()))
+        }
+    };
+    let packages = snapshot.value["modules"]
+        .as_array()
+        .and_then(|modules| modules.iter().find(|module| module["id"] == "mbrew"))
+        .and_then(|module| module["outcomes"]["packages"].as_array());
+    let mut casks = Vec::new();
+    for name in &body.casks {
+        let item = packages.and_then(|packages| {
+            packages.iter().find(|item| {
+                item["name"].as_str() == Some(name.as_str()) && item["state"] == "attention"
+            })
+        });
+        let Some(item) = item else {
+            return cask_attention_response(reject(
+                StatusCode::CONFLICT,
+                "cask no longer needs a decision; refresh Brew Manager",
+            ));
+        };
+        if !casks
+            .iter()
+            .any(|item: &access::CaskAttentionItem| item.name == *name)
+        {
+            casks.push(access::CaskAttentionItem {
+                name: name.clone(),
+                reason: item["reason"]
+                    .as_str()
+                    .unwrap_or("User decision required")
+                    .to_string(),
+            });
+        }
+    }
+    let ticket = match state
+        .cask_attention
+        .open_request(casks.clone(), body.dismiss)
+    {
+        Ok(ticket) => ticket,
+        Err(message) => {
+            return cask_attention_response(reject(StatusCode::TOO_MANY_REQUESTS, &message))
+        }
+    };
+    if body.dismiss {
+        let names = casks
+            .iter()
+            .map(|item| item.name.clone())
+            .collect::<Vec<_>>();
+        if let Err(error) = apply_cask_decision(
+            &state.paths.state_dir,
+            &names,
+            crate::modules::mbrew::CaskDecision::Dismiss,
+        ) {
+            state
+                .cask_attention
+                .resolve_claim(&ticket.claim, access::CaskAttentionState::Unavailable);
+            return cask_attention_response(reject(StatusCode::INTERNAL_SERVER_ERROR, &error));
+        }
+        state.snapshot_cache.invalidate();
+        state
+            .cask_attention
+            .resolve_claim(&ticket.claim, access::CaskAttentionState::Dismissed);
+    } else {
+        let pending_state = Arc::clone(&state);
+        let claim = ticket.claim.clone();
+        let message = format!(
+            "Allow Brew Manager to retry these casks?\n{}\nIdentifier: {}",
+            casks
+                .iter()
+                .map(|item| format!(
+                    "{}: {}",
+                    item.name,
+                    item.reason.chars().take(160).collect::<String>()
+                ))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            ticket.identifier
+        );
+        tokio::spawn(async move {
+            use access::CaskAttentionState as Outcome;
+            let outcome = match crate::approval::request_approval(
+                "Brew Manager cask attention",
+                &message,
+                access::REQUEST_TIMEOUT,
+            )
+            .await
+            {
+                Ok(crate::approval::ApprovalDecision::Allowed)
+                    if pending_state.cask_attention.poll(&claim).0 == Outcome::Waiting =>
+                {
+                    let names = casks
+                        .iter()
+                        .map(|item| item.name.clone())
+                        .collect::<Vec<_>>();
+                    match apply_cask_decision(
+                        &pending_state.paths.state_dir,
+                        &names,
+                        crate::modules::mbrew::CaskDecision::Approve,
+                    ) {
+                        Ok(()) => {
+                            pending_state.snapshot_cache.invalidate();
+                            Outcome::Allowed
+                        }
+                        Err(error) => {
+                            eprintln!("{error}");
+                            Outcome::Unavailable
+                        }
+                    }
+                }
+                Ok(crate::approval::ApprovalDecision::Denied) => Outcome::Denied,
+                Ok(crate::approval::ApprovalDecision::Dismissed) => Outcome::Dismissed,
+                _ => Outcome::Unavailable,
+            };
+            pending_state.cask_attention.resolve_claim(&claim, outcome);
+        });
+    }
+    cask_attention_response(Json(json!({ "ok": true,
+        "state": if body.dismiss { "dismissed" } else { "waiting" },
+        "identifier": ticket.identifier, "claim": ticket.claim,
+    })))
+}
+
+async fn cask_attention_poll(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<access::AccessPollBody>,
+) -> axum::response::Response {
+    if !authorized(&state, &headers) || !origin_allowed(header(&headers, "origin"), state.port) {
+        return cask_attention_response(reject(
+            StatusCode::FORBIDDEN,
+            "host, origin or grant was not accepted",
+        ));
+    }
+    let (outcome, casks) = state.cask_attention.wait(&body.claim).await;
+    cask_attention_response(Json(
+        json!({ "ok": true, "state": outcome, "casks": casks }),
+    ))
 }
 
 async fn access_revoke(
@@ -1515,6 +1714,7 @@ mod tests {
             shutdown: Notify::new(),
             stopping: watch::channel(false).0,
             access: AccessController::new(grants),
+            cask_attention: access::CaskAttentionController::default(),
             snapshot_cache: Arc::new(SnapshotCache::new()),
             idle_changed: Notify::new(),
             logs_notify: watch::channel(0_u64).0,
@@ -1648,6 +1848,66 @@ mod tests {
             "the live stream requires a grant"
         );
         let _ = shutdown_tx.send(());
+    }
+
+    #[tokio::test]
+    async fn dismissing_a_cask_persists_before_reporting_success() {
+        let state = test_state(43123);
+        fs::write(
+            state.paths.repo.join("service.yaml"),
+            "version: 1\nmodules: {}\n",
+        )
+        .expect("write isolated service config");
+        fs::write(
+            state.paths.state_dir.join("mbrew-outcomes.json"),
+            serde_json::to_vec(&json!({
+                "packages": [{
+                    "name": "attention-cask",
+                    "state": "attention",
+                    "reason": "upgrade failed",
+                    "attempts": 1,
+                    "retry": false,
+                    "dismissed": false
+                }]
+            }))
+            .expect("encode isolated ledger"),
+        )
+        .expect("seed isolated ledger");
+        let approval = state.access.open_request("test").expect("open grant");
+        state
+            .access
+            .resolve_claim(&approval.claim, true)
+            .expect("approve test grant");
+        let grant = match state.access.poll(&approval.claim) {
+            access::PollOutcome::Allowed(grant) => grant,
+            _ => panic!("test grant should be available"),
+        };
+        let mut headers = headers_with_grant(43123, &grant);
+        headers.insert("origin", HeaderValue::from_static("http://127.0.0.1:43123"));
+
+        let response = cask_attention_request(
+            State(Arc::clone(&state)),
+            headers,
+            Json(CaskAttentionBody {
+                casks: vec!["attention-cask".into()],
+                dismiss: true,
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let ledger: Value = serde_json::from_slice(
+            &fs::read(state.paths.state_dir.join("mbrew-outcomes.json"))
+                .expect("read persisted ledger"),
+        )
+        .expect("parse persisted ledger");
+        let entry = &ledger["packages"][0];
+        assert_eq!(entry["state"], "dismissed");
+        assert_eq!(entry["dismissed"], true);
+        assert_eq!(entry["retry"], false);
+        let _ = cached_service_snapshot(&state)
+            .await
+            .expect("read snapshot after invalidation");
     }
 
     #[tokio::test]
@@ -2023,6 +2283,7 @@ mod tests {
             shutdown: Notify::new(),
             stopping: watch::channel(false).0,
             access: AccessController::new(grants),
+            cask_attention: access::CaskAttentionController::default(),
             snapshot_cache: Arc::new(SnapshotCache::new()),
             idle_changed: Notify::new(),
             logs_notify: watch::channel(0_u64).0,

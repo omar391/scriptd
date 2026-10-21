@@ -65,7 +65,8 @@ let appState = {
   snapshot: null, drafts: {}, logs: [], severity: 'all', search: '',
   follow: true, message: '', error: '', observationDelayed: false, loading: true, dialog: null, dialogFocus: null,
   saveDiff: null, serviceOnline: false, quitQueue: null, quitWorking: false,
-  accessState: 'unknown', pendingIdentifier: null, browserProfiles: []
+  accessState: 'unknown', pendingIdentifier: null, browserProfiles: [],
+  caskAttention: {}, caskAttentionClaim: null, caskAttentionIdentifier: null, caskAttentionBusy: false
 };
 let eventStreamAbortController;
 let reconnectTimer;
@@ -445,7 +446,7 @@ function loadSnapshot() {
     reconnectDelay = 1000;
     const snapshot = data.snapshot || {};
     const drafts = Object.assign({}, JSON.parse(localStorage.getItem('scriptd-drafts') || '{}'), appState.drafts);
-    appState = Object.assign({}, appState, { snapshot, drafts, serviceOnline: !!(snapshot.service && snapshot.service.running), observationDelayed: snapshot.observation === 'delayed', loading: false, error: '' });
+    appState = Object.assign({}, appState, { snapshot, caskAttention: reconcileCaskAttention(snapshot), drafts, serviceOnline: !!(snapshot.service && snapshot.service.running), observationDelayed: snapshot.observation === 'delayed', loading: false, error: '' });
     renderApp();
     api('/api/drafts').then(saved => {
       appState = Object.assign({}, appState, { drafts: Object.assign({}, saved.drafts || {}, appState.drafts) });
@@ -537,7 +538,7 @@ function openEventStream(generation) {
               setState({ error: data.message });
               continue;
             }
-            appState = Object.assign({}, appState, { snapshot: data, serviceOnline: !!(data.service && data.service.running), observationDelayed: data.observation === 'delayed', error: '' });
+            appState = Object.assign({}, appState, { snapshot: data, caskAttention: reconcileCaskAttention(data), serviceOnline: !!(data.service && data.service.running), observationDelayed: data.observation === 'delayed', error: '' });
             renderApp();
           } catch (_) {}
         }
@@ -830,6 +831,83 @@ function row(label, value) {
   return h('div', { class: 'key-row' }, h('span', null, label), h('strong', null, displayValue(value)));
 }
 
+function caskAttentionKey(item) {
+  return JSON.stringify([item.name, item.reason || 'User decision required']);
+}
+
+function attentionCasks(info) {
+  const packages = info.outcomes && Array.isArray(info.outcomes.packages) ? info.outcomes.packages : [];
+  return packages.filter(item => item.state === 'attention');
+}
+
+function reconcileCaskAttention(snapshot) {
+  const brew = (snapshot.modules || []).find(item => item.id === 'mbrew');
+  const active = new Set(attentionCasks(brew || {}).map(caskAttentionKey));
+  return Object.fromEntries(Object.entries(appState.caskAttention).filter(([key]) => active.has(key)));
+}
+
+async function requestCaskAttention(item, dismiss) {
+  const key = caskAttentionKey(item);
+  setState({ caskAttentionBusy: true, error: '' });
+  try {
+    const data = await api('/api/cask-attention/request', {
+      method: 'POST', body: JSON.stringify({ casks: [item.name], dismiss: !!dismiss })
+    });
+    setState({ caskAttention: Object.assign({}, appState.caskAttention, { [key]: data.state }),
+      caskAttentionClaim: data.claim, caskAttentionIdentifier: data.identifier });
+    if (data.state === 'waiting') await pollCaskAttention(data.claim);
+  } catch (error) {
+    setState({ error: error.message });
+  } finally {
+    setState({ caskAttentionBusy: false });
+  }
+}
+
+// One server-side wait is woken by the native decision; no browser timer.
+// A failed connection retains the private claim for an explicit Check decision.
+async function pollCaskAttention(claim) {
+  setState({ caskAttentionBusy: true, error: '' });
+  try {
+    const data = await api('/api/cask-attention/poll', {
+      method: 'POST', body: JSON.stringify({ claim })
+    });
+    const decisions = Object.assign({}, appState.caskAttention);
+    (data.casks || []).forEach(item => { decisions[caskAttentionKey(item)] = data.state; });
+    setState({ caskAttention: decisions, caskAttentionClaim: data.state === 'waiting' ? claim : null,
+      caskAttentionIdentifier: data.state === 'waiting' ? appState.caskAttentionIdentifier : null,
+      message: data.state === 'allowed' ? 'Brew Manager approval recorded. Retry pending casks when ready.'
+        : data.state === 'unavailable' ? 'Brew Manager could not apply the decision. Casks remain pending.'
+        : 'Brew Manager decision: ' + data.state + '. Pending casks remain visible.' });
+  } finally {
+    setState({ caskAttentionBusy: false });
+  }
+}
+
+function CaskAttentionPanel(info) {
+  const items = attentionCasks(info);
+  if (!items.length) return null;
+  return card('Brew Manager cask attention', h('div', { class: 'content-stack' },
+    h('div', { class: 'alert info', role: 'status' },
+      h('span', null, 'These casks need a user decision. Denying or dismissing keeps the work here.'),
+      appState.caskAttentionIdentifier ? h('span', null, 'Identifier: ' + appState.caskAttentionIdentifier) : null),
+    h('ul', { class: 'activity-list' }, items.map(item => {
+      const decision = appState.caskAttention[caskAttentionKey(item)];
+      return h('li', { key: caskAttentionKey(item) },
+        badge(decision || 'Needs decision', 'warn'),
+        h('span', null, displayValue(item.name) + ' · ' + displayValue(item.reason || 'User decision required')),
+        h('div', { class: 'editor-actions' },
+          button('Approve', () => requestCaskAttention(item, false), 'button primary',
+            { disabled: appState.caskAttentionBusy || !!decision }),
+          button('Dismiss', () => requestCaskAttention(item, true), 'button subtle',
+            { disabled: appState.caskAttentionBusy || decision === 'dismissed' })));
+    })),
+    h('div', { class: 'editor-actions' },
+      button('Retry pending casks', () => confirmRun('mbrew', 'retry_pending'), 'button subtle',
+        { disabled: appState.caskAttentionBusy }),
+      appState.caskAttentionClaim && !appState.caskAttentionBusy
+        ? button('Check decision', () => pollCaskAttention(appState.caskAttentionClaim).catch(error => setState({ error: error.message })), 'button subtle') : null)));
+}
+
 function moduleOverview(info) {
   const outcomes = Array.isArray(info.outcomes) ? info.outcomes : [];
   const last = outcomes.length ? outcomes[outcomes.length - 1] : null;
@@ -837,7 +915,7 @@ function moduleOverview(info) {
   const lastJob = jobs.length ? jobs[jobs.length - 1] : null;
   const brew = info.id === 'mbrew';
   const packages = brew && info.outcomes && Array.isArray(info.outcomes.packages) ? info.outcomes.packages : [];
-  const pending = packages.filter(item => item.retry);
+  const pending = packages.filter(item => item.state === 'deferred' && item.retry === true);
   const observed = info.module_status && typeof info.module_status === 'object'
     ? Object.entries(info.module_status).map(([key, value]) => key + ': ' + displayValue(value)).join(' · ')
     : displayValue(info.module_status);
@@ -860,6 +938,7 @@ function moduleOverview(info) {
       metric('Pending work', brew ? (pending.length || 'None') : (lastJob && ['queued', 'running'].includes(lastJob.state) ? lastJob.state : '—'),
         brew ? 'Casks waiting for retry' : 'Manual request state')),
     info.last_error ? h('div', { class: 'alert danger', role: 'status' }, h('strong', null, 'Needs attention'), h('span', null, info.last_error)) : null,
+    brew ? CaskAttentionPanel(info) : null,
     card('Module status', h('div', { class: 'key-values' }, statusRows)),
     brew ? card('Homebrew maintenance', h('div', { class: 'key-values' },
       row('Privilege helper', info.privilege_helper || 'Not configured; privileged broker bridge is inactive'),
@@ -873,7 +952,7 @@ function moduleOverview(info) {
     brew && packages.length ? card('Cask retry ledger', h('ul', { class: 'activity-list' }, packages.slice(-8).reverse().map(item =>
       h('li', null, badge(item.state || 'record', item.state === 'attention' ? 'danger' : item.retry ? 'warn' : 'good'),
         h('span', null, item.name + (item.reason ? ' · ' + item.reason : '')),
-        h('time', null, item.retry ? 'Retry eligible' : (item.attempts || 0) + ' attempts'))))) : null,
+        h('time', null, item.state === 'attention' ? 'User decision required' : item.retry ? 'Retry eligible' : (item.attempts || 0) + ' attempts'))))) : null,
     jobs.length ? card('Service requests', h('ul', { class: 'activity-list' }, jobs.slice(-6).reverse().map(job =>
       h('li', null, badge(job.state, job.state === 'failed' || job.state === 'interrupted' ? 'danger' : job.state === 'running' ? 'warn' : 'muted'),
         h('span', null, (job.action || 'manual run') + (job.message ? ' · ' + job.message : '')),
