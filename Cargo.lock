@@ -1207,6 +1207,7 @@ dependencies = [
  "regex",
  "rpassword",
  "schemars",
+ "scriptd-bridge-protocol",
  "security-framework",
  "serde",
  "serde_json",
@@ -1217,6 +1218,14 @@ dependencies = [
  "sysinfo",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "scriptd-bridge-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

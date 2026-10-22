@@ -222,6 +222,8 @@ pub struct ModuleContext {
     pub action: Option<String>,
     pub settings: Option<ModuleSettings>,
     pub broker: Option<std::sync::Arc<std::sync::Mutex<crate::broker::Broker>>>,
+    pub(crate) client_handle: Option<String>,
+    pub(crate) client_job_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -340,6 +342,8 @@ pub fn module_context_with_console(
         action: None,
         settings: None,
         broker: None,
+        client_handle: None,
+        client_job_id: None,
     }
 }
 

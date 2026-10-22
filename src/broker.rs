@@ -1,15 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
-#[cfg(test)]
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{bail, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone)]
 pub struct Policy {
@@ -75,6 +73,24 @@ pub fn read_root_owned_file(path: &Path, owner_uid: u32) -> Result<String> {
     Ok(contents)
 }
 
+fn read_private_root_owned_file(path: &Path, owner_uid: u32) -> Result<String> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("open private broker state {}", path.display()))?;
+    validate_open_root_owned_file(&file, path, owner_uid)?;
+    if file.metadata()?.mode() & 0o077 != 0 {
+        bail!(
+            "{} must not be readable or writable by group or other users",
+            path.display()
+        );
+    }
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)?;
+    Ok(contents)
+}
+
 pub fn validate_root_owned_file(path: &Path, owner_uid: u32) -> Result<()> {
     let file = OpenOptions::new()
         .read(true)
@@ -134,7 +150,7 @@ pub fn validate_activation_evidence(
     activation_path: &Path,
     client_path: &Path,
 ) -> Result<()> {
-    if repo.join(".git").is_file() {
+    if crate::paths::is_linked_worktree(repo) {
         bail!("privilege broker activation requires the primary repository checkout");
     }
     let repo = repo.to_string_lossy();
@@ -320,6 +336,8 @@ pub struct Grant {
 struct Job {
     cask: String,
     source: String,
+    client_bundle_identifier: Option<String>,
+    client_signing_identity: Option<String>,
     token: String,
     owner_pid: u32,
     worker_pid: Option<u32>,
@@ -339,6 +357,10 @@ pub struct ExecOutput {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct JobAudit {
     pub job_id: String,
+    #[serde(default)]
+    pub client_bundle_identifier: Option<String>,
+    #[serde(default)]
+    pub client_signing_identity: Option<String>,
     pub cask: String,
     pub source: String,
     pub completed: bool,
@@ -346,12 +368,84 @@ pub struct JobAudit {
     pub command_count: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PairingAudit {
+    transition: String,
+    signing_identity: String,
+    bundle_identifier: String,
+    authorizing_principal: String,
+    occurred_at_unix_seconds: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ClientSubmission {
+    handle: String,
+    job_id: String,
+    module: String,
+    action: Option<String>,
+    bundle_identifier: String,
+    signing_identity: String,
+    #[serde(default)]
+    status: ClientSubmissionStatus,
+    #[serde(default)]
+    run_handle: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ClientSubmissionStatus {
+    #[default]
+    Issued,
+    Dispatched,
+    Completed,
+    Interrupted,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct BrokerAudit {
+    schema: String,
+    jobs: Vec<JobAudit>,
+    pairings: Vec<Pairing>,
+    pairing_events: Vec<PairingAudit>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+struct ClientSubmissionStore {
+    schema: String,
+    submissions: Vec<ClientSubmission>,
+}
+
 #[derive(Debug, Default)]
 pub struct Broker {
     policy: Policy,
     audit_path: Option<std::path::PathBuf>,
+    client_submissions_path: Option<std::path::PathBuf>,
     jobs: BTreeMap<String, Job>,
+    historical_jobs: Vec<JobAudit>,
     spent_tokens: HashSet<String>,
+    pairings: BTreeMap<String, Pairing>,
+    pairing_events: Vec<PairingAudit>,
+    client_submissions: BTreeMap<String, ClientSubmission>,
+}
+
+/// A client that the bridge has agreed to work with.
+///
+/// Pairing binds the bridge to one code-signing identity so a later client
+/// running as a different signer is not silently trusted. Revoking a pairing
+/// blocks new jobs; jobs that were already accepted still report their
+/// results.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Pairing {
+    /// The code-signing identity the client presented.
+    pub signing_identity: String,
+    /// The client application's bundle identifier.
+    pub bundle_identifier: String,
+    /// The protocol version the client speaks.
+    pub protocol_version: u32,
+    /// Whether the pairing is currently active.
+    pub active: bool,
 }
 
 impl Default for Policy {
@@ -413,11 +507,447 @@ impl Broker {
     }
 
     pub fn with_audit(policy: Policy, audit_path: std::path::PathBuf) -> Self {
+        let client_submissions_path = audit_path.with_file_name("broker-client-submissions.json");
         Self {
             policy,
             audit_path: Some(audit_path),
+            client_submissions_path: Some(client_submissions_path),
             ..Self::default()
         }
+    }
+
+    pub fn load_with_audit(policy: Policy, audit_path: std::path::PathBuf) -> Result<Self> {
+        Self::load_with_audit_owner(policy, audit_path, 0)
+    }
+
+    pub fn load_with_audit_owner(
+        policy: Policy,
+        audit_path: std::path::PathBuf,
+        owner_uid: u32,
+    ) -> Result<Self> {
+        let mut broker = Self::with_audit(policy, audit_path.clone());
+        match crate::broker::read_root_owned_file(&audit_path, owner_uid) {
+            Ok(contents) => {
+                let value: serde_json::Value = serde_json::from_str(&contents)
+                    .context("parse durable broker state and pairing audit")?;
+                let legacy_audit = value.is_array();
+                let persisted = if legacy_audit {
+                    BrokerAudit {
+                        jobs: serde_json::from_value(value)
+                            .context("parse legacy broker job audit")?,
+                        ..BrokerAudit::default()
+                    }
+                } else {
+                    serde_json::from_value::<BrokerAudit>(value)
+                        .context("parse durable broker state and pairing audit")?
+                };
+                if !legacy_audit && persisted.schema != "scriptd-broker-audit/v1" {
+                    bail!("durable broker state has an unsupported schema");
+                }
+                for pairing in &persisted.pairings {
+                    if pairing.signing_identity.trim().is_empty()
+                        || pairing.signing_identity.trim() != pairing.signing_identity
+                        || pairing.bundle_identifier.trim().is_empty()
+                        || pairing.bundle_identifier.trim() != pairing.bundle_identifier
+                        || pairing.protocol_version != crate::control::PROTOCOL_VERSION
+                    {
+                        bail!("durable broker state contains an invalid client pairing");
+                    }
+                    if broker
+                        .pairings
+                        .insert(pairing.bundle_identifier.clone(), pairing.clone())
+                        .is_some()
+                    {
+                        bail!("durable broker state contains duplicate client pairings");
+                    }
+                }
+                broker.historical_jobs = persisted.jobs;
+                broker.pairing_events = persisted.pairing_events;
+            }
+            Err(_error) if !audit_path.exists() => {}
+            Err(error) => return Err(error).context("load durable broker state"),
+        }
+        if unsafe { libc::geteuid() } == owner_uid {
+            if let Some(submissions_path) = broker.client_submissions_path.as_deref() {
+                match read_private_root_owned_file(submissions_path, owner_uid) {
+                    Ok(contents) => {
+                        let mut persisted: ClientSubmissionStore = serde_json::from_str(&contents)
+                            .context("parse protected client submission handles")?;
+                        let legacy = persisted.schema == "scriptd-client-submissions/v1";
+                        if !legacy && persisted.schema != "scriptd-client-submissions/v2" {
+                            bail!("protected client submission store has an unsupported schema");
+                        }
+                        let mut submission_job_ids = HashSet::new();
+                        let mut interrupted_active_run = false;
+                        for mut submission in persisted.submissions.drain(..) {
+                            let stored_run_handle_is_valid =
+                                submission.status != ClientSubmissionStatus::Dispatched
+                                    || submission
+                                        .run_handle
+                                        .as_deref()
+                                        .is_some_and(is_capability_handle);
+                            if !stored_run_handle_is_valid {
+                                bail!("protected client submission store contains an invalid run handle");
+                            }
+                            if legacy || submission.status == ClientSubmissionStatus::Dispatched {
+                                if submission.status == ClientSubmissionStatus::Dispatched {
+                                    interrupted_active_run = true;
+                                }
+                                submission.status = ClientSubmissionStatus::Interrupted;
+                                submission.run_handle = None;
+                            }
+                            let run_handle_is_valid = match submission.status {
+                                ClientSubmissionStatus::Dispatched => submission
+                                    .run_handle
+                                    .as_deref()
+                                    .is_some_and(is_capability_handle),
+                                ClientSubmissionStatus::Issued
+                                | ClientSubmissionStatus::Completed
+                                | ClientSubmissionStatus::Interrupted => {
+                                    submission.run_handle.is_none()
+                                }
+                            };
+                            if !is_capability_handle(&submission.handle)
+                                || submission.job_id.trim().is_empty()
+                                || submission.job_id.trim() != submission.job_id
+                                || submission.module != "mbrew"
+                                || submission.bundle_identifier.trim().is_empty()
+                                || submission.bundle_identifier.trim()
+                                    != submission.bundle_identifier
+                                || submission.signing_identity.trim().is_empty()
+                                || submission.signing_identity.trim() != submission.signing_identity
+                                || !run_handle_is_valid
+                                || !submission_job_ids.insert(submission.job_id.clone())
+                                || broker
+                                    .client_submissions
+                                    .insert(submission.handle.clone(), submission)
+                                    .is_some()
+                            {
+                                bail!(
+                                    "protected client submission store contains an invalid handle"
+                                );
+                            }
+                        }
+                        if legacy || interrupted_active_run {
+                            broker.persist_client_submissions().context(
+                                "persist interrupted client submissions before accepting work",
+                            )?;
+                        }
+                    }
+                    Err(_error) if !submissions_path.exists() => {}
+                    Err(error) => return Err(error).context("load protected client submissions"),
+                }
+            }
+        }
+        Ok(broker)
+    }
+
+    /// Records a pairing for a client identity.
+    ///
+    /// Pairing is keyed by bundle identifier and bound to its verified signer.
+    /// An active signer cannot be silently replaced; the old pairing must be
+    /// explicitly revoked first.
+    #[cfg(test)]
+    pub fn pair(&mut self, pairing: Pairing) -> Result<Pairing> {
+        let authenticated_signer = pairing.signing_identity.clone();
+        let principal = format!(
+            "{} ({})",
+            pairing.signing_identity, pairing.bundle_identifier
+        );
+        self.pair_authorized(pairing, &authenticated_signer, &principal)
+    }
+
+    pub fn pair_authorized(
+        &mut self,
+        pairing: Pairing,
+        authenticated_signing_identity: &str,
+        authorizing_principal: &str,
+    ) -> Result<Pairing> {
+        if pairing.signing_identity.trim().is_empty()
+            || pairing.signing_identity.trim() != pairing.signing_identity
+        {
+            bail!("pairing requires a code-signing identity");
+        }
+        if pairing.bundle_identifier.trim().is_empty()
+            || pairing.bundle_identifier.trim() != pairing.bundle_identifier
+        {
+            bail!("pairing requires a bundle identifier");
+        }
+        if pairing.protocol_version != crate::control::PROTOCOL_VERSION {
+            bail!("pairing protocol version is not supported");
+        }
+        if pairing.signing_identity != authenticated_signing_identity {
+            bail!("pairing signer does not match the authenticated client");
+        }
+        if let Some(existing) = self.pairings.get(&pairing.bundle_identifier) {
+            if existing.active && existing.signing_identity != authenticated_signing_identity {
+                bail!("signer replacement requires the enrolled signer or an administrator");
+            }
+        }
+        let previous = self
+            .pairings
+            .insert(pairing.bundle_identifier.clone(), pairing.clone());
+        self.pairing_events.push(PairingAudit {
+            transition: match previous.as_ref() {
+                None => "paired",
+                Some(existing) if existing.signing_identity != pairing.signing_identity => {
+                    "replaced"
+                }
+                Some(_) => "reaffirmed",
+            }
+            .to_string(),
+            signing_identity: pairing.signing_identity.clone(),
+            bundle_identifier: pairing.bundle_identifier.clone(),
+            authorizing_principal: authorizing_principal.to_string(),
+            occurred_at_unix_seconds: unix_timestamp(),
+        });
+        if let Err(error) = self.persist_audit() {
+            self.pairing_events.pop();
+            if let Some(previous) = previous {
+                self.pairings
+                    .insert(pairing.bundle_identifier.clone(), previous);
+            } else {
+                self.pairings.remove(&pairing.bundle_identifier);
+            }
+            return Err(error).context("persist pairing before acknowledging enrollment");
+        }
+        Ok(pairing)
+    }
+
+    /// Revokes a pairing.
+    ///
+    /// Revocation blocks new work from that client. Jobs the bridge already
+    /// accepted still report their results.
+    #[cfg(test)]
+    pub fn unpair(&mut self, bundle_identifier: &str) -> Result<()> {
+        let Some(pairing) = self.pairings.get(bundle_identifier).cloned() else {
+            bail!("no pairing exists for this client");
+        };
+        let principal = format!(
+            "{} ({})",
+            pairing.signing_identity, pairing.bundle_identifier
+        );
+        self.unpair_authorized(bundle_identifier, &pairing.signing_identity, &principal)
+    }
+
+    pub fn unpair_authorized(
+        &mut self,
+        bundle_identifier: &str,
+        authenticated_signing_identity: &str,
+        authorizing_principal: &str,
+    ) -> Result<()> {
+        let Some(pairing) = self.pairings.get(bundle_identifier).cloned() else {
+            bail!("no pairing exists for this client");
+        };
+        if pairing.signing_identity != authenticated_signing_identity {
+            bail!("authenticated signer does not match the enrolled pairing");
+        }
+        if !pairing.active {
+            bail!("client pairing is already revoked");
+        }
+        self.pairings
+            .get_mut(bundle_identifier)
+            .expect("pairing checked above")
+            .active = false;
+        self.pairing_events.push(PairingAudit {
+            transition: "revoked".to_string(),
+            signing_identity: pairing.signing_identity.clone(),
+            bundle_identifier: pairing.bundle_identifier.clone(),
+            authorizing_principal: authorizing_principal.to_string(),
+            occurred_at_unix_seconds: unix_timestamp(),
+        });
+        if let Err(error) = self.persist_audit() {
+            self.pairing_events.pop();
+            self.pairings.insert(bundle_identifier.to_string(), pairing);
+            return Err(error).context("persist revocation before acknowledging it");
+        }
+        Ok(())
+    }
+
+    /// Issues a durable opaque handle for one authenticated queued submission.
+    ///
+    /// The handle is returned to the trusted service and stored in its
+    /// user-owned queue. The corresponding client identity remains in the
+    /// broker's protected audit store, where queue edits cannot change it.
+    pub fn issue_client_submission_handle(
+        &mut self,
+        client: &Pairing,
+        job_id: &str,
+        module: &str,
+        action: Option<&str>,
+    ) -> Result<String> {
+        self.require_active_pairing(&client.bundle_identifier, &client.signing_identity)?;
+        if job_id.trim().is_empty() || job_id.trim() != job_id || module != "mbrew" {
+            bail!("client submission requires a valid queued job id");
+        }
+        if action.is_some_and(|action| action != "retry_pending") {
+            bail!("client submission action is not supported");
+        }
+        if let Some(existing) = self
+            .client_submissions
+            .values()
+            .find(|submission| submission.job_id == job_id)
+        {
+            if existing.bundle_identifier == client.bundle_identifier
+                && existing.signing_identity == client.signing_identity
+                && existing.module == module
+                && existing.action.as_deref() == action
+                && existing.status == ClientSubmissionStatus::Issued
+            {
+                return Ok(existing.handle.clone());
+            }
+            bail!("queued job id is already authorized or has been consumed");
+        }
+
+        let handle = random_hex()?;
+        let submission = ClientSubmission {
+            handle: handle.clone(),
+            job_id: job_id.to_string(),
+            module: module.to_string(),
+            action: action.map(str::to_string),
+            bundle_identifier: client.bundle_identifier.clone(),
+            signing_identity: client.signing_identity.clone(),
+            status: ClientSubmissionStatus::Issued,
+            run_handle: None,
+        };
+        self.client_submissions.insert(handle.clone(), submission);
+        if let Err(error) = self.persist_client_submissions() {
+            self.client_submissions.remove(&handle);
+            return Err(error).context("persist client submission before accepting it");
+        }
+        Ok(handle)
+    }
+
+    /// Claims a queued submission for one run and persists the dispatch before
+    /// returning the run-scoped capability used by its cask operations.
+    pub fn begin_client_submission_run(
+        &mut self,
+        handle: &str,
+        job_id: &str,
+        module: &str,
+        action: Option<&str>,
+    ) -> Result<String> {
+        let submission = self
+            .client_submissions
+            .get(handle)
+            .context("unknown authenticated client submission handle")?;
+        if submission.job_id != job_id
+            || submission.module != module
+            || submission.action.as_deref() != action
+        {
+            bail!("authenticated client handle does not match the queued job");
+        }
+        let Some(pairing) = self.pairings.get(&submission.bundle_identifier) else {
+            bail!("authenticated client submission has no enrolled pairing");
+        };
+        if !pairing.active || pairing.signing_identity != submission.signing_identity {
+            bail!("authenticated client submission pairing is inactive or has changed");
+        }
+        if submission.status != ClientSubmissionStatus::Issued {
+            bail!("authenticated client submission has already been dispatched or consumed");
+        }
+
+        let run_handle = random_hex()?;
+        {
+            let submission = self
+                .client_submissions
+                .get_mut(handle)
+                .expect("submission was validated above");
+            submission.status = ClientSubmissionStatus::Dispatched;
+            submission.run_handle = Some(run_handle.clone());
+        }
+        if let Err(error) = self.persist_client_submissions() {
+            if let Some(submission) = self.client_submissions.get_mut(handle) {
+                submission.status = ClientSubmissionStatus::Interrupted;
+                submission.run_handle = None;
+            }
+            return Err(error).context("persist client submission dispatch before authorizing work");
+        }
+        Ok(run_handle)
+    }
+
+    /// Resolves an in-flight run capability to the identity recorded at
+    /// submission time. Multiple cask operations can use it until the run is
+    /// completed, interrupted, or the broker restarts.
+    pub fn resolve_client_submission_run(
+        &self,
+        run_handle: &str,
+        job_id: &str,
+        module: &str,
+        action: Option<&str>,
+    ) -> Result<Pairing> {
+        let submission = self
+            .client_submissions
+            .values()
+            .find(|submission| {
+                submission.status == ClientSubmissionStatus::Dispatched
+                    && submission.run_handle.as_deref() == Some(run_handle)
+            })
+            .context("unknown or inactive client submission run")?;
+        if submission.job_id != job_id
+            || submission.module != module
+            || submission.action.as_deref() != action
+        {
+            bail!("authenticated client run does not match the queued job");
+        }
+        let Some(pairing) = self.pairings.get(&submission.bundle_identifier) else {
+            bail!("authenticated client submission has no enrolled pairing");
+        };
+        if !pairing.active || pairing.signing_identity != submission.signing_identity {
+            bail!("authenticated client submission pairing is inactive or has changed");
+        }
+        Ok(pairing.clone())
+    }
+
+    /// Marks a submission run terminal. The state remains spent even if the
+    /// durable write fails, and a restart also converts any persisted active
+    /// run into an interrupted one.
+    pub fn finish_client_submission_run(
+        &mut self,
+        run_handle: &str,
+        job_id: &str,
+        module: &str,
+        action: Option<&str>,
+        completed: bool,
+    ) -> Result<()> {
+        let handle = self
+            .client_submissions
+            .values()
+            .find(|submission| {
+                submission.status == ClientSubmissionStatus::Dispatched
+                    && submission.run_handle.as_deref() == Some(run_handle)
+                    && submission.job_id == job_id
+                    && submission.module == module
+                    && submission.action.as_deref() == action
+            })
+            .map(|submission| submission.handle.clone())
+            .context("unknown or mismatched client submission run")?;
+        let submission = self
+            .client_submissions
+            .get_mut(&handle)
+            .expect("run submission was found above");
+        submission.status = if completed {
+            ClientSubmissionStatus::Completed
+        } else {
+            ClientSubmissionStatus::Interrupted
+        };
+        submission.run_handle = None;
+        self.persist_client_submissions()
+            .context("persist client submission terminal state")
+    }
+
+    /// Reports the pairing recorded for a client, if any.
+    #[cfg(test)]
+    pub fn pairing(&self, bundle_identifier: &str) -> Option<&Pairing> {
+        self.pairings.get(bundle_identifier)
+    }
+
+    /// Reports whether a client currently holds an active pairing.
+    #[cfg(test)]
+    pub fn is_paired(&self, bundle_identifier: &str) -> bool {
+        self.pairings
+            .get(bundle_identifier)
+            .is_some_and(|pairing| pairing.active)
     }
 
     #[cfg(test)]
@@ -425,7 +955,18 @@ impl Broker {
         self.open_job_from(request, 0)
     }
 
+    #[cfg(test)]
     pub fn open_job_from(&mut self, request: OpenRequest, owner_pid: u32) -> Result<Grant> {
+        self.open_job_from_client(request, owner_pid, None, None)
+    }
+
+    fn open_job_from_client(
+        &mut self,
+        request: OpenRequest,
+        owner_pid: u32,
+        client_bundle_identifier: Option<&str>,
+        client_signing_identity: Option<&str>,
+    ) -> Result<Grant> {
         if request.caller_uid != self.policy.owner_uid {
             bail!("broker caller is not the enrolled user");
         }
@@ -439,6 +980,8 @@ impl Broker {
             Job {
                 cask: request.cask.token,
                 source: request.cask.source,
+                client_bundle_identifier: client_bundle_identifier.map(str::to_string),
+                client_signing_identity: client_signing_identity.map(str::to_string),
                 token: token.clone(),
                 owner_pid,
                 worker_pid: None,
@@ -459,19 +1002,41 @@ impl Broker {
         &mut self,
         caller_uid: u32,
         owner_pid: u32,
+        client: &Pairing,
         token: &str,
         info_json: &str,
         ttl: Duration,
     ) -> Result<Grant> {
+        self.require_active_pairing(&client.bundle_identifier, &client.signing_identity)?;
         let cask = verify_installed_cask(token, info_json, &self.policy)?;
-        self.open_job_from(
+        self.open_job_from_client(
             OpenRequest {
                 caller_uid,
                 cask,
                 ttl,
             },
             owner_pid,
+            Some(&client.bundle_identifier),
+            Some(&client.signing_identity),
         )
+    }
+
+    /// Requires that a client holds an active pairing before new work runs.
+    ///
+    /// A revoked pairing blocks new jobs. Jobs that were already accepted
+    /// keep their own state, so an in-flight job still reports its result.
+    fn require_active_pairing(
+        &self,
+        bundle_identifier: &str,
+        signing_identity: &str,
+    ) -> Result<()> {
+        let Some(pairing) = self.pairings.get(bundle_identifier) else {
+            bail!("requesting client has no pairing; pair this client before requesting work");
+        };
+        if !pairing.active || pairing.signing_identity != signing_identity {
+            bail!("requesting client pairing is inactive or its signer does not match");
+        }
+        Ok(())
     }
 
     pub fn pending_job_cask_from(
@@ -652,27 +1217,47 @@ impl Broker {
     }
 
     pub fn audit(&self) -> Vec<JobAudit> {
-        self.jobs
-            .iter()
-            .map(|(job_id, job)| JobAudit {
-                job_id: job_id.clone(),
-                cask: job.cask.clone(),
-                source: job.source.clone(),
-                completed: job.completed,
-                worker_bound: job.worker_pid.is_some(),
-                command_count: job.seen_commands.len(),
-            })
-            .collect()
+        let mut records = self.historical_jobs.clone();
+        records.extend(
+            self.jobs
+                .iter()
+                .map(|(job_id, job)| JobAudit {
+                    job_id: job_id.clone(),
+                    client_bundle_identifier: job.client_bundle_identifier.clone(),
+                    client_signing_identity: job.client_signing_identity.clone(),
+                    cask: job.cask.clone(),
+                    source: job.source.clone(),
+                    completed: job.completed,
+                    worker_bound: job.worker_pid.is_some(),
+                    command_count: job.seen_commands.len(),
+                })
+                .collect::<Vec<_>>(),
+        );
+        records
     }
 
     fn persist_audit(&self) -> Result<()> {
         let Some(path) = self.audit_path.as_deref() else {
             return Ok(());
         };
-        crate::paths::write_private_atomic(
-            path,
-            serde_json::to_string_pretty(&self.audit())?.as_bytes(),
-        )
+        let persisted = BrokerAudit {
+            schema: "scriptd-broker-audit/v1".to_string(),
+            jobs: self.audit(),
+            pairings: self.pairings.values().cloned().collect(),
+            pairing_events: self.pairing_events.clone(),
+        };
+        write_shared_audit(path, serde_json::to_string_pretty(&persisted)?.as_bytes())
+    }
+
+    fn persist_client_submissions(&self) -> Result<()> {
+        let Some(path) = self.client_submissions_path.as_deref() else {
+            return Ok(());
+        };
+        let persisted = ClientSubmissionStore {
+            schema: "scriptd-client-submissions/v2".to_string(),
+            submissions: self.client_submissions.values().cloned().collect(),
+        };
+        write_private_shared_state(path, serde_json::to_string_pretty(&persisted)?.as_bytes())
     }
 }
 
@@ -687,6 +1272,73 @@ fn random_hex() -> Result<String> {
         write!(&mut result, "{byte:02x}").expect("writing to a string cannot fail");
     }
     Ok(result)
+}
+
+fn is_capability_handle(handle: &str) -> bool {
+    handle.len() == 64 && handle.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn unix_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn write_shared_audit(path: &Path, contents: &[u8]) -> Result<()> {
+    let parent = path.parent().context("broker audit path has no parent")?;
+    let name = path
+        .file_name()
+        .context("broker audit path has no filename")?
+        .to_string_lossy();
+    let temporary = parent.join(format!(".{name}.{}.tmp", random_hex()?));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o644)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&temporary)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, path)?;
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn write_private_shared_state(path: &Path, contents: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("private broker state path has no parent")?;
+    let name = path
+        .file_name()
+        .context("private broker state path has no filename")?
+        .to_string_lossy();
+    let temporary = parent.join(format!(".{name}.{}.tmp", random_hex()?));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&temporary)?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temporary, path)?;
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
 }
 
 pub fn bridge_compatible(system_command_source: &str) -> bool {
@@ -741,6 +1393,7 @@ pub(crate) fn run_forwarded(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     fn policy() -> Policy {
         Policy {
@@ -846,6 +1499,92 @@ mod tests {
         broker
             .complete_from(&grant.job_id, &grant.token, 100)
             .expect("complete from owning service");
+    }
+
+    #[test]
+    fn a_revoked_pairing_blocks_new_jobs_but_keeps_an_accepted_job_usable() {
+        let mut broker = Broker::new(policy());
+        let signer_a = "Developer ID Application: Client A (TEAM-A)";
+        let client_a = Pairing {
+            signing_identity: signer_a.to_string(),
+            bundle_identifier: "com.example.client-a".to_string(),
+            protocol_version: crate::control::PROTOCOL_VERSION,
+            active: true,
+        };
+        broker.pair(client_a.clone()).expect("pair client A");
+        broker
+            .pair(Pairing {
+                signing_identity: "Developer ID Application: Client B (TEAM-B)".to_string(),
+                bundle_identifier: "com.example.client-b".to_string(),
+                protocol_version: crate::control::PROTOCOL_VERSION,
+                active: true,
+            })
+            .expect("pair client B");
+
+        // A job accepted while the pairing was active keeps its own state.
+        let grant = broker
+            .open_cask_job_from(
+                42,
+                100,
+                &client_a,
+                "anydesk",
+                r#"{"casks":[{"token":"anydesk","tap":"homebrew/cask","installed":"9.7.0","pinned":false}]}"#,
+                Duration::from_secs(60),
+            )
+            .expect("open job for client A");
+        let accepted_audit = broker.audit();
+        assert_eq!(
+            accepted_audit[0].client_bundle_identifier.as_deref(),
+            Some("com.example.client-a")
+        );
+        assert_eq!(
+            accepted_audit[0].client_signing_identity.as_deref(),
+            Some(signer_a)
+        );
+
+        broker
+            .unpair("com.example.client-a")
+            .expect("revoke client A");
+        assert!(!broker.is_paired("com.example.client-a"));
+        assert!(broker.is_paired("com.example.client-b"));
+
+        let error = broker
+            .open_cask_job_from(
+                42,
+                100,
+                &client_a,
+                "anydesk",
+                r#"{"casks":[{"token":"anydesk","tap":"homebrew/cask","installed":"9.7.0","pinned":false}]}"#,
+                Duration::from_secs(60),
+            )
+            .expect_err("a revoked pairing blocks new work");
+        assert!(error.to_string().contains("inactive"));
+
+        // The job accepted before the revocation still completes.
+        broker
+            .complete_from(&grant.job_id, &grant.token, 100)
+            .expect("an accepted job still reports its result");
+    }
+
+    #[test]
+    fn a_client_without_a_pairing_cannot_open_new_work() {
+        let mut broker = Broker::new(policy());
+        let error = broker
+            .open_cask_job_from(
+                42,
+                100,
+                &Pairing {
+                    signing_identity: "Developer ID Application: Example (TEAM)".to_string(),
+                    bundle_identifier: "com.example.unpaired".to_string(),
+                    protocol_version: crate::control::PROTOCOL_VERSION,
+                    active: true,
+                },
+                "anydesk",
+                r#"{"casks":[{"token":"anydesk","tap":"homebrew/cask","installed":"9.7.0","pinned":false}]}"#,
+                Duration::from_secs(60),
+            )
+            .expect_err("an unpaired client cannot open work");
+        assert!(error.to_string().contains("no pairing"));
     }
 
     #[test]
@@ -1034,6 +1773,259 @@ mod tests {
         assert!(contents.contains("homebrew/cask"));
         assert!(contents.contains("\"completed\": true"));
         assert!(!contents.contains(&grant.token));
+    }
+
+    #[test]
+    fn client_submission_handles_are_private_durable_and_bound_to_the_queued_job() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().expect("broker state directory");
+        let audit_path = dir.path().join("broker-audit.json");
+        let submissions_path = dir.path().join("broker-client-submissions.json");
+        let client = Pairing {
+            signing_identity: "Developer ID Application: Client (TEAM)".to_string(),
+            bundle_identifier: "com.example.client".to_string(),
+            protocol_version: crate::control::PROTOCOL_VERSION,
+            active: true,
+        };
+        let mut broker = Broker::with_audit(policy(), audit_path.clone());
+        broker.pair(client.clone()).expect("enroll client");
+        let handle = broker
+            .issue_client_submission_handle(
+                &client,
+                "queued-request",
+                "mbrew",
+                Some("retry_pending"),
+            )
+            .expect("authorize queued work");
+        assert_eq!(
+            broker
+                .issue_client_submission_handle(
+                    &client,
+                    "queued-request",
+                    "mbrew",
+                    Some("retry_pending"),
+                )
+                .expect("idempotent authorization"),
+            handle
+        );
+        assert!(broker
+            .begin_client_submission_run(
+                &handle,
+                "edited-request",
+                "mbrew",
+                Some("retry_pending"),
+            )
+            .is_err());
+        let run_handle = broker
+            .begin_client_submission_run(
+                &handle,
+                "queued-request",
+                "mbrew",
+                Some("retry_pending"),
+            )
+            .expect("claim the submission run");
+        assert!(broker
+            .begin_client_submission_run(
+                &handle,
+                "queued-request",
+                "mbrew",
+                Some("retry_pending"),
+            )
+            .is_err());
+        for _ in 0..2 {
+            assert_eq!(
+                broker
+                    .resolve_client_submission_run(
+                        &run_handle,
+                        "queued-request",
+                        "mbrew",
+                        Some("retry_pending"),
+                    )
+                    .expect("same accepted run can open another cask operation"),
+                client
+            );
+        }
+
+        let public_audit = std::fs::read_to_string(&audit_path).expect("public broker audit");
+        assert!(!public_audit.contains(&handle));
+        assert!(!public_audit.contains(&run_handle));
+        let private_state =
+            std::fs::read_to_string(&submissions_path).expect("private handle store");
+        assert!(private_state.contains(&handle));
+        assert!(private_state.contains(&run_handle));
+        let mode = std::fs::metadata(&submissions_path)
+            .expect("private handle store metadata")
+            .mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "untrusted users cannot read the handle store"
+        );
+
+        drop(broker);
+        let mut loaded =
+            Broker::load_with_audit_owner(policy(), audit_path, unsafe { libc::geteuid() })
+                .expect("reload protected client handles");
+        assert!(loaded
+            .begin_client_submission_run(
+                &handle,
+                "queued-request",
+                "mbrew",
+                Some("retry_pending"),
+            )
+            .is_err(), "a broker restart must not reopen an interrupted run");
+        assert!(loaded
+            .resolve_client_submission_run(
+                &run_handle,
+                "queued-request",
+                "mbrew",
+                Some("retry_pending"),
+            )
+            .is_err(), "the prior run capability is invalid after restart");
+    }
+
+    #[test]
+    fn completed_and_interrupted_submissions_stay_spent_after_restart() {
+        let dir = tempfile::tempdir().expect("broker state directory");
+        let audit_path = dir.path().join("broker-audit.json");
+        let client = Pairing {
+            signing_identity: "Developer ID Application: Client (TEAM)".to_string(),
+            bundle_identifier: "com.example.client".to_string(),
+            protocol_version: crate::control::PROTOCOL_VERSION,
+            active: true,
+        };
+        let mut broker = Broker::with_audit(policy(), audit_path.clone());
+        broker.pair(client.clone()).expect("enroll client");
+
+        let mut spent = Vec::new();
+        for (job_id, completed) in [("completed-job", true), ("interrupted-job", false)] {
+            let handle = broker
+                .issue_client_submission_handle(&client, job_id, "mbrew", None)
+                .expect("issue client submission");
+            let run_handle = broker
+                .begin_client_submission_run(&handle, job_id, "mbrew", None)
+                .expect("dispatch submission");
+            broker
+                .finish_client_submission_run(
+                    &run_handle,
+                    job_id,
+                    "mbrew",
+                    None,
+                    completed,
+                )
+                .expect("persist terminal submission state");
+            assert!(broker
+                .begin_client_submission_run(&handle, job_id, "mbrew", None)
+                .is_err(), "a terminal submission cannot be dispatched again");
+            spent.push((handle, run_handle, job_id));
+        }
+
+        drop(broker);
+        let mut restarted = Broker::load_with_audit_owner(
+            policy(),
+            audit_path,
+            unsafe { libc::geteuid() },
+        )
+        .expect("reload durable submission states");
+        for (handle, run_handle, job_id) in spent {
+            assert!(restarted
+                .begin_client_submission_run(&handle, job_id, "mbrew", None)
+                .is_err(), "requeueing a spent job must not dispatch it again");
+            assert!(restarted
+                .resolve_client_submission_run(&run_handle, job_id, "mbrew", None)
+                .is_err(), "terminal run capabilities must not open new work");
+        }
+    }
+
+    #[test]
+    fn pairing_state_and_transitions_are_durable_and_audit_failure_fails_closed() {
+        let dir = tempfile::tempdir().expect("audit directory");
+        let path = dir.path().join("broker-audit.json");
+        let mut broker = Broker::with_audit(policy(), path.clone());
+        let pairing = Pairing {
+            signing_identity: "Developer ID Application: Client (TEAM)".to_string(),
+            bundle_identifier: "com.example.client".to_string(),
+            protocol_version: crate::control::PROTOCOL_VERSION,
+            active: true,
+        };
+        broker.pair(pairing.clone()).expect("persist enrollment");
+        broker
+            .unpair(&pairing.bundle_identifier)
+            .expect("persist revocation");
+
+        let loaded =
+            Broker::load_with_audit_owner(policy(), path.clone(), unsafe { libc::geteuid() })
+                .expect("reload durable pairing state");
+        assert!(!loaded.is_paired(&pairing.bundle_identifier));
+        assert_eq!(loaded.pairing_events.len(), 2);
+        assert_eq!(loaded.pairing_events[0].transition, "paired");
+        assert_eq!(loaded.pairing_events[1].transition, "revoked");
+        assert_eq!(
+            loaded.pairing_events[0].authorizing_principal,
+            "Developer ID Application: Client (TEAM) (com.example.client)"
+        );
+
+        let blocked_path = dir.path().join("missing").join("audit.json");
+        let mut blocked = Broker::with_audit(policy(), blocked_path);
+        assert!(blocked.pair(pairing.clone()).is_err());
+        assert!(!blocked.is_paired(&pairing.bundle_identifier));
+
+        let mut revoke_blocked = Broker::new(policy());
+        revoke_blocked
+            .pair(pairing.clone())
+            .expect("in-memory enrollment");
+        revoke_blocked.audit_path = Some(dir.path().join("absent").join("revoke.json"));
+        assert!(revoke_blocked.unpair(&pairing.bundle_identifier).is_err());
+        assert!(revoke_blocked.is_paired(&pairing.bundle_identifier));
+    }
+
+    #[test]
+    fn signer_replacement_requires_an_explicit_revocation_and_is_audited() {
+        let dir = tempfile::tempdir().expect("audit directory");
+        let path = dir.path().join("broker-audit.json");
+        let mut broker = Broker::with_audit(policy(), path);
+        let client = Pairing {
+            signing_identity: "Developer ID Application: Old (TEAM)".to_string(),
+            bundle_identifier: "com.example.client".to_string(),
+            protocol_version: crate::control::PROTOCOL_VERSION,
+            active: true,
+        };
+        broker.pair(client.clone()).expect("enroll first signer");
+        let impostor = Pairing {
+            signing_identity: "Developer ID Application: New (TEAM)".to_string(),
+            bundle_identifier: client.bundle_identifier.clone(),
+            protocol_version: client.protocol_version,
+            active: true,
+        };
+        assert!(broker
+            .pair_authorized(
+                impostor.clone(),
+                &impostor.signing_identity,
+                "Developer ID Application: New (TEAM) (com.example.client)",
+            )
+            .is_err());
+        assert!(broker
+            .unpair_authorized(
+                &client.bundle_identifier,
+                &impostor.signing_identity,
+                "Developer ID Application: New (TEAM) (com.example.client)",
+            )
+            .is_err());
+        assert_eq!(
+            broker
+                .pairing("com.example.client")
+                .unwrap()
+                .signing_identity,
+            "Developer ID Application: Old (TEAM)"
+        );
+        broker
+            .unpair("com.example.client")
+            .expect("explicitly revoke old signer");
+        broker
+            .pair(impostor)
+            .expect("enroll replacement signer after revocation");
+        assert_eq!(broker.pairing_events[2].transition, "replaced");
     }
 
     #[test]

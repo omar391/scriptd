@@ -102,7 +102,7 @@ fn resolve_state_app_root() -> PathBuf {
 }
 
 fn ensure_stable_service_root(root: &Path) -> Result<()> {
-    if root.join(".git").is_file() {
+    if crate::paths::is_linked_worktree(root) {
         anyhow::bail!(
             "refusing to install scriptd from a linked git worktree; land the change and start it from the primary checkout"
         );
@@ -293,9 +293,27 @@ mod tests {
     #[test]
     fn launch_agent_rejects_linked_worktree_roots() {
         let root = tempdir().expect("temp root");
-        std::fs::write(root.path().join(".git"), "gitdir: /tmp/example").expect("git marker");
+        std::fs::write(
+            root.path().join(".git"),
+            "gitdir: /tmp/example/.git/worktrees/feature",
+        )
+        .expect("git marker");
         let error = ensure_stable_service_root(root.path()).expect_err("linked worktree rejected");
         assert!(error.to_string().contains("primary checkout"));
+    }
+
+    #[test]
+    fn launch_agent_accepts_a_submodule_checkout_root() {
+        let root = tempdir().expect("temp root");
+        std::fs::write(
+            root.path().join(".git"),
+            "gitdir: /tmp/example/.git/modules/scriptd",
+        )
+        .expect("git marker");
+        assert!(
+            ensure_stable_service_root(root.path()).is_ok(),
+            "a submodule checkout is a stable service root"
+        );
     }
 
     #[test]

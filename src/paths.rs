@@ -85,6 +85,39 @@ pub fn resolve_repo_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// Reports whether a repository root is a linked Git worktree.
+///
+/// A linked worktree and a submodule checkout both store a `.git` *file*
+/// rather than a `.git` directory, so the file's presence cannot distinguish
+/// them. A linked worktree's Git directory lives under the common directory's
+/// `worktrees/` folder, while a submodule's Git directory is a `modules/`
+/// entry of the superproject's common directory. The parent checkout is a
+/// `.git` directory in both layouts.
+pub fn is_linked_worktree(root: &Path) -> bool {
+    let marker = root.join(".git");
+    let Ok(contents) = std::fs::read_to_string(&marker) else {
+        return false;
+    };
+    let Some(git_dir) = contents
+        .trim()
+        .strip_prefix("gitdir:")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    let git_dir = Path::new(git_dir);
+    let git_dir = if git_dir.is_absolute() {
+        git_dir.to_path_buf()
+    } else {
+        root.join(git_dir)
+    };
+    git_dir
+        .parent()
+        .and_then(Path::file_name)
+        .is_some_and(|name| name == "worktrees")
+}
+
 pub fn resolve_service_config_path(root: &Path) -> PathBuf {
     root.join("service.yaml")
 }
@@ -119,7 +152,52 @@ pub fn resolve_script_path() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_config_path, write_private_atomic};
+    use super::{is_linked_worktree, validate_config_path, write_private_atomic};
+
+    #[test]
+    fn linked_worktrees_are_distinguished_from_submodule_checkouts() {
+        let root = tempfile::tempdir().expect("temp root");
+
+        let primary = root.path().join("primary");
+        std::fs::create_dir_all(primary.join(".git")).expect("primary git directory");
+        assert!(
+            !is_linked_worktree(&primary),
+            "a primary checkout is never a linked worktree"
+        );
+
+        let worktree = root.path().join("worktree");
+        std::fs::create_dir_all(&worktree).expect("worktree root");
+        std::fs::write(
+            worktree.join(".git"),
+            "gitdir: /repo/.git/worktrees/feature\n",
+        )
+        .expect("worktree git marker");
+        assert!(
+            is_linked_worktree(&worktree),
+            "a linked worktree keeps its git directory under worktrees/"
+        );
+
+        let submodule = root.path().join("submodule");
+        std::fs::create_dir_all(&submodule).expect("submodule root");
+        std::fs::write(
+            submodule.join(".git"),
+            "gitdir: /repo/.git/modules/scriptd\n",
+        )
+        .expect("submodule git marker");
+        assert!(
+            !is_linked_worktree(&submodule),
+            "a submodule checkout is not a linked worktree"
+        );
+
+        let unrelated = root.path().join("unrelated");
+        std::fs::create_dir_all(&unrelated).expect("unrelated root");
+        std::fs::write(unrelated.join(".git"), "not a git marker\n")
+            .expect("unrelated marker");
+        assert!(
+            !is_linked_worktree(&unrelated),
+            "a malformed marker is not treated as a linked worktree"
+        );
+    }
 
     #[test]
     fn config_paths_are_absolute_or_home_relative() {

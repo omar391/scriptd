@@ -721,6 +721,8 @@ fn control_request(paths: &ControlPaths, id: &str, op: &str) -> control::Request
         max_lines: None,
         severity: None,
         query: None,
+        client_identity: None,
+        client_handle: None,
     }
 }
 

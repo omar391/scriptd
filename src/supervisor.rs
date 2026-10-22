@@ -380,10 +380,9 @@ impl RunningSupervisor {
             wifi_event_receiver: Some(wifi_event_receiver),
             last_state_fingerprint: None,
             control_paths,
-            broker: std::sync::Arc::new(std::sync::Mutex::new(crate::broker::Broker::with_audit(
-                broker_policy,
-                broker_audit_path,
-            ))),
+            broker: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::broker::Broker::load_with_audit(broker_policy, broker_audit_path)?,
+            )),
             control_server: None,
             work: VecDeque::new(),
             inflight: BTreeSet::new(),
@@ -878,7 +877,7 @@ impl RunningSupervisor {
     }
 
     fn prepare_work(&mut self, work: QueuedWork) -> Result<PreparedRun> {
-        let (module_id, label, invocation, action) = match work {
+        let (module_id, label, invocation, action, client_handle, client_job_id) = match work {
             QueuedWork::Trigger(dispatch) => {
                 if let Some(trigger) = self.triggers.get_mut(&dispatch.trigger_id) {
                     trigger.mark_started(&dispatch.incident_id);
@@ -897,17 +896,24 @@ impl RunningSupervisor {
                         action: dispatch.action.clone(),
                     }),
                     dispatch.action,
+                    None,
+                    None,
                 )
             }
-            QueuedWork::Manual(job) => (
-                job.module.clone(),
-                WorkLabel::Manual {
-                    job_id: job.id,
-                    module: job.module.clone(),
-                },
-                ModuleInvocation::Manual,
-                job.action,
-            ),
+            QueuedWork::Manual(job) => {
+                let job_id = job.id.clone();
+                (
+                    job.module.clone(),
+                    WorkLabel::Manual {
+                        job_id: job.id,
+                        module: job.module.clone(),
+                    },
+                    ModuleInvocation::Manual,
+                    job.action,
+                    job.client_handle,
+                    Some(job_id),
+                )
+            }
         };
         let Some(runtime) = self.modules.get_mut(&module_id) else {
             anyhow::bail!("queued work targets unknown module {module_id}");
@@ -922,6 +928,8 @@ impl RunningSupervisor {
         );
         context.invocation = invocation;
         context.action = action;
+        context.client_handle = client_handle;
+        context.client_job_id = client_job_id;
         context.broker = Some(std::sync::Arc::clone(&self.broker));
         let kind = runtime.kind;
         runtime.status = RuntimeStatus::Running;

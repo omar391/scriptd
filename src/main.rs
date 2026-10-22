@@ -296,6 +296,8 @@ fn cmd_broker(args: &[String], root: &Path) -> ExitCode {
         max_lines: None,
         severity: None,
         query: None,
+        client_identity: None,
+        client_handle: None,
     };
     let uid = match credentials::console_uid() {
         Ok(uid) => uid,

@@ -184,26 +184,31 @@ fn askpass_source_path() -> anyhow::Result<PathBuf> {
 
 fn write_askpass(config: &MbrewConfig, logger: &ModuleLogger) -> anyhow::Result<()> {
     let path = homebrew_path(&config.askpass_path)?;
-    if path.exists() {
-        return Ok(());
-    }
     let source = askpass_source_path()?;
     let script = fs::read(&source)
         .with_context(|| format!("read tracked askpass helper {}", source.display()))?;
+
+    // The installed copy is an installation artifact of the tracked source,
+    // never an independently authored file. A copy that already matches the
+    // packaged source is left alone; a stale or missing one is refreshed from
+    // it, so an upgrade always ships the current helper.
+    if path.exists() && fs::read(&path).is_ok_and(|installed| installed == script) {
+        return Ok(());
+    }
     fs::create_dir_all(path.parent().expect("path has parent"))?;
-    fs::write(&path, &script)
+    crate::paths::write_private_atomic(&path, &script)
         .with_context(|| format!("write askpass helper {}", path.display()))?;
     let _ = Command::new("chmod")
         .args(["+x", &path.to_string_lossy()])
         .status();
-    logger.info(&format!("installed askpass helper {}", path.display()));
+    logger.info(&format!("refreshed askpass helper {}", path.display()));
     Ok(())
 }
 
 fn ensure_askpass(config: &MbrewConfig, logger: &ModuleLogger) -> anyhow::Result<()> {
     let path = homebrew_path(&config.askpass_path)?;
     if path.exists() {
-        return Ok(());
+        return write_askpass(config, logger);
     }
     if unsafe { libc::geteuid() } == 0 {
         bail!("mbrew setup required. run './scriptd.sh config mbrew' as the logged-in user");
@@ -624,9 +629,75 @@ struct BrewMaintenanceOutcome {
     /// count towards the ledger attempt counter.
     attempted_casks: BTreeSet<String>,
     reasons: BTreeMap<String, String>,
+    /// The class of blocker that stopped each deferred cask. The class
+    /// decides whether retrying can help and which recovery action to offer.
+    blockers: BTreeMap<String, CaskBlockerClass>,
     cask_error: Option<String>,
     formula_error: Option<String>,
     cleanup_error: Option<String>,
+}
+
+/// Why a cask's maintenance did not complete.
+///
+/// The class is what the interface shows the user, so each class carries both
+/// a stable name and the recovery action that can actually resolve it. A
+/// cask that cannot be retried until a human installs something must never
+/// advertise itself as retryable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CaskBlockerClass {
+    /// The local Scriptd setup for Homebrew maintenance is incomplete.
+    SetupMissing,
+    /// The companion automation bridge is not installed or not paired.
+    BridgeAbsent,
+    /// An application from this cask is running and must be closed first.
+    ApplicationRunning,
+    /// The cask's running state could not be established.
+    ActivityUnverifiable,
+    /// The authorization policy denies this operation.
+    PolicyDenied,
+    /// A real Homebrew upgrade ran and failed.
+    UpgradeFailed,
+}
+
+impl CaskBlockerClass {
+    /// The stable name recorded in the ledger and shown to the interface.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SetupMissing => "setup_missing",
+            Self::BridgeAbsent => "bridge_absent",
+            Self::ApplicationRunning => "application_running",
+            Self::ActivityUnverifiable => "activity_unverifiable",
+            Self::PolicyDenied => "policy_denied",
+            Self::UpgradeFailed => "upgrade_failed",
+        }
+    }
+
+    /// Whether retrying the same operation could succeed without the user
+    /// changing anything first.
+    ///
+    /// A missing setup or bridge, a denied policy, and an unverifiable
+    /// activity state all need a human action before a retry can work.
+    pub fn is_retryable(self) -> bool {
+        matches!(self, Self::ApplicationRunning | Self::UpgradeFailed)
+    }
+
+    /// The recovery action that can resolve this blocker.
+    pub fn recovery_action(self) -> &'static str {
+        match self {
+            Self::SetupMissing => {
+                "Run the Homebrew setup to finish installing the maintenance helper."
+            }
+            Self::BridgeAbsent => "Install the automation bridge and pair this app with it.",
+            Self::ApplicationRunning => "Quit the running app, then retry the upgrade.",
+            Self::ActivityUnverifiable => {
+                "The app's state could not be read. Retry once the app can be inspected."
+            }
+            Self::PolicyDenied => {
+                "This package source is not approved. Review the trusted sources."
+            }
+            Self::UpgradeFailed => "The upgrade failed. Review the error, then retry.",
+        }
+    }
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -645,9 +716,9 @@ struct CaskMetadata {
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-struct RunningApplication {
-    bundle_id: Option<String>,
-    path: Option<String>,
+pub(crate) struct RunningApplication {
+    pub(crate) bundle_id: Option<String>,
+    pub(crate) path: Option<String>,
 }
 
 const RUNNING_APPLICATIONS_SCRIPT: &str = r#"'use strict';
@@ -1119,6 +1190,16 @@ fn resolve_package_receipts(
     resolve_package_receipts_with(receipts, Path::new("/usr/sbin/pkgutil"))
 }
 
+/// Resolves the installed files declared by one package receipt.
+///
+/// The bridge exposes this so a client can learn what a receipt actually
+/// installed without reading raw configuration.
+pub(crate) fn resolve_package_receipt_paths(receipt: &str) -> anyhow::Result<BTreeSet<String>> {
+    let receipts = BTreeSet::from([receipt.to_string()]);
+    let (paths, _) = resolve_package_receipts_with(&receipts, Path::new("/usr/sbin/pkgutil"))?;
+    Ok(paths)
+}
+
 fn resolve_package_receipts_with(
     receipts: &BTreeSet<String>,
     pkgutil: &Path,
@@ -1226,7 +1307,7 @@ fn package_receipt_install_root(
         .get("install-location")
         .and_then(serde_json::Value::as_str)
         .context("package receipt has no install location")?;
-    let volume = validated_receipt_location(volume, "volume")?;
+    let volume = validated_receipt_volume(volume)?;
     let location = validated_receipt_location(location, "install location")?;
     let volume = volume
         .canonicalize()
@@ -1234,11 +1315,12 @@ fn package_receipt_install_root(
     if !volume.is_dir() {
         bail!("package receipt {receipt} volume is unavailable");
     }
-    let location_relative = location
-        .strip_prefix("/")
-        .context("package receipt install location must be absolute")?;
+    // A receipt's install location is relative to its volume. Real receipts
+    // report it either with a leading slash ("/Applications") or as a bare
+    // relative path ("Applications"), so both spellings resolve to the same
+    // directory inside the volume.
     let install_root = volume
-        .join(location_relative)
+        .join(location.strip_prefix("/").unwrap_or(&location))
         .canonicalize()
         .with_context(|| format!("resolve package receipt {receipt} install location"))?;
     if !install_root.is_dir() || !install_root.starts_with(&volume) {
@@ -1247,7 +1329,12 @@ fn package_receipt_install_root(
     Ok(install_root)
 }
 
-fn validated_receipt_location(raw: &str, field: &str) -> anyhow::Result<PathBuf> {
+/// Validates a receipt's volume.
+///
+/// A volume is always an absolute path and may be the filesystem root. It
+/// must not contain traversal or relative components, because it anchors
+/// every path derived from the receipt.
+fn validated_receipt_volume(raw: &str) -> anyhow::Result<PathBuf> {
     let path = Path::new(raw);
     if !path.is_absolute()
         || path.components().any(|component| {
@@ -1257,7 +1344,20 @@ fn validated_receipt_location(raw: &str, field: &str) -> anyhow::Result<PathBuf>
             )
         })
     {
-        bail!("package receipt {field} is not a safe absolute path");
+        bail!("package receipt volume is not a safe absolute path");
+    }
+    Ok(path.to_path_buf())
+}
+
+fn validated_receipt_location(raw: &str, field: &str) -> anyhow::Result<PathBuf> {
+    let path = Path::new(raw);
+    if path.components().any(|component| {
+        matches!(
+            component,
+            Component::ParentDir | Component::CurDir | Component::Prefix(_)
+        )
+    }) {
+        bail!("package receipt {field} is not a safe path");
     }
     Ok(path.to_path_buf())
 }
@@ -1382,7 +1482,7 @@ fn listed_casks(output: &str) -> Vec<String> {
         .collect()
 }
 
-fn running_applications() -> anyhow::Result<Vec<RunningApplication>> {
+pub(crate) fn running_applications() -> anyhow::Result<Vec<RunningApplication>> {
     let (stdout, stderr, status) = run_command(
         "osascript",
         &["-l", "JavaScript", "-e", RUNNING_APPLICATIONS_SCRIPT],
@@ -1472,7 +1572,9 @@ fn broker_control_call(
     op: &str,
     module: Option<&str>,
     document: Option<&str>,
-    token: Option<&str>,
+    request_id: Option<&str>,
+    client_handle: Option<&str>,
+    action: Option<&str>,
 ) -> anyhow::Result<crate::control::Response> {
     use std::time::Duration;
 
@@ -1491,12 +1593,14 @@ fn broker_control_call(
         module: module.map(str::to_string),
         yaml: None,
         base_digest: None,
-        request_id: token.map(str::to_string),
+        request_id: request_id.map(str::to_string),
         bypass: false,
-        action: None,
+        action: action.map(str::to_string),
         max_lines: None,
         severity: None,
         query: None,
+        client_identity: None,
+        client_handle: client_handle.map(str::to_string),
     };
     let response = crate::control::transact_with_timeout(
         &crate::control::broker_socket_path(repo, uid),
@@ -1513,28 +1617,46 @@ fn broker_control_call(
     Ok(response)
 }
 
+#[derive(Clone, Copy, Default)]
+struct ClientSubmission<'a> {
+    run_handle: Option<&'a str>,
+    job_id: Option<&'a str>,
+    action: Option<&'a str>,
+}
+
 fn brokered_cask_upgrade(
     config: &MbrewConfig,
     cask: &str,
     identity: &CaskRuntimeIdentity,
     _broker: &crate::control::SharedBroker,
+    submission: ClientSubmission<'_>,
 ) -> anyhow::Result<BrokerUpgradeResult> {
+    let (Some(client_run_handle), Some(client_job_id)) =
+        (submission.run_handle, submission.job_id)
+    else {
+        return Ok(BrokerUpgradeResult::Deferred(
+            "an authenticated paired client is required for privileged maintenance".into(),
+            CaskBlockerClass::PolicyDenied,
+        ));
+    };
     let bridge_path = PathBuf::from("/Library/Application Support/scriptd/privilege_bridge.rb");
     let bridge = match crate::broker::read_root_owned_file(&bridge_path, 0) {
         Ok(bridge) => bridge,
         Err(error) => {
-            return Ok(BrokerUpgradeResult::Deferred(format!(
-                "privilege bridge setup is required: {error}"
-            )));
+            return Ok(BrokerUpgradeResult::Deferred(
+                format!("privilege bridge setup is required: {error}"),
+                CaskBlockerClass::BridgeAbsent,
+            ));
         }
     };
     let repository = std::env::var_os("SCRIPTD_ROOT_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(crate::paths::resolve_repo_root);
     if let Err(error) = crate::control::broker_activation_status(&repository) {
-        return Ok(BrokerUpgradeResult::Deferred(format!(
-            "privilege broker is inactive: {error}"
-        )));
+        return Ok(BrokerUpgradeResult::Deferred(
+            format!("privilege broker is inactive: {error}"),
+            CaskBlockerClass::BridgeAbsent,
+        ));
     }
     let command_runner = PathBuf::from(&config.homebrew_bin)
         .parent()
@@ -1547,29 +1669,34 @@ fn brokered_cask_upgrade(
     if !crate::broker::bridge_compatible(&runner) || !bridge.contains("def sudo_prefix") {
         return Ok(BrokerUpgradeResult::Deferred(
             "Homebrew privilege bridge compatibility is not verified; elevation is deferred".into(),
+            CaskBlockerClass::BridgeAbsent,
         ));
     }
 
     let client = PathBuf::from("/usr/local/libexec/scriptd-broker");
     if let Err(error) = crate::broker::validate_root_owned_file(&client, 0) {
-        return Ok(BrokerUpgradeResult::Deferred(format!(
-            "root-owned scriptd broker client setup is required: {error}"
-        )));
+        return Ok(BrokerUpgradeResult::Deferred(
+            format!("root-owned scriptd broker client setup is required: {error}"),
+            CaskBlockerClass::SetupMissing,
+        ));
     }
     let grant = match broker_control_call(
         &repository,
         "broker_open",
         Some(cask),
         Some(&config.homebrew_bin),
-        None,
+        Some(client_job_id),
+        Some(client_run_handle),
+        submission.action,
     ) {
         Ok(response) => response
             .snapshot
             .ok_or_else(|| anyhow::anyhow!("privilege broker returned no job grant"))?,
         Err(error) => {
-            return Ok(BrokerUpgradeResult::Deferred(format!(
-                "authenticated privilege broker is unavailable: {error}"
-            )));
+            return Ok(BrokerUpgradeResult::Deferred(
+                format!("authenticated privilege broker is unavailable: {error}"),
+                CaskBlockerClass::PolicyDenied,
+            ));
         }
     };
     let job_id = grant
@@ -1590,9 +1717,12 @@ fn brokered_cask_upgrade(
                 Some(&job_id),
                 None,
                 Some(&token),
+                None,
+                None,
             );
             return Ok(BrokerUpgradeResult::Deferred(
                 "an application or helper from this cask became active before the upgrade".into(),
+                CaskBlockerClass::ApplicationRunning,
             ));
         }
         Err(error) => {
@@ -1602,10 +1732,13 @@ fn brokered_cask_upgrade(
                 Some(&job_id),
                 None,
                 Some(&token),
+                None,
+                None,
             );
-            return Ok(BrokerUpgradeResult::Deferred(format!(
-                "could not reverify cask activity immediately before upgrade: {error}"
-            )));
+            return Ok(BrokerUpgradeResult::Deferred(
+                format!("could not reverify cask activity immediately before upgrade: {error}"),
+                CaskBlockerClass::ActivityUnverifiable,
+            ));
         }
         Ok(false) => {}
     }
@@ -1618,6 +1751,8 @@ fn brokered_cask_upgrade(
         Some(&job_id),
         None,
         Some(&token),
+        None,
+        None,
     ) {
         Ok(response) => response,
         Err(error) => {
@@ -1629,6 +1764,8 @@ fn brokered_cask_upgrade(
                     Some(&job_id),
                     None,
                     Some(&token),
+                    None,
+                    None,
                 );
             }
             return Ok(broker_launch_failure_result(failure, &error));
@@ -1705,9 +1842,10 @@ fn broker_launch_failure_result(
         BrokerLaunchFailure::Unknown => BrokerUpgradeResult::Unconfirmed(format!(
             "Homebrew worker launch result is unknown: {error}"
         )),
-        BrokerLaunchFailure::NotStarted => BrokerUpgradeResult::Deferred(format!(
-            "helper-launched Homebrew worker was unavailable: {error}"
-        )),
+        BrokerLaunchFailure::NotStarted => BrokerUpgradeResult::Deferred(
+            format!("helper-launched Homebrew worker was unavailable: {error}"),
+            CaskBlockerClass::BridgeAbsent,
+        ),
     }
 }
 
@@ -1722,7 +1860,7 @@ enum BrokerUpgradeResult {
     Unconfirmed(String),
     /// The upgrade was never launched (bridge missing, broker inactive,
     /// privilege not granted). No upgrade was attempted.
-    Deferred(String),
+    Deferred(String, CaskBlockerClass),
 }
 
 fn push_unique(values: &mut Vec<String>, value: &str) {
@@ -1737,9 +1875,34 @@ fn defer_cask(
     cask: &str,
     reason: &str,
 ) {
+    defer_cask_with_class(
+        outcome,
+        logger,
+        cask,
+        reason,
+        CaskBlockerClass::ApplicationRunning,
+    );
+}
+
+/// Defers a cask and records why it was stopped.
+///
+/// The blocker class decides whether the cask is eligible for an automatic
+/// retry, so a cask that needs a human action never claims it is retryable.
+fn defer_cask_with_class(
+    outcome: &mut BrewMaintenanceOutcome,
+    logger: &ModuleLogger,
+    cask: &str,
+    reason: &str,
+    class: CaskBlockerClass,
+) {
     push_unique(&mut outcome.deferred_casks, cask);
-    outcome.retryable_casks.insert(cask.to_string());
+    if class.is_retryable() {
+        outcome.retryable_casks.insert(cask.to_string());
+    } else {
+        outcome.retryable_casks.remove(cask);
+    }
     outcome.reasons.insert(cask.to_string(), reason.to_string());
+    outcome.blockers.insert(cask.to_string(), class);
     logger.warn(&format!("Deferring cask {cask}: {reason}"));
 }
 
@@ -1749,7 +1912,28 @@ fn defer_cask_for_attention(
     cask: &str,
     reason: &str,
 ) {
-    defer_cask(outcome, logger, cask, reason);
+    defer_cask_for_attention_with_class(
+        outcome,
+        logger,
+        cask,
+        reason,
+        CaskBlockerClass::ActivityUnverifiable,
+    );
+}
+
+/// Defers a cask that needs a human decision before it can proceed.
+///
+/// The cask stays visible in the ledger, is never retried automatically, and
+/// is surfaced as an attention item so the interface can offer the recovery
+/// action its blocker class names.
+fn defer_cask_for_attention_with_class(
+    outcome: &mut BrewMaintenanceOutcome,
+    logger: &ModuleLogger,
+    cask: &str,
+    reason: &str,
+    class: CaskBlockerClass,
+) {
+    defer_cask_with_class(outcome, logger, cask, reason, class);
     outcome.retryable_casks.remove(cask);
     outcome.attention_casks.insert(cask.to_string());
 }
@@ -1762,6 +1946,9 @@ fn fail_cask(
 ) {
     push_unique(&mut outcome.failed_casks, cask);
     outcome.reasons.insert(cask.to_string(), reason.to_string());
+    outcome
+        .blockers
+        .insert(cask.to_string(), CaskBlockerClass::UpgradeFailed);
     outcome.attention_casks.insert(cask.to_string());
     logger.error(&format!("Cask {cask} upgrade failed: {reason}"));
 }
@@ -1781,6 +1968,24 @@ fn brew_cask_maintenance_with_broker(
     only: Option<&std::collections::BTreeSet<String>>,
     broker: Option<&crate::control::SharedBroker>,
     skip: &std::collections::BTreeSet<String>,
+) -> anyhow::Result<BrewMaintenanceOutcome> {
+    brew_cask_maintenance_with_client(
+        config,
+        logger,
+        only,
+        broker,
+        skip,
+        ClientSubmission::default(),
+    )
+}
+
+fn brew_cask_maintenance_with_client(
+    config: &MbrewConfig,
+    logger: &ModuleLogger,
+    only: Option<&std::collections::BTreeSet<String>>,
+    broker: Option<&crate::control::SharedBroker>,
+    skip: &std::collections::BTreeSet<String>,
+    submission: ClientSubmission<'_>,
 ) -> anyhow::Result<BrewMaintenanceOutcome> {
     let (outdated_out, outdated_err, outdated_status) = command_for_brew(
         config,
@@ -1826,33 +2031,35 @@ fn brew_cask_maintenance_with_broker(
             continue;
         }
         let Some(broker) = broker else {
-            defer_cask_for_attention(
+            defer_cask_for_attention_with_class(
                 &mut outcome,
                 logger,
                 &cask,
                 "the authenticated scriptd privilege broker is unavailable; cask elevation is not permitted from a direct CLI run",
+                CaskBlockerClass::BridgeAbsent,
             );
             continue;
         };
-        let upgrade = match brokered_cask_upgrade(config, &cask, &metadata.identity, broker) {
-            Ok(BrokerUpgradeResult::Completed(output)) => {
-                outcome.attempted_casks.insert(cask.clone());
-                Ok(output)
-            }
-            Ok(BrokerUpgradeResult::Failed(reason)) => {
-                outcome.attempted_casks.insert(cask.clone());
-                Err(anyhow::anyhow!(reason))
-            }
-            Ok(BrokerUpgradeResult::Deferred(reason)) => {
-                defer_cask(&mut outcome, logger, &cask, &reason);
-                continue;
-            }
-            Ok(BrokerUpgradeResult::Unconfirmed(reason)) => {
-                defer_cask_for_attention(&mut outcome, logger, &cask, &reason);
-                continue;
-            }
-            Err(error) => Err(error),
-        };
+        let upgrade =
+            match brokered_cask_upgrade(config, &cask, &metadata.identity, broker, submission) {
+                Ok(BrokerUpgradeResult::Completed(output)) => {
+                    outcome.attempted_casks.insert(cask.clone());
+                    Ok(output)
+                }
+                Ok(BrokerUpgradeResult::Failed(reason)) => {
+                    outcome.attempted_casks.insert(cask.clone());
+                    Err(anyhow::anyhow!(reason))
+                }
+                Ok(BrokerUpgradeResult::Deferred(reason, class)) => {
+                    defer_cask_with_class(&mut outcome, logger, &cask, &reason, class);
+                    continue;
+                }
+                Ok(BrokerUpgradeResult::Unconfirmed(reason)) => {
+                    defer_cask_for_attention(&mut outcome, logger, &cask, &reason);
+                    continue;
+                }
+                Err(error) => Err(error),
+            };
         match upgrade {
             Ok((stdout, stderr, 0)) => {
                 push_unique(&mut outcome.repaired_casks, &cask);
@@ -1889,20 +2096,22 @@ fn defer_for_activity(
     match cask_activity(identity) {
         Ok(false) => false,
         Ok(true) => {
-            defer_cask(
+            defer_cask_with_class(
                 outcome,
                 logger,
                 cask,
                 "an application or helper from this cask is running",
+                CaskBlockerClass::ApplicationRunning,
             );
             true
         }
         Err(error) => {
-            defer_cask(
+            defer_cask_with_class(
                 outcome,
                 logger,
                 cask,
                 &format!("could not verify cask activity: {error}"),
+                CaskBlockerClass::ActivityUnverifiable,
             );
             true
         }
@@ -1943,15 +2152,116 @@ fn brew_maintenance_with_broker(
     broker: Option<&crate::control::SharedBroker>,
     state_dir: &Path,
 ) -> anyhow::Result<BrewMaintenanceOutcome> {
+    brew_maintenance_with_client(config, logger, action, broker, state_dir, None, None)
+}
+
+fn brew_maintenance_with_client(
+    config: &MbrewConfig,
+    logger: &ModuleLogger,
+    action: Option<&str>,
+    broker: Option<&crate::control::SharedBroker>,
+    state_dir: &Path,
+    client_handle: Option<&str>,
+    client_job_id: Option<&str>,
+) -> anyhow::Result<BrewMaintenanceOutcome> {
+    let submission = ClientSubmission {
+        run_handle: client_handle,
+        job_id: client_job_id,
+        action,
+    };
+    let (Some(client_handle), Some(client_job_id), Some(_)) =
+        (client_handle, client_job_id, broker)
+    else {
+        return brew_maintenance_with_submission(
+            config,
+            logger,
+            action,
+            broker,
+            state_dir,
+            submission,
+        );
+    };
+
+    let repository = std::env::var_os("SCRIPTD_ROOT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(crate::paths::resolve_repo_root);
+    let response = broker_control_call(
+        &repository,
+        "broker_begin_submission",
+        Some("mbrew"),
+        None,
+        Some(client_job_id),
+        Some(client_handle),
+        action,
+    )?;
+    let snapshot = response
+        .snapshot
+        .ok_or_else(|| anyhow::anyhow!("privilege broker returned no submission run"))?;
+    let run_handle = snapshot
+        .get("run_handle")
+        .and_then(serde_json::Value::as_str)
+        .context("privilege broker returned no submission run capability")?
+        .to_string();
+    let submission = ClientSubmission {
+        run_handle: Some(&run_handle),
+        job_id: Some(client_job_id),
+        action,
+    };
+    let result = brew_maintenance_with_submission(
+        config,
+        logger,
+        action,
+        broker,
+        state_dir,
+        submission,
+    );
+    let finish_op = if result.is_ok() {
+        "broker_finish_submission"
+    } else {
+        "broker_interrupt_submission"
+    };
+    let finish_result = broker_control_call(
+        &repository,
+        finish_op,
+        Some("mbrew"),
+        None,
+        Some(client_job_id),
+        Some(&run_handle),
+        action,
+    );
+    match (result, finish_result) {
+        (Ok(outcome), Ok(_)) => Ok(outcome),
+        (Err(error), Ok(_)) => Err(error),
+        (Ok(_), Err(error)) => Err(error).context("persist Homebrew submission completion"),
+        (Err(run_error), Err(finish_error)) => Err(anyhow::anyhow!(
+            "{run_error}; Homebrew submission interruption could not be recorded: {finish_error}"
+        )),
+    }
+}
+
+fn brew_maintenance_with_submission(
+    config: &MbrewConfig,
+    logger: &ModuleLogger,
+    action: Option<&str>,
+    broker: Option<&crate::control::SharedBroker>,
+    state_dir: &Path,
+    submission: ClientSubmission<'_>,
+) -> anyhow::Result<BrewMaintenanceOutcome> {
     if action == Some("retry_pending") {
         let only = retry_candidates(state_dir)?;
         let dismissed = dismissed_casks(state_dir)?;
-        let outcome =
-            brew_cask_maintenance_with_broker(config, logger, Some(&only), broker, &dismissed)
-                .unwrap_or_else(|error| BrewMaintenanceOutcome {
-                    cask_error: Some(error.to_string()),
-                    ..BrewMaintenanceOutcome::default()
-                });
+        let outcome = brew_cask_maintenance_with_client(
+            config,
+            logger,
+            Some(&only),
+            broker,
+            &dismissed,
+            submission,
+        )
+        .unwrap_or_else(|error| BrewMaintenanceOutcome {
+            cask_error: Some(error.to_string()),
+            ..BrewMaintenanceOutcome::default()
+        });
         record_cask_ledger(state_dir, &outcome, true)?;
         if outcome.cask_error.is_none() {
             clear_resolved_retries(state_dir, &only, &outcome)?;
@@ -1991,11 +2301,12 @@ fn brew_maintenance_with_broker(
     }
     let mut excluded = dismissed_casks(state_dir)?;
     excluded.extend(attention_casks(state_dir)?);
-    let mut outcome = brew_cask_maintenance_with_broker(config, logger, None, broker, &excluded)
-        .unwrap_or_else(|error| BrewMaintenanceOutcome {
-            cask_error: Some(error.to_string()),
-            ..BrewMaintenanceOutcome::default()
-        });
+    let mut outcome =
+        brew_cask_maintenance_with_client(config, logger, None, broker, &excluded, submission)
+            .unwrap_or_else(|error| BrewMaintenanceOutcome {
+                cask_error: Some(error.to_string()),
+                ..BrewMaintenanceOutcome::default()
+            });
     if formula_status != 0 {
         outcome.formula_error = Some(if formula_err.trim().is_empty() {
             "brew upgrade --formula returned a nonzero status".to_string()
@@ -2026,6 +2337,14 @@ struct PackageRecord {
     name: String,
     state: String,
     reason: Option<String>,
+    /// The class of blocker that stopped this cask, when one applies. The
+    /// interface uses it to show an accurate state and a recovery action
+    /// instead of a misleading generic retry label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    blocker: Option<String>,
+    /// The recovery action that can resolve this cask's blocker.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recovery: Option<String>,
     /// Number of REAL upgrade attempts (a launched `brew upgrade`) for this
     /// cask. Pure deferrals never increase it.
     attempts: u32,
@@ -2141,6 +2460,14 @@ fn record_cask_ledger(
         ledger.packages.retain(|record| record.name != name);
         ledger.packages.push(PackageRecord {
             reason: outcome.reasons.get(&name).cloned(),
+            blocker: outcome
+                .blockers
+                .get(&name)
+                .map(|class| class.as_str().to_string()),
+            recovery: outcome
+                .blockers
+                .get(&name)
+                .map(|class| class.recovery_action().to_string()),
             name,
             state,
             attempts,
@@ -2270,12 +2597,14 @@ pub fn run_once(context: &mut ModuleContext) -> anyhow::Result<Option<ModuleStat
     // thread it down. Tests call the lower level helpers with a temp dir so
     // they never touch the real ledger.
     let state_dir = crate::paths::resolve_state_dir();
-    let result = brew_maintenance_with_broker(
+    let result = brew_maintenance_with_client(
         &config,
         &context.logger,
         context.action.as_deref(),
         context.broker.as_ref(),
         &state_dir,
+        context.client_handle.as_deref(),
+        context.client_job_id.as_deref(),
     );
     let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
 
@@ -2424,6 +2753,63 @@ mod tests {
     use std::io::Write;
     use std::path::Path;
     use tempfile::tempdir;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn broker_open_carries_only_the_queued_client_handle() -> anyhow::Result<()> {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixListener;
+
+        let repo = tempdir()?;
+        let uid = credentials::console_uid()?;
+        let listener = UnixListener::bind(crate::control::broker_socket_path(repo.path(), uid))?;
+        let broker_thread =
+            std::thread::spawn(move || -> anyhow::Result<crate::control::Request> {
+                let (mut stream, _) = listener.accept()?;
+                let request = {
+                    let mut reader = BufReader::new(&mut stream);
+                    let mut line = String::new();
+                    reader.read_line(&mut line)?;
+                    serde_json::from_str::<crate::control::Request>(&line)?
+                };
+                let response = crate::control::Response {
+                    v: crate::control::PROTOCOL_VERSION,
+                    id: request.id.clone(),
+                    ok: true,
+                    state: "accepted".to_string(),
+                    apply: None,
+                    config_digest: None,
+                    reload_error: None,
+                    message: None,
+                    snapshot: None,
+                    logs: None,
+                    draft_yaml: None,
+                };
+                stream.write_all(serde_json::to_string(&response)?.as_bytes())?;
+                stream.write_all(b"\n")?;
+                Ok(request)
+            });
+        let response = broker_control_call(
+            repo.path(),
+            "broker_open",
+            Some("anydesk"),
+            Some("/opt/homebrew/bin/brew"),
+            Some("queue-job-1"),
+            Some("opaque-broker-handle"),
+            Some("retry_pending"),
+        )?;
+        assert!(response.ok);
+        let forwarded = broker_thread.join().expect("mock broker thread")?;
+        assert_eq!(forwarded.op, "broker_open");
+        assert_eq!(forwarded.request_id.as_deref(), Some("queue-job-1"));
+        assert_eq!(forwarded.client_identity, None);
+        assert_eq!(
+            forwarded.client_handle.as_deref(),
+            Some("opaque-broker-handle")
+        );
+        assert_eq!(forwarded.action.as_deref(), Some("retry_pending"));
+        Ok(())
+    }
 
     #[cfg(target_os = "macos")]
     #[test]
@@ -2804,6 +3190,179 @@ mod tests {
     }
 
     #[test]
+    fn package_receipt_resolves_a_volume_relative_install_location() -> anyhow::Result<()> {
+        // A real receipt reports "volume: /" with "install-location:
+        // Applications" and relative `pkgutil --files` output.
+        let root = tempdir()?;
+        let volume = root.path().join("volume");
+        let install_root = volume.join("Applications");
+        let app = install_root.join("Example.app");
+        fs::create_dir_all(&app)?;
+
+        let pkgutil = root.path().join("pkgutil");
+        write_script(
+            &pkgutil,
+            r##"#!/bin/sh
+if [ "$1" = "--pkg-info-plist" ]; then echo '<plist />'; exit 0; fi
+if [ "$1" = "--files" ]; then printf '%s\n' 'Example.app'; exit 0; fi
+echo unsupported >&2
+exit 2
+"##,
+        )?;
+        fs::write(
+            root.path().join("receipt-info.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "volume": volume.to_string_lossy(),
+                "install-location": "Applications"
+            }))?,
+        )?;
+        let plutil = root.path().join("plutil");
+        write_script(
+            &plutil,
+            r##"#!/bin/sh
+cat >/dev/null
+cat "$(dirname "$0")/receipt-info.json"
+"##,
+        )?;
+
+        let (paths, services) = resolve_package_receipts_with_tools(
+            &BTreeSet::from(["com.example.product".to_string()]),
+            &pkgutil,
+            &plutil,
+        )?;
+        let app_path = app.canonicalize()?.to_string_lossy().into_owned();
+        assert!(
+            paths.contains(&app_path),
+            "a volume-relative install location must resolve inside its volume"
+        );
+        assert!(services.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn package_receipt_resolves_a_slash_prefixed_relative_install_location() -> anyhow::Result<()> {
+        let root = tempdir()?;
+        let volume = root.path().join("volume");
+        let install_root = volume.join("Applications");
+        fs::create_dir_all(&install_root)?;
+
+        let pkgutil = root.path().join("pkgutil");
+        write_script(
+            &pkgutil,
+            r##"#!/bin/sh
+if [ "$1" = "--pkg-info-plist" ]; then echo '<plist />'; exit 0; fi
+if [ "$1" = "--files" ]; then printf '%s\n' 'Example.app'; exit 0; fi
+echo unsupported >&2
+exit 2
+"##,
+        )?;
+        fs::write(
+            root.path().join("receipt-info.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "volume": volume.to_string_lossy(),
+                "install-location": "/Applications"
+            }))?,
+        )?;
+        let plutil = root.path().join("plutil");
+        write_script(
+            &plutil,
+            r##"#!/bin/sh
+cat >/dev/null
+cat "$(dirname "$0")/receipt-info.json"
+"##,
+        )?;
+
+        let (paths, _) = resolve_package_receipts_with_tools(
+            &BTreeSet::from(["com.example.product".to_string()]),
+            &pkgutil,
+            &plutil,
+        )?;
+        assert_eq!(paths.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn package_receipt_rejects_a_traversal_install_location() -> anyhow::Result<()> {
+        let root = tempdir()?;
+        let volume = root.path().join("volume");
+        fs::create_dir_all(&volume)?;
+
+        let pkgutil = root.path().join("pkgutil");
+        write_script(
+            &pkgutil,
+            r##"#!/bin/sh
+if [ "$1" = "--pkg-info-plist" ]; then echo '<plist />'; exit 0; fi
+echo unsupported >&2
+exit 2
+"##,
+        )?;
+        fs::write(
+            root.path().join("receipt-info.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "volume": volume.to_string_lossy(),
+                "install-location": "../outside"
+            }))?,
+        )?;
+        let plutil = root.path().join("plutil");
+        write_script(
+            &plutil,
+            r##"#!/bin/sh
+cat >/dev/null
+cat "$(dirname "$0")/receipt-info.json"
+"##,
+        )?;
+
+        let error = resolve_package_receipts_with_tools(
+            &BTreeSet::from(["com.example.product".to_string()]),
+            &pkgutil,
+            &plutil,
+        )
+        .expect_err("a traversal install location must be rejected");
+        assert!(error.to_string().contains("not a safe path"));
+        Ok(())
+    }
+
+    #[test]
+    fn package_receipt_rejects_a_relative_volume() -> anyhow::Result<()> {
+        let root = tempdir()?;
+        let pkgutil = root.path().join("pkgutil");
+        write_script(
+            &pkgutil,
+            r##"#!/bin/sh
+if [ "$1" = "--pkg-info-plist" ]; then echo '<plist />'; exit 0; fi
+echo unsupported >&2
+exit 2
+"##,
+        )?;
+        fs::write(
+            root.path().join("receipt-info.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "volume": "relative/volume",
+                "install-location": "Applications"
+            }))?,
+        )?;
+        let plutil = root.path().join("plutil");
+        write_script(
+            &plutil,
+            r##"#!/bin/sh
+cat >/dev/null
+cat "$(dirname "$0")/receipt-info.json"
+"##,
+        )?;
+
+        let error = resolve_package_receipts_with_tools(
+            &BTreeSet::from(["com.example.product".to_string()]),
+            &pkgutil,
+            &plutil,
+        )
+        .expect_err("a relative volume must be rejected");
+        assert!(error
+            .to_string()
+            .contains("volume is not a safe absolute path"));
+        Ok(())
+    }
+
+    #[test]
     fn missing_package_receipt_files_are_unknown_activity() -> anyhow::Result<()> {
         let root = tempdir()?;
         let volume = root.path().join("volume");
@@ -2852,6 +3411,119 @@ mod tests {
         assert_eq!(metrics["failedCasks"], serde_json::json!("broken-cask"));
         assert!(maintenance_message(&state).contains("deferred casks: running-cask"));
         assert!(maintenance_message(&state).contains("failed casks: broken-cask"));
+    }
+
+    #[test]
+    fn a_blocker_that_needs_a_human_action_is_never_retryable() {
+        // A missing bridge, a missing setup, a denied policy, and an
+        // unverifiable activity state all need the user to act first, so
+        // none of them may advertise themselves as retryable.
+        for class in [
+            CaskBlockerClass::SetupMissing,
+            CaskBlockerClass::BridgeAbsent,
+            CaskBlockerClass::ActivityUnverifiable,
+            CaskBlockerClass::PolicyDenied,
+        ] {
+            assert!(
+                !class.is_retryable(),
+                "{} must not be advertised as retryable",
+                class.as_str()
+            );
+            assert!(
+                !class.recovery_action().is_empty(),
+                "{} must name a recovery action",
+                class.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn a_running_application_and_a_failed_upgrade_stay_retryable() {
+        assert!(CaskBlockerClass::ApplicationRunning.is_retryable());
+        assert!(CaskBlockerClass::UpgradeFailed.is_retryable());
+    }
+
+    #[test]
+    fn a_deferred_cask_records_its_blocker_class_and_recovery_action() {
+        let mut outcome = BrewMaintenanceOutcome::default();
+        let logger = ModuleLogger::new(std::env::temp_dir(), "mbrew", false);
+        defer_cask_with_class(
+            &mut outcome,
+            &logger,
+            "bridge-cask",
+            "privilege bridge setup is required",
+            CaskBlockerClass::BridgeAbsent,
+        );
+
+        assert!(outcome.deferred_casks.contains(&"bridge-cask".to_string()));
+        assert!(
+            !outcome.retryable_casks.contains("bridge-cask"),
+            "a missing bridge must not advertise itself as retryable"
+        );
+        assert_eq!(
+            outcome.blockers.get("bridge-cask"),
+            Some(&CaskBlockerClass::BridgeAbsent)
+        );
+        assert_eq!(
+            outcome.reasons.get("bridge-cask").map(String::as_str),
+            Some("privilege bridge setup is required")
+        );
+    }
+
+    #[test]
+    fn a_blocker_class_has_a_stable_distinct_name() {
+        let mut names: Vec<&str> = [
+            CaskBlockerClass::SetupMissing,
+            CaskBlockerClass::BridgeAbsent,
+            CaskBlockerClass::ApplicationRunning,
+            CaskBlockerClass::ActivityUnverifiable,
+            CaskBlockerClass::PolicyDenied,
+            CaskBlockerClass::UpgradeFailed,
+        ]
+        .iter()
+        .map(|class| class.as_str())
+        .collect();
+        names.sort_unstable();
+        let count = names.len();
+        names.dedup();
+        assert_eq!(names.len(), count, "blocker class names must be distinct");
+    }
+
+    #[test]
+    fn the_installed_askpass_helper_is_refreshed_from_the_tracked_source() -> anyhow::Result<()> {
+        let root = tempdir()?;
+        let source = root.path().join("brew_askpass.sh");
+        fs::write(&source, "#!/bin/sh\nexit 1\n")?;
+        let installed = root.path().join("installed/brew_askpass.sh");
+        fs::create_dir_all(installed.parent().expect("installed parent"))?;
+        // A stale copy from an earlier version must be replaced.
+        fs::write(&installed, "#!/bin/sh\necho stale >&2\n")?;
+
+        let config = MbrewConfig {
+            askpass_path: installed.to_string_lossy().into_owned(),
+            ..MbrewConfig::default()
+        };
+        let logger = ModuleLogger::new(root.path().to_path_buf(), "mbrew", false);
+
+        let previous_root = std::env::var_os("SCRIPTD_ROOT_DIR");
+        // Point the tracked-asset lookup at a directory that holds the source.
+        let asset_root = root.path().join("assets");
+        fs::create_dir_all(asset_root.join("modules/mbrew"))?;
+        fs::copy(&source, asset_root.join("modules/mbrew/brew_askpass.sh"))?;
+        std::env::set_var("SCRIPTD_ROOT_DIR", &asset_root);
+        let result = write_askpass(&config, &logger);
+        match previous_root {
+            Some(value) => std::env::set_var("SCRIPTD_ROOT_DIR", value),
+            None => std::env::remove_var("SCRIPTD_ROOT_DIR"),
+        }
+        result?;
+
+        assert_eq!(
+            fs::read(&installed)?,
+            fs::read(&source)?,
+            "the installed helper must match the tracked source"
+        );
+        Ok(())
     }
 
     #[test]
@@ -3095,6 +3767,12 @@ exit 1
                         name: "pending-cask".to_string(),
                         state: "deferred".to_string(),
                         reason: Some("application running".to_string()),
+                        blocker: Some("application_running".to_string()),
+                        recovery: Some(
+                            CaskBlockerClass::ApplicationRunning
+                                .recovery_action()
+                                .to_string(),
+                        ),
                         attempts: 2,
                         retry: true,
                         dismissed: false,
@@ -3103,6 +3781,12 @@ exit 1
                         name: "attention-cask".to_string(),
                         state: "attention".to_string(),
                         reason: Some("metadata unavailable".to_string()),
+                        blocker: Some("activity_unverifiable".to_string()),
+                        recovery: Some(
+                            CaskBlockerClass::ActivityUnverifiable
+                                .recovery_action()
+                                .to_string(),
+                        ),
                         attempts: 1,
                         retry: false,
                         dismissed: false,
@@ -3111,6 +3795,12 @@ exit 1
                         name: "stale-cask".to_string(),
                         state: "deferred".to_string(),
                         reason: Some("application running".to_string()),
+                        blocker: Some("application_running".to_string()),
+                        recovery: Some(
+                            CaskBlockerClass::ApplicationRunning
+                                .recovery_action()
+                                .to_string(),
+                        ),
                         attempts: 3,
                         retry: true,
                         dismissed: false,
@@ -3248,7 +3938,7 @@ exit 1
 
     #[test]
     #[serial_test::serial]
-    fn brew_askpass_recreated_when_missing() -> anyhow::Result<()> {
+    fn brew_askpass_is_refreshed_from_tracked_source_during_maintenance() -> anyhow::Result<()> {
         let root = tempdir()?;
         let fake_bin = root.path().join("bin");
         fs::create_dir_all(&fake_bin)?;
@@ -3266,15 +3956,16 @@ exit 1
             .with_context(|| format!("read tracked askpass helper {}", tracked.display()))?;
         let previous_root = std::env::var_os("SCRIPTD_ROOT_DIR");
         std::env::set_var("SCRIPTD_ROOT_DIR", tracked_root());
-        with_path_scope(&fake_bin, || {
-            assert!(!askpass.exists());
+        with_path_scope(&fake_bin, || -> anyhow::Result<()> {
+            fs::write(&askpass, "stale helper")?;
             ensure_askpass(
                 &config,
                 &ModuleLogger::new(root.path().to_path_buf(), "mbrew", false),
             )
-            .expect("askpass written");
+            .expect("stale askpass refreshed");
             assert!(askpass.exists());
-        });
+            Ok(())
+        })?;
         match previous_root {
             Some(value) => std::env::set_var("SCRIPTD_ROOT_DIR", value),
             None => std::env::remove_var("SCRIPTD_ROOT_DIR"),
@@ -3386,6 +4077,8 @@ exit 1
             name: name.to_string(),
             state: state.to_string(),
             reason: Some("reason".to_string()),
+            blocker: None,
+            recovery: None,
             attempts,
             retry,
             dismissed: false,
@@ -3571,7 +4264,7 @@ exit 1
         );
         assert!(matches!(
             broker_launch_failure_result(BrokerLaunchFailure::NotStarted, &connection_refused),
-            BrokerUpgradeResult::Deferred(_)
+            BrokerUpgradeResult::Deferred(_, CaskBlockerClass::BridgeAbsent)
         ));
 
         let lost_response = anyhow::Error::new(std::io::Error::new(
