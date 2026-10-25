@@ -1,0 +1,19 @@
+#!/bin/sh
+set -eu
+BIN=/usr/local/libexec/scriptd-bridge
+PLIST=/Library/LaunchDaemons/com.astronlab.scriptd.bridge.plist
+LABEL=com.astronlab.scriptd.bridge
+SUPPORT='/Library/Application Support/scriptd'
+
+/bin/mkdir -p "$SUPPORT"
+/usr/sbin/chown root:wheel "$SUPPORT"
+/bin/chmod 755 "$SUPPORT"
+/usr/sbin/chown root:wheel "$BIN" "$PLIST"
+/bin/chmod 755 "$BIN"
+/bin/chmod 644 "$PLIST"
+"$BIN" write-installation-receipt
+/usr/bin/plutil -lint "$PLIST"
+/usr/bin/codesign --verify --strict --options runtime "$BIN"
+/bin/launchctl bootstrap system "$PLIST"
+/bin/launchctl kickstart -k "system/$LABEL"
+exit 0

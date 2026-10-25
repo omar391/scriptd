@@ -1,0 +1,25 @@
+#!/bin/sh
+set -eu
+PLIST=/Library/LaunchDaemons/com.astronlab.scriptd.bridge.plist
+LABEL=com.astronlab.scriptd.bridge
+if output=$(/bin/launchctl print "system/$LABEL" 2>&1); then
+  if output=$(/bin/launchctl bootout system "$PLIST" 2>&1); then
+    exit 0
+  else
+    status=$?
+    printf 'preinstall: launchctl bootout failed (%s): %s\n' "$status" "$output" >&2
+    exit "$status"
+  fi
+else
+  status=$?
+fi
+
+case "$status:$output" in
+  113:*"Could not find service \"$LABEL\" in domain for system"*)
+    exit 0
+    ;;
+  *)
+    printf 'preinstall: launchctl could not inspect service (%s): %s\n' "$status" "$output" >&2
+    exit "$status"
+    ;;
+esac

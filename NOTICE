@@ -19,17 +19,13 @@ the License.
 Scope of this repository
 ------------------------
 
-This repository contains the generic automation bridge and the runtime it
-drives:
+This repository contains the generic, minimal privileged bridge and its
+versioned wire-protocol crate. The bridge performs only explicitly typed,
+paired operations that require privileges unavailable to a sandboxed app; it
+does not own automation, module configuration, scheduling, or the user
+interface. Homebrew remains responsible for its own package maintenance.
 
-* the Scriptd service runtime, supervisor, and control API;
-* the module implementations (Brew Manager, CPU Monitor, Wi-Fi Monitor, and
-  Router Watch);
-* the privilege broker, its authorization policy, and its audit trail;
-* the `scriptd-bridge-protocol` crate of shared wire types; and
-* a browser-based control center retained as a generic fallback.
-
-The paid desktop product, its interface, and its product-specific rules,
-scheduling, and presets are developed separately and are not part of this
-repository. Nothing from that product may be copied into this repository or
-into a release archive published from it.
+The paid Scriptd desktop application is maintained separately. It owns rules,
+schedules, policies, presets, configuration, and all product interface code.
+Those private product sources are not part of this repository or its release
+archives.
