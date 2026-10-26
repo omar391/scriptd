@@ -19,8 +19,6 @@ jobs:
     needs: installer-smoke
     runs-on: macos-15
     timeout-minutes: 60
-    env:
-      CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-targets/scriptd-bridge
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -34,10 +32,16 @@ jobs:
       - name: Validate installer lifecycle scripts
         run: ./tools/test-bridge-installer.sh
       - name: Test the bridge and shared protocol
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-targets/scriptd-bridge
         run: cargo +stable test --locked --workspace
       - name: Lint the bridge and shared protocol
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-targets/scriptd-bridge
         run: cargo +stable clippy --locked --workspace --all-targets -- -D warnings
       - name: Build the bridge
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-targets/scriptd-bridge
         run: cargo +stable build --locked --release -p scriptd-bridge
       - name: Import Developer ID signing identities
         env:
@@ -60,6 +64,7 @@ jobs:
           security list-keychains -d user -s "$KEYCHAIN_PATH"
       - name: Sign and package the bridge daemon
         env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-targets/scriptd-bridge
           DEVELOPER_ID_APPLICATION: ${{ secrets.DEVELOPER_ID_APPLICATION }}
           DEVELOPER_ID_INSTALLER: ${{ secrets.DEVELOPER_ID_INSTALLER }}
         run: |
