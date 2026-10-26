@@ -12,10 +12,13 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use scriptd_bridge_protocol::{
     Capability, CapabilityReport, Operation, OperationReceipt, OperationRequest, OperationState,
-    OperationStatusRequest, PairingReceipt, PairingRequest, PairingStatus, PROTOCOL_VERSION,
+    OperationStatusRequest, PairingReceipt, PairingRequest, PairingStatus,
+    INSTALLER_PROTOCOL_VERSION, PROTOCOL_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+mod installer;
 
 const BRIDGE_BINARY: &str = "/usr/local/libexec/scriptd-bridge";
 const INSTALLATION_RECEIPT: &str = "/Library/Application Support/scriptd/bridge-installation.json";
@@ -24,7 +27,9 @@ const SOCKET_DIRECTORY: &str = "/var/run/scriptd";
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_STATE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_RECEIPTS: usize = 4096;
+const MAX_RECEIPT_MESSAGE_BYTES: usize = 4096;
 const IO_TIMEOUT: Duration = Duration::from_secs(15);
+const DIRECT_APP_BUNDLE_IDENTIFIER: &str = "com.astronlab.scriptd";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -55,7 +60,7 @@ struct Response {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Identity {
+pub(crate) struct Identity {
     team_identifier: String,
     bundle_identifier: String,
 }
@@ -76,6 +81,22 @@ struct OperationRecord {
     receipt: OperationReceipt,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct InstallerGrant {
+    pub(crate) app_identity: Identity,
+    pub(crate) publisher_team_identifier: String,
+    pub(crate) package_identifier: String,
+    pub(crate) method: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct InstallerApprovalQuery {
+    publisher_team_identifier: String,
+    package_identifier: String,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct State {
@@ -83,6 +104,8 @@ struct State {
     pairings: BTreeMap<String, Pairing>,
     #[serde(default)]
     pairing_authorizations: BTreeMap<String, Identity>,
+    #[serde(default)]
+    installer_grants: BTreeMap<String, InstallerGrant>,
     operations: BTreeMap<String, OperationRecord>,
 }
 
@@ -121,6 +144,9 @@ impl State {
 
     fn save(&self, path: &Path) -> Result<()> {
         let bytes = serde_json::to_vec(self)?;
+        if bytes.len() > MAX_STATE_BYTES {
+            bail!("bridge state exceeds the maximum supported size; refusing the change");
+        }
         write_root_atomic(path, &bytes)
     }
 
@@ -131,6 +157,72 @@ impl State {
             .context("this app is not paired with the bridge")?;
         if !pairing.active || pairing.team_identifier != identity.team_identifier {
             bail!("the active pairing does not match this app's signing identity");
+        }
+        Ok(())
+    }
+
+    fn installer_grant(
+        &self,
+        identity: &Identity,
+        package_identifier: &str,
+    ) -> Result<&InstallerGrant> {
+        let key = installer_grant_key(identity, package_identifier);
+        self.installer_grants.get(&key).context(
+            "this package and publisher have not been approved for unattended installation",
+        )
+    }
+
+    fn set_installer_grant(
+        &mut self,
+        grant: InstallerGrant,
+        revoke: bool,
+        path: &Path,
+    ) -> Result<()> {
+        self.set_installer_grant_with(grant, revoke, |state| state.save(path))
+    }
+
+    fn set_installer_grant_with(
+        &mut self,
+        grant: InstallerGrant,
+        revoke: bool,
+        mut persist: impl FnMut(&State) -> Result<()>,
+    ) -> Result<()> {
+        validate_identity(&grant.app_identity)?;
+        if grant.app_identity.bundle_identifier != DIRECT_APP_BUNDLE_IDENTIFIER {
+            bail!("package approval is available only to the direct-download app edition");
+        }
+        validate_team_identifier(&grant.publisher_team_identifier)?;
+        validate_package_identifier(&grant.package_identifier)?;
+        if grant.method != "package_installer_v1" {
+            bail!("unsupported privileged installer method");
+        }
+        let key = installer_grant_key(&grant.app_identity, &grant.package_identifier);
+        if let Some(existing) = self.installer_grants.get(&key) {
+            if !revoke && existing.publisher_team_identifier != grant.publisher_team_identifier {
+                bail!("revoke the existing publisher approval before changing package publisher");
+            }
+            if revoke && existing.publisher_team_identifier != grant.publisher_team_identifier {
+                bail!("publisher identity does not match the approved package grant");
+            }
+        }
+        let previous = if revoke {
+            self.installer_grants.remove(&key)
+        } else {
+            self.installer_grants.insert(key.clone(), grant.clone())
+        };
+        if previous.is_none() && revoke {
+            bail!("no matching installer approval exists");
+        }
+        if let Err(error) = persist(self) {
+            match previous {
+                Some(previous) => {
+                    self.installer_grants.insert(key, previous);
+                }
+                None => {
+                    self.installer_grants.remove(&key);
+                }
+            }
+            return Err(error).context("persist installer approval change");
         }
         Ok(())
     }
@@ -151,8 +243,10 @@ impl State {
         mut persist: impl FnMut(&State) -> Result<()>,
     ) -> Result<PairingReceipt> {
         validate_identity(identity)?;
-        if request.protocol_version != PROTOCOL_VERSION
-            || request.bundle_identifier != identity.bundle_identifier
+        if !matches!(
+            request.protocol_version,
+            PROTOCOL_VERSION | INSTALLER_PROTOCOL_VERSION
+        ) || request.bundle_identifier != identity.bundle_identifier
         {
             bail!("pairing request does not match the authenticated app or protocol");
         }
@@ -166,7 +260,7 @@ impl State {
                 return Ok(PairingReceipt {
                     signing_identity: identity.team_identifier.clone(),
                     bundle_identifier: identity.bundle_identifier.clone(),
-                    protocol_version: PROTOCOL_VERSION,
+                    protocol_version: request.protocol_version,
                     active: true,
                 });
             }
@@ -198,7 +292,7 @@ impl State {
         Ok(PairingReceipt {
             signing_identity: identity.team_identifier.clone(),
             bundle_identifier: identity.bundle_identifier.clone(),
-            protocol_version: PROTOCOL_VERSION,
+            protocol_version: request.protocol_version,
             active: true,
         })
     }
@@ -250,12 +344,25 @@ impl State {
         identity: &Identity,
         request: OperationRequest,
         mut persist: impl FnMut(&State) -> Result<()>,
-        execute_operation: impl FnOnce(&Operation) -> Result<()>,
+        execute_operation: impl FnOnce(&Operation, &[InstallerGrant]) -> Result<()>,
     ) -> Result<OperationReceipt> {
         request
             .validate()
             .map_err(|error| anyhow::anyhow!("invalid bridge operation: {error}"))?;
         self.require_pairing(identity)?;
+        let installer_grants = match &request.operation {
+            Operation::InstallApprovedPackage {
+                package_identifier, ..
+            } => {
+                self.installer_grant(identity, package_identifier)?;
+                self.installer_grants
+                    .values()
+                    .filter(|grant| grant.app_identity == *identity)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            }
+            Operation::SetWifiNetwork { .. } => Vec::new(),
+        };
         let id = request.operation_id.as_str().to_string();
         if let Some(existing) = self.operations.get(&id) {
             if existing.identity != *identity || existing.request != request {
@@ -270,7 +377,7 @@ impl State {
             identity: identity.clone(),
             request: request.clone(),
             receipt: OperationReceipt {
-                protocol_version: PROTOCOL_VERSION,
+                protocol_version: request.protocol_version,
                 operation_id: request.operation_id.clone(),
                 state: OperationState::Accepted,
                 message: None,
@@ -291,14 +398,16 @@ impl State {
             return Err(error).context("persist running operation before execution");
         }
 
-        match execute_operation(&request.operation) {
+        match execute_operation(&request.operation, &installer_grants) {
             Ok(()) => {
                 record.receipt.state = OperationState::Succeeded;
                 record.receipt.message = Some("operation completed".to_string());
             }
             Err(error) => {
                 record.receipt.state = OperationState::Failed;
-                record.receipt.message = Some(format!("operation failed: {error:#}"));
+                record.receipt.message = Some(bounded_receipt_message(format!(
+                    "operation failed: {error:#}"
+                )));
             }
         }
         self.operations.insert(id.clone(), record.clone());
@@ -323,7 +432,7 @@ impl State {
             Some(record) if record.identity == *identity => Ok(record.receipt.clone()),
             Some(_) => bail!("operation receipt belongs to a different app"),
             None => Ok(OperationReceipt {
-                protocol_version: PROTOCOL_VERSION,
+                protocol_version: request.protocol_version,
                 operation_id: request.operation_id,
                 state: OperationState::Unknown,
                 message: Some("no operation with this ID is recorded".to_string()),
@@ -371,6 +480,35 @@ fn validate_identity(identity: &Identity) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn validate_team_identifier(identifier: &str) -> Result<()> {
+    if identifier.is_empty()
+        || identifier.len() > 64
+        || !identifier.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    {
+        bail!("publisher signing team identifier is invalid");
+    }
+    Ok(())
+}
+
+fn validate_package_identifier(identifier: &str) -> Result<()> {
+    if identifier.is_empty()
+        || identifier.len() > 255
+        || !identifier
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+    {
+        bail!("package identifier is invalid");
+    }
+    Ok(())
+}
+
+fn installer_grant_key(identity: &Identity, package_identifier: &str) -> String {
+    format!(
+        "{}:{}:{}",
+        identity.team_identifier, identity.bundle_identifier, package_identifier
+    )
+}
+
 fn respond(
     id: &str,
     ok: bool,
@@ -378,8 +516,19 @@ fn respond(
     message: Option<String>,
     snapshot: Option<serde_json::Value>,
 ) -> Response {
+    respond_version(PROTOCOL_VERSION, id, ok, state, message, snapshot)
+}
+
+fn respond_version(
+    version: u32,
+    id: &str,
+    ok: bool,
+    state: &str,
+    message: Option<String>,
+    snapshot: Option<serde_json::Value>,
+) -> Response {
     Response {
-        v: PROTOCOL_VERSION,
+        v: version,
         id: id.to_string(),
         ok,
         state: state.to_string(),
@@ -395,7 +544,20 @@ fn handle(
     state: &mut State,
     state_path: &Path,
 ) -> Response {
-    if request.v != PROTOCOL_VERSION {
+    let protocol_version = request.v;
+    let mut response = handle_inner(request, identity, admin_authorized, state, state_path);
+    response.v = protocol_version;
+    response
+}
+
+fn handle_inner(
+    request: Request,
+    identity: Option<Identity>,
+    admin_authorized: bool,
+    state: &mut State,
+    state_path: &Path,
+) -> Response {
+    if !matches!(request.v, PROTOCOL_VERSION | INSTALLER_PROTOCOL_VERSION) {
         return respond(
             &request.id,
             false,
@@ -405,15 +567,26 @@ fn handle(
         );
     }
     match request.op.as_str() {
-        "capabilities" => respond(
+        "capabilities" => respond_version(
+            request.v,
             &request.id,
             true,
             "completed",
             None,
             Some(
                 serde_json::to_value(CapabilityReport {
-                    protocol_version: PROTOCOL_VERSION,
-                    capabilities: vec![Capability::WifiNetworkChange],
+                    protocol_version: request.v,
+                    capabilities: if request.v == INSTALLER_PROTOCOL_VERSION {
+                        let mut capabilities = vec![Capability::WifiNetworkChange];
+                        if identity.as_ref().is_some_and(|identity| {
+                            identity.bundle_identifier == DIRECT_APP_BUNDLE_IDENTIFIER
+                        }) {
+                            capabilities.push(Capability::InstallerPackageV1);
+                        }
+                        capabilities
+                    } else {
+                        vec![Capability::WifiNetworkChange]
+                    },
                 })
                 .unwrap_or(serde_json::Value::Null),
             ),
@@ -449,6 +622,15 @@ fn handle(
                     )
                 }
             };
+            if pairing.protocol_version != request.v {
+                return respond(
+                    &request.id,
+                    false,
+                    "rejected",
+                    Some("pairing protocol does not match the bridge request".into()),
+                    None,
+                );
+            }
             match state.pair(identity, pairing, state_path) {
                 Ok(receipt) => respond(
                     &request.id,
@@ -514,6 +696,170 @@ fn handle(
                 ),
             }
         }
+        "authorize_package" | "revoke_package" => {
+            if !admin_authorized {
+                return respond(
+                    &request.id,
+                    false,
+                    "rejected",
+                    Some("package approval changes require administrator authorization".into()),
+                    None,
+                );
+            }
+            let Some(payload) = request.yaml.as_deref() else {
+                return respond(
+                    &request.id,
+                    false,
+                    "rejected",
+                    Some("package approval request is incomplete".into()),
+                    None,
+                );
+            };
+            let grant: InstallerGrant = match serde_json::from_str(payload) {
+                Ok(value) => value,
+                Err(error) => {
+                    return respond(
+                        &request.id,
+                        false,
+                        "rejected",
+                        Some(format!("invalid package approval: {error}")),
+                        None,
+                    )
+                }
+            };
+            match state.set_installer_grant(grant, request.op == "revoke_package", state_path) {
+                Ok(()) => respond(
+                    &request.id,
+                    true,
+                    "completed",
+                    Some(
+                        if request.op == "revoke_package" {
+                            "future package authorization revoked"
+                        } else {
+                            "package publisher authorization recorded"
+                        }
+                        .into(),
+                    ),
+                    None,
+                ),
+                Err(error) => respond(
+                    &request.id,
+                    false,
+                    "rejected",
+                    Some(error.to_string()),
+                    None,
+                ),
+            }
+        }
+        "package_approval_status" | "package_approval_list" => {
+            if request.v != INSTALLER_PROTOCOL_VERSION {
+                return respond(
+                    &request.id,
+                    false,
+                    "rejected",
+                    Some("package approvals require bridge protocol version 4".into()),
+                    None,
+                );
+            }
+            let Some(identity) = identity.as_ref() else {
+                return respond(
+                    &request.id,
+                    false,
+                    "rejected",
+                    Some("app signature is not verified".into()),
+                    None,
+                );
+            };
+            if identity.bundle_identifier != DIRECT_APP_BUNDLE_IDENTIFIER {
+                return respond(
+                    &request.id,
+                    false,
+                    "rejected",
+                    Some(
+                        "installer approvals are available only to the direct-download app".into(),
+                    ),
+                    None,
+                );
+            }
+            if let Err(error) = state.require_pairing(identity) {
+                return respond(
+                    &request.id,
+                    false,
+                    "rejected",
+                    Some(error.to_string()),
+                    None,
+                );
+            }
+            if request.op == "package_approval_status" {
+                let Some(payload) = request.yaml.as_deref() else {
+                    return respond(
+                        &request.id,
+                        false,
+                        "rejected",
+                        Some("package approval query is incomplete".into()),
+                        None,
+                    );
+                };
+                let query: InstallerApprovalQuery = match serde_json::from_str(payload) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return respond(
+                            &request.id,
+                            false,
+                            "rejected",
+                            Some(format!("invalid package approval query: {error}")),
+                            None,
+                        )
+                    }
+                };
+                if validate_team_identifier(&query.publisher_team_identifier).is_err()
+                    || validate_package_identifier(&query.package_identifier).is_err()
+                {
+                    return respond(
+                        &request.id,
+                        false,
+                        "rejected",
+                        Some("package approval identity is invalid".into()),
+                        None,
+                    );
+                }
+                let approved = state
+                    .installer_grant(identity, &query.package_identifier)
+                    .is_ok_and(|grant| {
+                        grant.publisher_team_identifier == query.publisher_team_identifier
+                    });
+                respond_version(
+                    request.v,
+                    &request.id,
+                    true,
+                    "completed",
+                    None,
+                    Some(serde_json::json!({ "approved": approved })),
+                )
+            } else {
+                let approvals = state
+                    .installer_grants
+                    .values()
+                    .filter(|grant| {
+                        grant.app_identity == *identity && grant.method == "package_installer_v1"
+                    })
+                    .map(|grant| {
+                        serde_json::json!({
+                            "publisher_team_identifier": grant.publisher_team_identifier,
+                            "package_identifier": grant.package_identifier,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                respond_version(
+                    request.v,
+                    &request.id,
+                    true,
+                    "completed",
+                    None,
+                    Some(serde_json::Value::Array(approvals)),
+                )
+            }
+        }
         "pairing_status" => {
             let Some(identity) = identity.as_ref() else {
                 return respond(
@@ -540,7 +886,7 @@ fn handle(
                     pairing.active && pairing.team_identifier == identity.team_identifier
                 });
             let status = PairingStatus {
-                protocol_version: PROTOCOL_VERSION,
+                protocol_version: request.v,
                 bundle_identifier: identity.bundle_identifier.clone(),
                 active,
             };
@@ -619,6 +965,15 @@ fn handle(
                     )
                 }
             };
+            if operation.protocol_version != request.v {
+                return respond(
+                    &request.id,
+                    false,
+                    "rejected",
+                    Some("operation protocol does not match the bridge request".into()),
+                    None,
+                );
+            }
             match state.submit(identity, operation, state_path) {
                 Ok(receipt) => operation_response(&request.id, receipt),
                 Err(error) => respond(
@@ -682,6 +1037,17 @@ fn handle(
     }
 }
 
+fn bounded_receipt_message(mut message: String) -> String {
+    if message.len() > MAX_RECEIPT_MESSAGE_BYTES {
+        let mut end = MAX_RECEIPT_MESSAGE_BYTES;
+        while !message.is_char_boundary(end) {
+            end -= 1;
+        }
+        message.truncate(end);
+    }
+    message
+}
+
 fn operation_response(id: &str, receipt: OperationReceipt) -> Response {
     let state = match receipt.state {
         OperationState::Accepted => "accepted",
@@ -691,16 +1057,18 @@ fn operation_response(id: &str, receipt: OperationReceipt) -> Response {
         OperationState::Unavailable => "unavailable",
         OperationState::Unknown => "unknown",
     };
-    respond(
+    let mut response = respond(
         id,
         true,
         state,
         receipt.message.clone(),
-        Some(serde_json::to_value(receipt).unwrap_or(serde_json::Value::Null)),
-    )
+        Some(serde_json::to_value(&receipt).unwrap_or(serde_json::Value::Null)),
+    );
+    response.v = receipt.protocol_version;
+    response
 }
 
-fn execute(operation: &Operation) -> Result<()> {
+fn execute(operation: &Operation, grants: &[InstallerGrant]) -> Result<()> {
     match operation {
         Operation::SetWifiNetwork { ssid } => {
             let ports = Command::new("/usr/sbin/networksetup")
@@ -740,6 +1108,10 @@ fn execute(operation: &Operation) -> Result<()> {
             }
             Ok(())
         }
+        Operation::InstallApprovedPackage {
+            package_identifier,
+            package_path,
+        } => installer::install_approved_package(package_identifier, package_path, grants),
     }
 }
 
@@ -853,14 +1225,17 @@ fn read_request(
         bytes.push(byte[0]);
     }
     let request: Request = serde_json::from_slice(&bytes).context("parse bridge request")?;
-    if request.op == "authorize_pairing" {
+    if matches!(
+        request.op.as_str(),
+        "authorize_pairing" | "authorize_package" | "revoke_package"
+    ) {
         if uid != 0 {
-            bail!("pairing approval requires a root-owned bridge client");
+            bail!("administrator approval requires a root-owned bridge client");
         }
         let client_identity = authenticate_peer(pid)?;
         let bridge_identity = authenticate_peer_identity_path(Path::new(BRIDGE_BINARY))?;
         if client_identity != bridge_identity {
-            bail!("pairing approval must come from the installed bridge executable");
+            bail!("administrator approval must come from the installed bridge executable");
         }
         return Ok((request, None, true));
     }
@@ -869,8 +1244,15 @@ fn read_request(
     }
     let identity = if matches!(
         request.op.as_str(),
-        "pair" | "pairing_status" | "unpair" | "operation" | "operation_status"
-    ) {
+        "pair"
+            | "pairing_status"
+            | "unpair"
+            | "operation"
+            | "operation_status"
+            | "package_approval_status"
+            | "package_approval_list"
+    ) || (request.op == "capabilities" && request.v == INSTALLER_PROTOCOL_VERSION)
+    {
         Some(authenticate_peer(pid)?)
     } else {
         None
@@ -937,6 +1319,9 @@ fn authenticate_peer(pid: u32) -> Result<Identity> {
     let executable = PathBuf::from(
         String::from_utf8(path_bytes).context("bridge peer executable path is not UTF-8")?,
     );
+    if has_mas_receipt(&executable) {
+        bail!("the Mac App Store edition cannot use Scriptd Bridge operations");
+    }
     let verify = Command::new("/usr/bin/codesign")
         .args(["--verify", "--strict", "--all-architectures", "--"])
         .arg(&executable)
@@ -999,6 +1384,17 @@ fn authenticate_peer(pid: u32) -> Result<Identity> {
         team_identifier: team,
         bundle_identifier: identifier.context("bridge peer has no bundle identifier")?,
     })
+}
+
+fn has_mas_receipt(executable: &Path) -> bool {
+    executable
+        .ancestors()
+        .find(|ancestor| {
+            ancestor
+                .extension()
+                .is_some_and(|extension| extension == "app")
+        })
+        .is_some_and(|bundle| bundle.join("Contents/_MASReceipt/receipt").is_file())
 }
 
 fn read_root_file(path: &Path) -> std::io::Result<Vec<u8>> {
@@ -1155,7 +1551,7 @@ fn write_installation_receipt() -> Result<()> {
     )
 }
 
-fn console_uid() -> Result<u32> {
+pub(crate) fn console_uid() -> Result<u32> {
     let output = Command::new("/usr/bin/stat")
         .args(["-f", "%u", "/dev/console"])
         .output()?;
@@ -1279,8 +1675,27 @@ fn main() -> Result<()> {
             }
             authorize_pairing_command(team_identifier, bundle_identifier)
         }
+        Some("set-package-approval") => {
+            let action = args.next().context("missing approve or revoke action")?;
+            let app_team = args.next().context("missing app team identifier")?;
+            let app_bundle = args.next().context("missing app bundle identifier")?;
+            let publisher_team = args
+                .next()
+                .context("missing package publisher team identifier")?;
+            let package_identifier = args.next().context("missing package identifier")?;
+            if args.next().is_some() || !matches!(action.as_str(), "approve" | "revoke") {
+                bail!("usage: set-package-approval <approve|revoke> <app-team> <app-bundle> <publisher-team> <package-id>");
+            }
+            set_package_approval_command(
+                action == "revoke",
+                app_team,
+                app_bundle,
+                publisher_team,
+                package_identifier,
+            )
+        }
         _ => {
-            eprintln!("usage: scriptd-bridge serve|write-installation-receipt|authorize-pairing <team-identifier> <bundle-identifier>");
+            eprintln!("usage: scriptd-bridge serve|write-installation-receipt|authorize-pairing <team-identifier> <bundle-identifier>|set-package-approval <approve|revoke> <app-team> <app-bundle> <publisher-team> <package-id>");
             std::process::exit(2);
         }
     }
@@ -1343,6 +1758,81 @@ fn authorize_pairing_command(team_identifier: String, bundle_identifier: String)
     Ok(())
 }
 
+fn set_package_approval_command(
+    revoke: bool,
+    app_team: String,
+    app_bundle: String,
+    publisher_team: String,
+    package_identifier: String,
+) -> Result<()> {
+    if unsafe { libc::geteuid() } != 0 {
+        bail!("package approval changes require administrator privileges");
+    }
+    let grant = InstallerGrant {
+        app_identity: Identity {
+            team_identifier: app_team,
+            bundle_identifier: app_bundle,
+        },
+        publisher_team_identifier: publisher_team,
+        package_identifier,
+        method: "package_installer_v1".into(),
+    };
+    validate_identity(&grant.app_identity)?;
+    validate_team_identifier(&grant.publisher_team_identifier)?;
+    validate_package_identifier(&grant.package_identifier)?;
+    let uid = console_uid()?;
+    let socket = socket_path(Path::new(SOCKET_DIRECTORY), uid);
+    let mut stream = UnixStream::connect(&socket)
+        .with_context(|| format!("connect to bridge at {}", socket.display()))?;
+    stream.set_read_timeout(Some(IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(IO_TIMEOUT))?;
+    let request = Request {
+        v: PROTOCOL_VERSION,
+        id: format!("package-approval-{}", std::process::id()),
+        op: if revoke {
+            "revoke_package"
+        } else {
+            "authorize_package"
+        }
+        .into(),
+        repo: String::new(),
+        module: None,
+        yaml: Some(serde_json::to_string(&grant)?),
+    };
+    let mut bytes = serde_json::to_vec(&request)?;
+    bytes.push(b'\n');
+    stream.write_all(&bytes)?;
+    let mut response_bytes = Vec::new();
+    let mut byte = [0_u8; 1];
+    loop {
+        let count = stream.read(&mut byte)?;
+        if count == 0 || byte[0] == b'\n' {
+            break;
+        }
+        if response_bytes.len() >= MAX_REQUEST_BYTES {
+            bail!("bridge approval response exceeds the size limit");
+        }
+        response_bytes.push(byte[0]);
+    }
+    let response: Response = serde_json::from_slice(&response_bytes)
+        .context("parse bridge package approval response")?;
+    if !response.ok || response.state != "completed" {
+        bail!(
+            "bridge rejected package approval: {}",
+            response.message.unwrap_or_else(|| response.state.clone())
+        );
+    }
+    println!(
+        "{} for {} from {}",
+        response
+            .message
+            .unwrap_or_else(|| "package approval changed".into()),
+        grant.package_identifier,
+        grant.publisher_team_identifier
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1379,6 +1869,630 @@ mod tests {
                 ssid: "Saved network".to_string(),
             },
         }
+    }
+
+    fn smoke_request(
+        id: &str,
+        op: &str,
+        payload: Option<String>,
+        version: u32,
+    ) -> Result<Response> {
+        let request = Request {
+            v: version,
+            id: id.to_string(),
+            op: op.to_string(),
+            repo: String::new(),
+            module: None,
+            yaml: payload,
+        };
+        let socket = socket_path(Path::new(SOCKET_DIRECTORY), console_uid()?);
+        let mut stream = UnixStream::connect(&socket)
+            .with_context(|| format!("connect to running bridge at {}", socket.display()))?;
+        stream.set_read_timeout(Some(IO_TIMEOUT))?;
+        stream.set_write_timeout(Some(IO_TIMEOUT))?;
+        let mut bytes = serde_json::to_vec(&request)?;
+        bytes.push(b'\n');
+        stream.write_all(&bytes)?;
+
+        let mut response_bytes = Vec::new();
+        let mut byte = [0_u8; 1];
+        loop {
+            let count = stream.read(&mut byte)?;
+            if count == 0 || byte[0] == b'\n' {
+                break;
+            }
+            if response_bytes.len() >= MAX_REQUEST_BYTES {
+                anyhow::bail!("bridge smoke response exceeds the size limit");
+            }
+            response_bytes.push(byte[0]);
+        }
+        let response: Response = serde_json::from_slice(&response_bytes)?;
+        if response.id != id {
+            anyhow::bail!("bridge returned a response for a different request");
+        }
+        Ok(response)
+    }
+
+    fn installer_smoke_operation(
+        id: &str,
+        package_identifier: &str,
+        package_path: &str,
+    ) -> OperationRequest {
+        OperationRequest {
+            protocol_version: INSTALLER_PROTOCOL_VERSION,
+            operation_id: scriptd_bridge_protocol::OperationId::new(id)
+                .expect("valid installer smoke operation ID"),
+            operation: Operation::InstallApprovedPackage {
+                package_identifier: package_identifier.to_string(),
+                package_path: package_path.to_string(),
+            },
+        }
+    }
+
+    fn smoke_admin(arguments: &[&str]) {
+        let output = Command::new("/usr/bin/sudo")
+            .arg("-n")
+            .arg(BRIDGE_BINARY)
+            .args(arguments)
+            .output()
+            .expect("run bridge administrator command");
+        assert!(
+            output.status.success(),
+            "bridge administrator command failed: {}: {}",
+            arguments.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn smoke_receipt(response: Response) -> OperationReceipt {
+        assert!(response.ok, "bridge request failed: {:?}", response.message);
+        serde_json::from_value(response.snapshot.expect("operation receipt"))
+            .expect("decode operation receipt")
+    }
+
+    fn smoke_approval_status(publisher: &str, package: &str) -> bool {
+        let query = InstallerApprovalQuery {
+            publisher_team_identifier: publisher.to_string(),
+            package_identifier: package.to_string(),
+        };
+        let response = smoke_request(
+            "status-smoke-approval",
+            "package_approval_status",
+            Some(serde_json::to_string(&query).expect("serialize approval query")),
+            INSTALLER_PROTOCOL_VERSION,
+        )
+        .expect("query durable package approval");
+        assert!(
+            response.ok,
+            "approval status failed: {:?}",
+            response.message
+        );
+        response
+            .snapshot
+            .expect("package approval status")
+            .get("approved")
+            .and_then(serde_json::Value::as_bool)
+            .expect("boolean package approval result")
+    }
+
+    struct SmokeService {
+        child: std::process::Child,
+        pid_file: PathBuf,
+        service_pid: u32,
+    }
+
+    impl SmokeService {
+        fn start() -> Self {
+            let pid_file = PathBuf::from(
+                std::env::var_os("SCRIPTD_INSTALLER_SMOKE_SERVICE_PID_FILE")
+                    .expect("service pid file path"),
+            );
+            let _ = fs::remove_file(&pid_file);
+            let mut child = Command::new("/usr/bin/sudo")
+                .arg("-n")
+                .arg("/bin/sh")
+                .arg("-c")
+                .arg("printf '%s\\n' \"$$\" > \"$1\"; exec \"$2\" serve")
+                .arg("scriptd-installer-smoke-service")
+                .arg(&pid_file)
+                .arg(BRIDGE_BINARY)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::inherit())
+                .spawn()
+                .expect("start isolated bridge service");
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            let service_pid = loop {
+                if let Ok(value) = fs::read_to_string(&pid_file) {
+                    if let Ok(pid) = value.trim().parse::<u32>() {
+                        break pid;
+                    }
+                }
+                if let Some(status) = child.try_wait().expect("inspect bridge process") {
+                    panic!("bridge service exited before startup: {status}");
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "bridge service did not publish its process ID"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            };
+            let socket = socket_path(
+                Path::new(SOCKET_DIRECTORY),
+                console_uid().expect("console user"),
+            );
+            loop {
+                if UnixStream::connect(&socket).is_ok() {
+                    break;
+                }
+                if let Some(status) = child.try_wait().expect("inspect bridge process") {
+                    panic!("bridge service exited before binding its socket: {status}");
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "bridge service did not bind its console-user socket"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Self {
+                child,
+                pid_file,
+                service_pid,
+            }
+        }
+
+        fn stop(&mut self, signal: &str) {
+            let pid = self.service_pid.to_string();
+            let output = Command::new("/usr/bin/sudo")
+                .args(["-n", "/bin/kill", signal, pid.as_str()])
+                .output()
+                .expect("signal isolated bridge service");
+            assert!(
+                output.status.success(),
+                "could not signal bridge service: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let _ = self.child.wait().expect("wait for bridge service exit");
+        }
+    }
+
+    impl Drop for SmokeService {
+        fn drop(&mut self) {
+            if self.child.try_wait().is_ok_and(|status| status.is_none()) {
+                let pid = self.service_pid.to_string();
+                let _ = Command::new("/usr/bin/sudo")
+                    .args(["-n", "/bin/kill", "-TERM", pid.as_str()])
+                    .status();
+                let _ = self.child.wait();
+            }
+            let owns_pid_file = fs::read_to_string(&self.pid_file)
+                .is_ok_and(|value| value.trim() == self.service_pid.to_string());
+            if owns_pid_file {
+                let _ = fs::remove_file(&self.pid_file);
+            }
+        }
+    }
+
+    fn smoke_operation_state(operation_id: &str) -> Option<String> {
+        let output = Command::new("/usr/bin/sudo")
+            .args(["-n", "/bin/cat", STATE_FILE])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let state: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+        state["operations"][operation_id]["receipt"]["state"]
+            .as_str()
+            .map(str::to_string)
+    }
+
+    fn wait_for_file(path: &Path, timeout: Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if path.is_file() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("timed out waiting for {}", path.display());
+    }
+
+    #[test]
+    #[ignore = "requires signed notarized packages and a disposable macOS runner"]
+    fn installer_transaction_survives_upgrade_restart_and_revocation() {
+        let package_v1 = std::env::var("SCRIPTD_INSTALLER_SMOKE_PACKAGE_V1")
+            .expect("version 1 smoke package path");
+        let package_v2 = std::env::var("SCRIPTD_INSTALLER_SMOKE_PACKAGE_V2")
+            .expect("version 2 smoke package path");
+        let package_v3 = std::env::var("SCRIPTD_INSTALLER_SMOKE_PACKAGE_V3")
+            .expect("version 3 smoke package path");
+        let publisher = std::env::var("SCRIPTD_INSTALLER_SMOKE_PUBLISHER")
+            .expect("smoke package publisher team");
+        let directory = tempfile::tempdir().expect("create isolated substitution fixtures");
+        let package_identifier = "com.astronlab.scriptd.installer-smoke.pkg";
+        let dependency_identifier = "com.astronlab.scriptd.installer-smoke.dependency.pkg";
+        let marker = Path::new("/private/tmp/scriptd-installer-smoke/marker");
+        let dependency_marker = Path::new("/private/tmp/scriptd-installer-smoke-dependency/marker");
+        let interrupted_started = Path::new("/private/tmp/scriptd-installer-smoke-v3-started");
+        let interrupted_runs = Path::new("/private/tmp/scriptd-installer-smoke-v3-runs");
+        let identity = authenticate_peer(std::process::id())
+            .expect("authenticate signed smoke client process");
+        assert_eq!(identity.bundle_identifier, DIRECT_APP_BUNDLE_IDENTIFIER);
+
+        let mut service = SmokeService::start();
+        smoke_admin(&[
+            "authorize-pairing",
+            &identity.team_identifier,
+            &identity.bundle_identifier,
+        ]);
+        let pairing = smoke_request(
+            "pair-smoke-app",
+            "pair",
+            Some(
+                serde_json::to_string(&PairingRequest {
+                    bundle_identifier: identity.bundle_identifier.clone(),
+                    protocol_version: INSTALLER_PROTOCOL_VERSION,
+                })
+                .expect("serialize pairing request"),
+            ),
+            INSTALLER_PROTOCOL_VERSION,
+        )
+        .expect("pair signed smoke client");
+        assert!(pairing.ok, "app pairing failed: {:?}", pairing.message);
+
+        for package in [package_identifier, dependency_identifier] {
+            smoke_admin(&[
+                "set-package-approval",
+                "approve",
+                &identity.team_identifier,
+                &identity.bundle_identifier,
+                &publisher,
+                package,
+            ]);
+            assert!(smoke_approval_status(&publisher, package));
+        }
+
+        let request_v1 =
+            installer_smoke_operation("smoke-install-v1", package_identifier, &package_v1);
+        let response = smoke_request(
+            "submit-smoke-v1",
+            "operation",
+            Some(serde_json::to_string(&request_v1).expect("serialize v1 operation")),
+            INSTALLER_PROTOCOL_VERSION,
+        )
+        .expect("submit version 1 package");
+        let receipt_v1 = smoke_receipt(response);
+        assert_eq!(receipt_v1.state, OperationState::Succeeded);
+        assert!(
+            dependency_marker.is_file(),
+            "approved dependency was not installed"
+        );
+        assert_eq!(
+            fs::read_to_string(marker).expect("read v1 marker").trim(),
+            "version 1"
+        );
+
+        let status = smoke_request(
+            "status-smoke-v1",
+            "operation_status",
+            Some(
+                serde_json::to_string(&OperationStatusRequest {
+                    protocol_version: INSTALLER_PROTOCOL_VERSION,
+                    operation_id: request_v1.operation_id.clone(),
+                })
+                .expect("serialize completed operation status query"),
+            ),
+            INSTALLER_PROTOCOL_VERSION,
+        )
+        .expect("read completed operation status");
+        assert_eq!(smoke_receipt(status).state, OperationState::Succeeded);
+
+        service.stop("-TERM");
+        service = SmokeService::start();
+        assert!(smoke_approval_status(&publisher, package_identifier));
+        assert!(smoke_approval_status(&publisher, dependency_identifier));
+        let duplicate = smoke_request(
+            "retry-smoke-v1-after-restart",
+            "operation",
+            Some(serde_json::to_string(&request_v1).expect("serialize duplicate operation")),
+            INSTALLER_PROTOCOL_VERSION,
+        )
+        .expect("reconcile duplicate operation after restart");
+        assert_eq!(smoke_receipt(duplicate), receipt_v1);
+        assert_eq!(
+            fs::read_to_string(marker)
+                .expect("marker after cross-restart duplicate")
+                .trim(),
+            "version 1",
+            "a duplicate operation replayed the completed installer"
+        );
+
+        let request_v2 =
+            installer_smoke_operation("smoke-upgrade-v2", package_identifier, &package_v2);
+        let upgrade = smoke_request(
+            "submit-smoke-v2",
+            "operation",
+            Some(serde_json::to_string(&request_v2).expect("serialize v2 operation")),
+            INSTALLER_PROTOCOL_VERSION,
+        )
+        .expect("submit version 2 package upgrade");
+        assert_eq!(smoke_receipt(upgrade).state, OperationState::Succeeded);
+        assert_eq!(
+            fs::read_to_string(marker).expect("read v2 marker").trim(),
+            "version 2"
+        );
+
+        smoke_admin(&[
+            "set-package-approval",
+            "revoke",
+            &identity.team_identifier,
+            &identity.bundle_identifier,
+            &publisher,
+            dependency_identifier,
+        ]);
+        let request_missing_dependency = installer_smoke_operation(
+            "smoke-missing-dependency-grant",
+            package_identifier,
+            &package_v2,
+        );
+        let rejected_dependency = smoke_request(
+            "submit-missing-dependency-grant",
+            "operation",
+            Some(
+                serde_json::to_string(&request_missing_dependency)
+                    .expect("serialize missing-dependency operation"),
+            ),
+            INSTALLER_PROTOCOL_VERSION,
+        )
+        .expect("submit package with unapproved dependency");
+        assert_eq!(
+            smoke_receipt(rejected_dependency).state,
+            OperationState::Failed
+        );
+        assert_eq!(
+            fs::read_to_string(marker)
+                .expect("marker after dependency rejection")
+                .trim(),
+            "version 2"
+        );
+        smoke_admin(&[
+            "set-package-approval",
+            "approve",
+            &identity.team_identifier,
+            &identity.bundle_identifier,
+            &publisher,
+            dependency_identifier,
+        ]);
+
+        smoke_admin(&[
+            "set-package-approval",
+            "revoke",
+            &identity.team_identifier,
+            &identity.bundle_identifier,
+            &publisher,
+            package_identifier,
+        ]);
+        let wrong_publisher = "WRONGTEAM1";
+        smoke_admin(&[
+            "set-package-approval",
+            "approve",
+            &identity.team_identifier,
+            &identity.bundle_identifier,
+            wrong_publisher,
+            package_identifier,
+        ]);
+        let request_wrong_publisher =
+            installer_smoke_operation("smoke-wrong-publisher", package_identifier, &package_v2);
+        let rejected_publisher = smoke_request(
+            "submit-wrong-publisher",
+            "operation",
+            Some(
+                serde_json::to_string(&request_wrong_publisher)
+                    .expect("serialize wrong-publisher operation"),
+            ),
+            INSTALLER_PROTOCOL_VERSION,
+        )
+        .expect("submit package with wrong publisher approval");
+        assert_eq!(
+            smoke_receipt(rejected_publisher).state,
+            OperationState::Failed
+        );
+        assert_eq!(
+            fs::read_to_string(marker)
+                .expect("marker after publisher rejection")
+                .trim(),
+            "version 2"
+        );
+        smoke_admin(&[
+            "set-package-approval",
+            "revoke",
+            &identity.team_identifier,
+            &identity.bundle_identifier,
+            wrong_publisher,
+            package_identifier,
+        ]);
+        smoke_admin(&[
+            "set-package-approval",
+            "approve",
+            &identity.team_identifier,
+            &identity.bundle_identifier,
+            &publisher,
+            package_identifier,
+        ]);
+
+        let tampered_package = directory.path().join("tampered.pkg");
+        fs::copy(&package_v2, &tampered_package).expect("copy package substitution fixture");
+        OpenOptions::new()
+            .append(true)
+            .open(&tampered_package)
+            .expect("open package substitution fixture")
+            .write_all(b"substituted")
+            .expect("alter package substitution fixture");
+        let chown = Command::new("/usr/sbin/chown")
+            .arg(
+                console_uid()
+                    .expect("find disposable runner console user")
+                    .to_string(),
+            )
+            .arg(&tampered_package)
+            .status()
+            .expect("set user ownership on tampered package fixture");
+        assert!(chown.success(), "tampered package ownership setup failed");
+        let tampered = installer_smoke_operation(
+            "smoke-tampered-package",
+            package_identifier,
+            tampered_package
+                .to_str()
+                .expect("UTF-8 package fixture path"),
+        );
+        let tampered_response = smoke_request(
+            "submit-tampered-package",
+            "operation",
+            Some(serde_json::to_string(&tampered).expect("serialize tampered operation")),
+            INSTALLER_PROTOCOL_VERSION,
+        )
+        .expect("submit tampered package");
+        assert_eq!(
+            smoke_receipt(tampered_response).state,
+            OperationState::Failed
+        );
+        assert_eq!(
+            fs::read_to_string(marker)
+                .expect("read marker after tampered package rejection")
+                .trim(),
+            "version 2"
+        );
+
+        let substituted_path = directory.path().join("substituted.pkg");
+        std::os::unix::fs::symlink(&package_v2, &substituted_path)
+            .expect("create package path substitution fixture");
+        let substituted = installer_smoke_operation(
+            "smoke-substituted-path",
+            package_identifier,
+            substituted_path.to_str().expect("UTF-8 substituted path"),
+        );
+        let substituted_response = smoke_request(
+            "submit-substituted-path",
+            "operation",
+            Some(
+                serde_json::to_string(&substituted).expect("serialize substituted-path operation"),
+            ),
+            INSTALLER_PROTOCOL_VERSION,
+        )
+        .expect("submit symlink-substituted package path");
+        assert_eq!(
+            smoke_receipt(substituted_response).state,
+            OperationState::Failed
+        );
+        assert_eq!(
+            fs::read_to_string(marker)
+                .expect("read marker after path rejection")
+                .trim(),
+            "version 2"
+        );
+
+        let request_v3 =
+            installer_smoke_operation("smoke-interrupted-v3", package_identifier, &package_v3);
+        let request_for_thread = request_v3.clone();
+        let submit = std::thread::spawn(move || {
+            smoke_request(
+                "submit-interrupted-v3",
+                "operation",
+                Some(serde_json::to_string(&request_for_thread).expect("serialize v3 operation")),
+                INSTALLER_PROTOCOL_VERSION,
+            )
+        });
+        wait_for_file(interrupted_started, Duration::from_secs(30));
+        assert_eq!(
+            smoke_operation_state(request_v3.operation_id.as_str()).as_deref(),
+            Some("running"),
+            "the broker did not durably record the in-flight transaction"
+        );
+        let staged_package = Path::new("/Library/Application Support/scriptd/packages")
+            .join(format!("scriptd-{}/approved.pkg", service.service_pid));
+        let replacement = directory.path().join("replacement.pkg");
+        fs::copy(&tampered_package, &replacement).expect("prepare staged-content substitution");
+        let replacement_owner = Command::new("/usr/sbin/chown")
+            .arg(console_uid().expect("console user").to_string())
+            .arg(&replacement)
+            .status()
+            .expect("set substitution fixture ownership");
+        assert!(replacement_owner.success());
+        let substitution = fs::rename(&replacement, &staged_package)
+            .expect_err("unprivileged client replaced the protected staged package");
+        assert_eq!(substitution.kind(), std::io::ErrorKind::PermissionDenied);
+
+        service.stop("-KILL");
+        assert!(
+            submit
+                .join()
+                .expect("join interrupted client submission")
+                .is_err(),
+            "interrupted client unexpectedly received a completed response"
+        );
+        std::thread::sleep(Duration::from_secs(9));
+        service = SmokeService::start();
+        let interrupted_status = smoke_request(
+            "status-interrupted-v3",
+            "operation_status",
+            Some(
+                serde_json::to_string(&OperationStatusRequest {
+                    protocol_version: INSTALLER_PROTOCOL_VERSION,
+                    operation_id: request_v3.operation_id.clone(),
+                })
+                .expect("serialize interrupted operation status"),
+            ),
+            INSTALLER_PROTOCOL_VERSION,
+        )
+        .expect("read reconciled interrupted operation");
+        assert_eq!(
+            smoke_receipt(interrupted_status).state,
+            OperationState::Unknown
+        );
+        let retry_interrupted = smoke_request(
+            "retry-interrupted-v3-after-restart",
+            "operation",
+            Some(serde_json::to_string(&request_v3).expect("serialize interrupted retry")),
+            INSTALLER_PROTOCOL_VERSION,
+        )
+        .expect("reconcile duplicate interrupted operation");
+        assert_eq!(
+            smoke_receipt(retry_interrupted).state,
+            OperationState::Unknown
+        );
+        assert_eq!(
+            fs::read_to_string(interrupted_runs)
+                .expect("read interrupted installer invocation marker")
+                .lines()
+                .count(),
+            1,
+            "restart replayed an operation with an uncertain outcome"
+        );
+
+        smoke_admin(&[
+            "set-package-approval",
+            "revoke",
+            &identity.team_identifier,
+            &identity.bundle_identifier,
+            &publisher,
+            package_identifier,
+        ]);
+        service.stop("-TERM");
+        service = SmokeService::start();
+        assert!(!smoke_approval_status(&publisher, package_identifier));
+        let after_revoke =
+            installer_smoke_operation("smoke-after-revocation", package_identifier, &package_v2);
+        let rejected = smoke_request(
+            "submit-after-revocation",
+            "operation",
+            Some(
+                serde_json::to_string(&after_revoke).expect("serialize post-revocation operation"),
+            ),
+            INSTALLER_PROTOCOL_VERSION,
+        )
+        .expect("submit operation after durable grant revocation");
+        assert!(!rejected.ok, "revoked package authorization was accepted");
+        service.stop("-TERM");
     }
 
     #[test]
@@ -1418,6 +2532,75 @@ mod tests {
             state.pairings[&identity.bundle_identifier].team_identifier,
             identity.team_identifier
         );
+    }
+
+    #[test]
+    fn v4_pairing_and_status_preserve_the_requested_protocol_version() {
+        let identity = identity();
+        let mut state = State::default();
+        state
+            .authorize_pairing_with(&identity, |_| Ok(()))
+            .expect("record administrator approval");
+        let request = PairingRequest {
+            bundle_identifier: identity.bundle_identifier.clone(),
+            protocol_version: INSTALLER_PROTOCOL_VERSION,
+        };
+        let receipt = state
+            .pair_with(&identity, request, |_| Ok(()))
+            .expect("pair v4 client");
+        assert_eq!(receipt.protocol_version, INSTALLER_PROTOCOL_VERSION);
+
+        let response = handle(
+            Request {
+                v: INSTALLER_PROTOCOL_VERSION,
+                id: "pairing-status-v4".into(),
+                op: "pairing_status".into(),
+                repo: String::new(),
+                module: Some(identity.bundle_identifier.clone()),
+                yaml: None,
+            },
+            Some(identity.clone()),
+            false,
+            &mut state,
+            Path::new("unused"),
+        );
+        assert!(response.ok);
+        assert_eq!(response.v, INSTALLER_PROTOCOL_VERSION);
+        let status: PairingStatus =
+            serde_json::from_value(response.snapshot.unwrap()).expect("decode v4 pairing status");
+        assert_eq!(status.protocol_version, INSTALLER_PROTOCOL_VERSION);
+        assert!(status.active);
+    }
+
+    #[test]
+    fn pairing_rejects_payload_version_mismatch_with_request_envelope() {
+        let identity = identity();
+        let mut state = State::default();
+        let response = handle(
+            Request {
+                v: PROTOCOL_VERSION,
+                id: "pair-version-mismatch".into(),
+                op: "pair".into(),
+                repo: String::new(),
+                module: None,
+                yaml: Some(
+                    serde_json::to_string(&PairingRequest {
+                        bundle_identifier: identity.bundle_identifier.clone(),
+                        protocol_version: INSTALLER_PROTOCOL_VERSION,
+                    })
+                    .expect("serialize mismatched pairing request"),
+                ),
+            },
+            Some(identity),
+            false,
+            &mut state,
+            Path::new("unused"),
+        );
+        assert!(!response.ok);
+        assert!(response
+            .message
+            .unwrap()
+            .contains("does not match the bridge request"));
     }
 
     #[test]
@@ -1467,6 +2650,37 @@ mod tests {
         )
         .expect("load state written before approval support");
         assert!(state.pairing_authorizations.is_empty());
+    }
+
+    #[test]
+    fn oversized_state_is_rejected_before_persistence() {
+        let state = State {
+            schema: "x".repeat(MAX_STATE_BYTES + 1),
+            ..State::default()
+        };
+        let error = state
+            .save(Path::new("unused"))
+            .expect_err("oversized state must fail before touching the path");
+        assert!(error
+            .to_string()
+            .contains("exceeds the maximum supported size"));
+    }
+
+    #[test]
+    fn multibyte_installer_failure_receipts_stay_within_protocol_limit() {
+        let message = bounded_receipt_message(format!("operation failed: {}", "界".repeat(2048)));
+        assert!(message.len() <= MAX_RECEIPT_MESSAGE_BYTES);
+        let operation_id = scriptd_bridge_protocol::OperationId::new("multibyte-failure")
+            .expect("valid operation ID");
+        let receipt = OperationReceipt {
+            protocol_version: INSTALLER_PROTOCOL_VERSION,
+            operation_id: operation_id.clone(),
+            state: OperationState::Failed,
+            message: Some(message),
+        };
+        receipt
+            .validate_for(&operation_id)
+            .expect("bounded failure receipt validates");
     }
 
     #[test]
@@ -1612,6 +2826,254 @@ mod tests {
     }
 
     #[test]
+    fn installer_capability_is_reported_only_to_the_direct_bundle_identity() {
+        let mut direct = identity();
+        direct.bundle_identifier = DIRECT_APP_BUNDLE_IDENTIFIER.into();
+        let direct_report = handle(
+            Request {
+                v: INSTALLER_PROTOCOL_VERSION,
+                id: "caps-direct".into(),
+                op: "capabilities".into(),
+                repo: String::new(),
+                module: None,
+                yaml: None,
+            },
+            Some(direct),
+            false,
+            &mut State::default(),
+            Path::new("unused"),
+        );
+        assert_eq!(direct_report.v, INSTALLER_PROTOCOL_VERSION);
+        let direct_report: CapabilityReport =
+            serde_json::from_value(direct_report.snapshot.unwrap()).unwrap();
+        assert!(direct_report.offers(Capability::InstallerPackageV1));
+
+        let store_report = handle(
+            Request {
+                v: INSTALLER_PROTOCOL_VERSION,
+                id: "caps-store".into(),
+                op: "capabilities".into(),
+                repo: String::new(),
+                module: None,
+                yaml: None,
+            },
+            Some(Identity {
+                team_identifier: "TEAM123456".into(),
+                bundle_identifier: "com.astronlab.scriptd.appstore".into(),
+            }),
+            false,
+            &mut State::default(),
+            Path::new("unused"),
+        );
+        let store_report: CapabilityReport =
+            serde_json::from_value(store_report.snapshot.unwrap()).unwrap();
+        assert!(!store_report.offers(Capability::InstallerPackageV1));
+    }
+
+    #[test]
+    fn app_store_receipt_blocks_bridge_authentication_for_same_bundle_identifier() {
+        let bundle = tempfile::tempdir().expect("create app bundle fixture");
+        let app = bundle.path().join("Scriptd.app");
+        let executable = app.join("Contents/MacOS/scriptd");
+        let receipt = app.join("Contents/_MASReceipt/receipt");
+        std::fs::create_dir_all(executable.parent().expect("executable parent"))
+            .expect("create executable path");
+        std::fs::write(&executable, b"fixture").expect("write executable fixture");
+        assert!(!has_mas_receipt(&executable));
+        std::fs::create_dir_all(receipt.parent().expect("receipt parent"))
+            .expect("create receipt path");
+        std::fs::write(&receipt, b"store receipt").expect("write receipt fixture");
+        assert!(has_mas_receipt(&executable));
+    }
+
+    #[test]
+    fn v4_package_approval_queries_are_paired_and_scoped_to_the_authenticated_app() {
+        let identity = Identity {
+            team_identifier: "TEAM123456".into(),
+            bundle_identifier: DIRECT_APP_BUNDLE_IDENTIFIER.into(),
+        };
+        let grant = InstallerGrant {
+            app_identity: identity.clone(),
+            publisher_team_identifier: "VENDOR1234".into(),
+            package_identifier: "com.vendor.app".into(),
+            method: "package_installer_v1".into(),
+        };
+        let mut state = State {
+            pairings: BTreeMap::from([(
+                identity.bundle_identifier.clone(),
+                Pairing {
+                    team_identifier: identity.team_identifier.clone(),
+                    bundle_identifier: identity.bundle_identifier.clone(),
+                    active: true,
+                },
+            )]),
+            installer_grants: BTreeMap::from([(
+                installer_grant_key(&identity, &grant.package_identifier),
+                grant,
+            )]),
+            ..State::default()
+        };
+        let status = handle(
+            Request {
+                v: INSTALLER_PROTOCOL_VERSION,
+                id: "package-status".into(),
+                op: "package_approval_status".into(),
+                repo: String::new(),
+                module: None,
+                yaml: Some(
+                    serde_json::to_string(&InstallerApprovalQuery {
+                        publisher_team_identifier: "VENDOR1234".into(),
+                        package_identifier: "com.vendor.app".into(),
+                    })
+                    .unwrap(),
+                ),
+            },
+            Some(identity.clone()),
+            false,
+            &mut state,
+            Path::new("unused"),
+        );
+        assert!(status.ok);
+        assert_eq!(status.snapshot.unwrap()["approved"], true);
+
+        let publisher_mismatch = handle(
+            Request {
+                v: INSTALLER_PROTOCOL_VERSION,
+                id: "package-status-mismatch".into(),
+                op: "package_approval_status".into(),
+                repo: String::new(),
+                module: None,
+                yaml: Some(
+                    serde_json::json!({
+                        "publisher_team_identifier": "OTHERTEAM1",
+                        "package_identifier": "com.vendor.app",
+                    })
+                    .to_string(),
+                ),
+            },
+            Some(identity.clone()),
+            false,
+            &mut state,
+            Path::new("unused"),
+        );
+        assert!(publisher_mismatch.ok);
+        assert_eq!(publisher_mismatch.snapshot.unwrap()["approved"], false);
+
+        let list = handle(
+            Request {
+                v: INSTALLER_PROTOCOL_VERSION,
+                id: "package-list".into(),
+                op: "package_approval_list".into(),
+                repo: String::new(),
+                module: None,
+                yaml: None,
+            },
+            Some(identity),
+            false,
+            &mut state,
+            Path::new("unused"),
+        );
+        assert!(list.ok);
+        let approvals = list.snapshot.unwrap();
+        assert_eq!(approvals.as_array().unwrap().len(), 1);
+        assert_eq!(approvals[0]["package_identifier"], "com.vendor.app");
+    }
+
+    #[test]
+    fn package_install_requires_a_separate_publisher_grant() {
+        let identity = identity();
+        let request = OperationRequest {
+            protocol_version: INSTALLER_PROTOCOL_VERSION,
+            operation_id: scriptd_bridge_protocol::OperationId::new("brew-pkg-1")
+                .expect("valid operation id"),
+            operation: Operation::InstallApprovedPackage {
+                package_identifier: "com.vendor.product".into(),
+                package_path: "/Users/test/Downloads/product.pkg".into(),
+            },
+        };
+        let mut state = paired_state(true);
+        let executed = std::cell::Cell::new(false);
+        let result = state.submit_with(
+            &identity,
+            request,
+            |_| Ok(()),
+            |_, _| {
+                executed.set(true);
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert!(!executed.get(), "an unapproved installer must never run");
+    }
+
+    #[test]
+    fn package_approval_does_not_create_or_change_wifi_pairing() {
+        let identity = identity();
+        let grant = InstallerGrant {
+            app_identity: identity.clone(),
+            publisher_team_identifier: "VENDOR1234".into(),
+            package_identifier: "com.vendor.product".into(),
+            method: "package_installer_v1".into(),
+        };
+        let mut state = State::default();
+        let key = installer_grant_key(&identity, &grant.package_identifier);
+        state.installer_grants.insert(key, grant);
+        assert!(state.require_pairing(&identity).is_err());
+        assert!(state
+            .installer_grant(&identity, "com.vendor.product")
+            .is_ok());
+        assert!(state
+            .installer_grant(&identity, "com.vendor.other")
+            .is_err());
+    }
+
+    #[test]
+    fn installer_grant_revocation_rolls_back_if_persistence_fails() {
+        let mut app_identity = identity();
+        app_identity.bundle_identifier = DIRECT_APP_BUNDLE_IDENTIFIER.into();
+        let grant = InstallerGrant {
+            app_identity: app_identity.clone(),
+            publisher_team_identifier: "VENDOR1234".into(),
+            package_identifier: "com.vendor.product".into(),
+            method: "package_installer_v1".into(),
+        };
+        let mut state = State::default();
+        state
+            .set_installer_grant_with(grant.clone(), false, |_| Ok(()))
+            .expect("save an approval");
+        assert!(state
+            .set_installer_grant_with(grant.clone(), true, |_| {
+                bail!("simulated persistence error")
+            })
+            .is_err());
+        assert!(state
+            .installer_grant(&app_identity, &grant.package_identifier)
+            .is_ok());
+        state
+            .set_installer_grant_with(grant.clone(), true, |_| Ok(()))
+            .expect("revoke future authorization");
+        assert!(state
+            .installer_grant(&app_identity, &grant.package_identifier)
+            .is_err());
+    }
+
+    #[test]
+    fn developer_id_publisher_parser_extracts_only_a_valid_team_identifier() {
+        assert_eq!(
+            installer::developer_id_team("origin=Developer ID Installer: Vendor (VENDOR1234)"),
+            Some("VENDOR1234")
+        );
+        assert_eq!(
+            installer::developer_id_team("origin=Developer ID Application: Vendor (VENDOR1234)"),
+            None
+        );
+        assert_eq!(
+            installer::developer_id_team("origin=Developer ID Installer: Vendor (bad-team!)"),
+            None
+        );
+    }
+
+    #[test]
     fn duplicate_operation_ids_never_execute_the_privileged_action_twice() {
         let identity = identity();
         let request = operation_request("wifi-once");
@@ -1619,7 +3081,7 @@ mod tests {
         let executions = std::cell::Cell::new(0);
         let persist = |_: &State| Ok(());
         let first = state
-            .submit_with(&identity, request.clone(), persist, |_| {
+            .submit_with(&identity, request.clone(), persist, |_, _| {
                 executions.set(executions.get() + 1);
                 Ok(())
             })
@@ -1629,7 +3091,7 @@ mod tests {
                 &identity,
                 request,
                 |_: &State| Ok(()),
-                |_| {
+                |_, _| {
                     executions.set(executions.get() + 1);
                     Ok(())
                 },
@@ -1664,7 +3126,7 @@ mod tests {
                 &identity,
                 operation_request("wifi-new"),
                 |_: &State| Ok(()),
-                |_| Ok(())
+                |_, _| Ok(())
             )
             .is_err());
         let reconciled = state

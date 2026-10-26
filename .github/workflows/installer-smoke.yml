@@ -1,0 +1,178 @@
+name: Isolated Bridge installer smoke
+
+on:
+  workflow_call:
+  workflow_dispatch:
+  push:
+    paths:
+      - "crates/scriptd-bridge/**"
+      - "crates/scriptd-bridge-protocol/**"
+      - Cargo.lock
+      - Cargo.toml
+      - ".github/workflows/installer-smoke.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bridge-installer-smoke-${{ github.ref }}-${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  isolated-installer:
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      CARGO_TARGET_DIR: ${{ runner.temp }}/cargo-targets/scriptd-installer-smoke
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal --component clippy
+      - name: Test and lint the bridge
+        run: |
+          cargo +stable test --locked --workspace
+          cargo +stable clippy --locked --workspace --all-targets -- -D warnings
+      - name: Import Developer ID signing identity
+        env:
+          APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.BUILD_KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          test -n "$APPLE_CERTIFICATE_P12_BASE64"
+          test -n "$APPLE_CERTIFICATE_PASSWORD"
+          test -n "$KEYCHAIN_PASSWORD"
+          KEYCHAIN_PATH="$RUNNER_TEMP/scriptd-smoke.keychain-db"
+          CERTIFICATE_PATH="$RUNNER_TEMP/developer-id-cert.p12"
+          printf '%s' "$APPLE_CERTIFICATE_P12_BASE64" | base64 --decode > "$CERTIFICATE_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" -k "$KEYCHAIN_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign -T /usr/bin/productbuild
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
+      - name: Build a signed smoke package
+        env:
+          DEVELOPER_ID_INSTALLER: ${{ secrets.DEVELOPER_ID_INSTALLER }}
+        run: |
+          set -euo pipefail
+          test -n "$DEVELOPER_ID_INSTALLER"
+          PKG_PATH="$RUNNER_TEMP/scriptd-installer-smoke-components"
+          mkdir -p "$PKG_PATH/dependency/private/tmp/scriptd-installer-smoke-dependency"
+          printf '%s\n' 'approved dependency installed' > "$PKG_PATH/dependency/private/tmp/scriptd-installer-smoke-dependency/marker"
+          pkgbuild --root "$PKG_PATH/dependency" --identifier com.astronlab.scriptd.installer-smoke.dependency.pkg --version 1.0.0 --install-location / --sign "$DEVELOPER_ID_INSTALLER" "$PKG_PATH/dependency.pkg"
+          for VERSION in 1 2 3; do
+            VERSION_PATH="$PKG_PATH/v$VERSION"
+            mkdir -p "$VERSION_PATH/main/private/tmp/scriptd-installer-smoke"
+            printf 'version %s\n' "$VERSION" > "$VERSION_PATH/main/private/tmp/scriptd-installer-smoke/marker"
+            if [ "$VERSION" = 3 ]; then
+              mkdir -p "$VERSION_PATH/scripts"
+              cat > "$VERSION_PATH/scripts/postinstall" <<'SCRIPT'
+          #!/bin/sh
+          set -eu
+          printf '%s\n' started >> /private/tmp/scriptd-installer-smoke-v3-runs
+          touch /private/tmp/scriptd-installer-smoke-v3-started
+          sleep 8
+          SCRIPT
+              chmod 755 "$VERSION_PATH/scripts/postinstall"
+              pkgbuild --root "$VERSION_PATH/main" --scripts "$VERSION_PATH/scripts" --identifier com.astronlab.scriptd.installer-smoke.pkg --version "$VERSION.0.0" --install-location / --sign "$DEVELOPER_ID_INSTALLER" "$VERSION_PATH/main.pkg"
+            else
+              pkgbuild --root "$VERSION_PATH/main" --identifier com.astronlab.scriptd.installer-smoke.pkg --version "$VERSION.0.0" --install-location / --sign "$DEVELOPER_ID_INSTALLER" "$VERSION_PATH/main.pkg"
+            fi
+            cp "$PKG_PATH/dependency.pkg" "$VERSION_PATH/dependency.pkg"
+            cat > "$VERSION_PATH/Distribution" <<XML
+          <?xml version="1.0" encoding="utf-8"?>
+          <installer-gui-script minSpecVersion="1">
+            <title>Scriptd installer capability smoke</title>
+            <options customize="never" require-scripts="true"/>
+            <choices-outline><line choice="main"/><line choice="dependency"/></choices-outline>
+            <choice id="main" visible="false"><pkg-ref id="com.astronlab.scriptd.installer-smoke.pkg"/></choice>
+            <choice id="dependency" visible="false"><pkg-ref id="com.astronlab.scriptd.installer-smoke.dependency.pkg"/></choice>
+            <pkg-ref id="com.astronlab.scriptd.installer-smoke.pkg" version="$VERSION.0.0" onConclusion="none">main.pkg</pkg-ref>
+            <pkg-ref id="com.astronlab.scriptd.installer-smoke.dependency.pkg" version="1.0.0" onConclusion="none">dependency.pkg</pkg-ref>
+          </installer-gui-script>
+          XML
+            productbuild --distribution "$VERSION_PATH/Distribution" --package-path "$VERSION_PATH" --sign "$DEVELOPER_ID_INSTALLER" "$RUNNER_TEMP/ScriptdInstallerSmoke-v$VERSION.pkg"
+          done
+          CONSOLE_UID="$(stat -f '%u' /dev/console)"
+          for VERSION in 1 2 3; do
+            sudo chown "$CONSOLE_UID" "$RUNNER_TEMP/ScriptdInstallerSmoke-v$VERSION.pkg"
+            pkgutil --check-signature "$RUNNER_TEMP/ScriptdInstallerSmoke-v$VERSION.pkg"
+          done
+      - name: Notarize and staple the smoke package
+        env:
+          APPLE_NOTARY_KEY_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          test -n "$APPLE_NOTARY_KEY_BASE64"
+          test -n "$APPLE_NOTARY_KEY_ID"
+          test -n "$APPLE_NOTARY_ISSUER_ID"
+          NOTARY_KEY="$RUNNER_TEMP/AuthKey.p8"
+          printf '%s' "$APPLE_NOTARY_KEY_BASE64" | base64 --decode > "$NOTARY_KEY"
+          chmod 600 "$NOTARY_KEY"
+          for VERSION in 1 2 3; do
+            PACKAGE="$RUNNER_TEMP/ScriptdInstallerSmoke-v$VERSION.pkg"
+            xcrun notarytool submit "$PACKAGE" --key "$NOTARY_KEY" --key-id "$APPLE_NOTARY_KEY_ID" --issuer "$APPLE_NOTARY_ISSUER_ID" --wait
+            xcrun stapler staple "$PACKAGE"
+            xcrun stapler validate "$PACKAGE"
+            spctl --assess --type install --verbose=4 "$PACKAGE" 2>&1 | tee "$RUNNER_TEMP/gatekeeper-assessment-v$VERSION.txt"
+          done
+          python3 - "$RUNNER_TEMP/gatekeeper-assessment-v1.txt" > "$RUNNER_TEMP/publisher-team.txt" <<'PY'
+          import re, sys
+          text = open(sys.argv[1], encoding="utf-8").read()
+          match = re.search(r"Developer ID Installer:.*\(([A-Z0-9]{10})\)", text)
+          if not match:
+              raise SystemExit("Gatekeeper did not report the installer publisher team")
+          print(match.group(1))
+          PY
+      - name: Run broker transaction and recovery smoke on this disposable runner
+        env:
+          DEVELOPER_ID_APPLICATION: ${{ secrets.DEVELOPER_ID_APPLICATION }}
+          SCRIPTD_INSTALLER_SMOKE_PACKAGE_V1: ${{ runner.temp }}/ScriptdInstallerSmoke-v1.pkg
+          SCRIPTD_INSTALLER_SMOKE_PACKAGE_V2: ${{ runner.temp }}/ScriptdInstallerSmoke-v2.pkg
+          SCRIPTD_INSTALLER_SMOKE_PACKAGE_V3: ${{ runner.temp }}/ScriptdInstallerSmoke-v3.pkg
+          SCRIPTD_INSTALLER_SMOKE_SERVICE_PID_FILE: ${{ runner.temp }}/scriptd-installer-smoke-service.pid
+        run: |
+          set -euo pipefail
+          test -n "$DEVELOPER_ID_APPLICATION"
+          PUBLISHER_TEAM="$(cat "$RUNNER_TEMP/publisher-team.txt")"
+          export SCRIPTD_INSTALLER_SMOKE_PUBLISHER="$PUBLISHER_TEAM"
+          cargo +stable build --locked --package scriptd-bridge
+          cargo +stable test --locked --package scriptd-bridge --no-run
+          TEST_BINARY="$(find "$CARGO_TARGET_DIR/debug/deps" -type f -perm -111 -name 'scriptd_bridge-*' -print -quit)"
+          test -n "$TEST_BINARY"
+          BRIDGE_BUILD="$CARGO_TARGET_DIR/debug/scriptd-bridge"
+          codesign --force --options runtime --timestamp --identifier com.astronlab.scriptd --sign "$DEVELOPER_ID_APPLICATION" "$TEST_BINARY"
+          codesign --verify --strict --all-architectures -- "$TEST_BINARY"
+          codesign --force --options runtime --timestamp --identifier com.astronlab.scriptd.bridge --sign "$DEVELOPER_ID_APPLICATION" "$BRIDGE_BUILD"
+          codesign --verify --strict --all-architectures -- "$BRIDGE_BUILD"
+          if sudo -n pgrep -f '^/usr/local/libexec/scriptd-bridge serve$' >/dev/null; then
+            echo "a bridge service is already running on the disposable runner" >&2
+            exit 1
+          fi
+          sudo -n rm -f /usr/local/libexec/scriptd-bridge
+          sudo -n rm -rf "/Library/Application Support/scriptd" /var/run/scriptd
+          sudo -n install -d -o root -g wheel -m 755 /usr/local/libexec
+          sudo -n install -d -o root -g wheel -m 755 "/Library/Application Support/scriptd"
+          sudo -n install -o root -g wheel -m 755 "$BRIDGE_BUILD" /usr/local/libexec/scriptd-bridge
+          sudo -n /usr/local/libexec/scriptd-bridge write-installation-receipt
+          "$TEST_BINARY" --exact tests::installer_transaction_survives_upgrade_restart_and_revocation --ignored --nocapture
+      - name: Remove disposable runner bridge state
+        if: always()
+        env:
+          SCRIPTD_INSTALLER_SMOKE_SERVICE_PID_FILE: ${{ runner.temp }}/scriptd-installer-smoke-service.pid
+        run: |
+          set -euo pipefail
+          if [ -f "$SCRIPTD_INSTALLER_SMOKE_SERVICE_PID_FILE" ]; then
+            SERVICE_PID="$(sudo -n cat "$SCRIPTD_INSTALLER_SMOKE_SERVICE_PID_FILE")"
+            sudo -n /bin/kill -TERM "$SERVICE_PID" 2>/dev/null || true
+          fi
+          sudo -n rm -f /usr/local/libexec/scriptd-bridge
+          sudo -n rm -rf "/Library/Application Support/scriptd"
+          sudo -n rm -f /var/run/scriptd/scriptd-broker-*.sock
+          sudo -n rmdir /var/run/scriptd 2>/dev/null || true
+          sudo -n rm -f /private/tmp/scriptd-installer-smoke-v3-started /private/tmp/scriptd-installer-smoke-v3-runs
