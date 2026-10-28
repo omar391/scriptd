@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize};
 /// A mismatch is reported rather than tolerated: a client that cannot speak
 /// the bridge's protocol must not guess at its semantics.
 pub const PROTOCOL_VERSION: u32 = 3;
+/// First protocol version with the fixed, approved package-installer operation.
+pub const INSTALLER_PROTOCOL_VERSION: u32 = 4;
 
 /// A privileged operation the bridge can perform.
 ///
@@ -25,18 +27,24 @@ pub const PROTOCOL_VERSION: u32 = 3;
 pub enum Capability {
     /// Change the current Wi-Fi network.
     WifiNetworkChange,
+    /// Install a publisher-approved signed macOS package through the native installer.
+    InstallerPackageV1,
 }
 
 impl Capability {
     /// Every capability this protocol version defines.
     pub fn all() -> &'static [Capability] {
-        &[Capability::WifiNetworkChange]
+        &[
+            Capability::WifiNetworkChange,
+            Capability::InstallerPackageV1,
+        ]
     }
 
     /// The stable wire name of this capability.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::WifiNetworkChange => "wifi_network_change",
+            Self::InstallerPackageV1 => "installer_package_v1",
         }
     }
 
@@ -149,7 +157,16 @@ impl From<OperationId> for String {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
-    SetWifiNetwork { ssid: String },
+    SetWifiNetwork {
+        ssid: String,
+    },
+    /// Install a package whose publisher and package identifier have a separate
+    /// administrator grant. `package_path` is only an untrusted source path;
+    /// the broker copies it into protected staging before inspection/use.
+    InstallApprovedPackage {
+        package_identifier: String,
+        package_path: String,
+    },
 }
 
 impl Operation {
@@ -157,6 +174,7 @@ impl Operation {
     pub fn capability(&self) -> Capability {
         match self {
             Self::SetWifiNetwork { .. } => Capability::WifiNetworkChange,
+            Self::InstallApprovedPackage { .. } => Capability::InstallerPackageV1,
         }
     }
 
@@ -168,6 +186,27 @@ impl Operation {
                     return Err(
                         "Wi-Fi network name must be 1 to 32 bytes without control characters",
                     );
+                }
+                Ok(())
+            }
+            Self::InstallApprovedPackage {
+                package_identifier,
+                package_path,
+            } => {
+                if package_identifier.is_empty()
+                    || package_identifier.len() > 255
+                    || !package_identifier.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_')
+                    })
+                {
+                    return Err("package identifier is invalid");
+                }
+                if !package_path.starts_with('/')
+                    || package_path.len() > 4096
+                    || package_path.chars().any(char::is_control)
+                    || !package_path.to_ascii_lowercase().ends_with(".pkg")
+                {
+                    return Err("package source path must be an absolute .pkg path without control characters");
                 }
                 Ok(())
             }
@@ -187,8 +226,16 @@ pub struct OperationRequest {
 impl OperationRequest {
     /// Rejects version skew or malformed bounded arguments.
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.protocol_version != PROTOCOL_VERSION {
+        if !matches!(
+            self.protocol_version,
+            PROTOCOL_VERSION | INSTALLER_PROTOCOL_VERSION
+        ) {
             return Err("unsupported bridge protocol version");
+        }
+        if matches!(&self.operation, Operation::InstallApprovedPackage { .. })
+            && self.protocol_version != INSTALLER_PROTOCOL_VERSION
+        {
+            return Err("package installation requires bridge protocol version 4");
         }
         self.operation.validate()
     }
@@ -205,7 +252,10 @@ pub struct OperationStatusRequest {
 impl OperationStatusRequest {
     /// Rejects protocol skew before looking up the stored receipt.
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.protocol_version != PROTOCOL_VERSION {
+        if !matches!(
+            self.protocol_version,
+            PROTOCOL_VERSION | INSTALLER_PROTOCOL_VERSION
+        ) {
             return Err("unsupported bridge protocol version");
         }
         Ok(())
@@ -238,7 +288,10 @@ pub struct OperationReceipt {
 impl OperationReceipt {
     /// Validates correlation and bounded user-facing detail.
     pub fn validate_for(&self, expected_id: &OperationId) -> Result<(), &'static str> {
-        if self.protocol_version != PROTOCOL_VERSION {
+        if !matches!(
+            self.protocol_version,
+            PROTOCOL_VERSION | INSTALLER_PROTOCOL_VERSION
+        ) {
             return Err("unsupported bridge protocol version");
         }
         if &self.operation_id != expected_id {
@@ -259,7 +312,8 @@ impl OperationReceipt {
 mod tests {
     use super::{
         Capability, CapabilityReport, Operation, OperationId, OperationReceipt, OperationRequest,
-        OperationState, OperationStatusRequest, PairingRequest, PairingStatus, PROTOCOL_VERSION,
+        OperationState, OperationStatusRequest, PairingRequest, PairingStatus,
+        INSTALLER_PROTOCOL_VERSION, PROTOCOL_VERSION,
     };
 
     #[test]
@@ -293,18 +347,20 @@ mod tests {
 
     #[test]
     fn wire_types_round_trip_through_json() {
-        let request = PairingRequest {
-            bundle_identifier: "com.astronlab.scriptd".to_string(),
-            protocol_version: PROTOCOL_VERSION,
-        };
-        let encoded = serde_json::to_string(&request).expect("encode pairing request");
-        let decoded: PairingRequest =
-            serde_json::from_str(&encoded).expect("decode pairing request");
-        assert_eq!(decoded, request);
+        for protocol_version in [PROTOCOL_VERSION, INSTALLER_PROTOCOL_VERSION] {
+            let request = PairingRequest {
+                bundle_identifier: "com.astronlab.scriptd".to_string(),
+                protocol_version,
+            };
+            let encoded = serde_json::to_string(&request).expect("encode pairing request");
+            let decoded: PairingRequest =
+                serde_json::from_str(&encoded).expect("decode pairing request");
+            assert_eq!(decoded, request);
+        }
 
         let status = PairingStatus {
-            protocol_version: PROTOCOL_VERSION,
-            bundle_identifier: request.bundle_identifier,
+            protocol_version: INSTALLER_PROTOCOL_VERSION,
+            bundle_identifier: "com.astronlab.scriptd".to_string(),
             active: true,
         };
         let encoded = serde_json::to_string(&status).expect("encode pairing status");
@@ -347,7 +403,7 @@ mod tests {
         assert!(OperationId::new("../tmp/unsafe").is_err());
         assert!(OperationId::new("x".repeat(129)).is_err());
         let request = OperationRequest {
-            protocol_version: PROTOCOL_VERSION + 1,
+            protocol_version: INSTALLER_PROTOCOL_VERSION + 1,
             operation_id: OperationId::new("wifi-1").expect("valid operation id"),
             operation: Operation::SetWifiNetwork {
                 ssid: "Office".into(),
@@ -363,6 +419,37 @@ mod tests {
             ssid: "x".repeat(33),
         };
         assert!(oversized_network.validate().is_err());
+    }
+
+    #[test]
+    fn approved_package_install_requires_v4_and_has_bounded_arguments() {
+        let request = OperationRequest {
+            protocol_version: INSTALLER_PROTOCOL_VERSION,
+            operation_id: OperationId::new("brew:pkg:job-1").expect("valid operation id"),
+            operation: Operation::InstallApprovedPackage {
+                package_identifier: "com.vendor.product.pkg".into(),
+                package_path: "/Users/test/Downloads/Product.pkg".into(),
+            },
+        };
+        request.validate().expect("valid installer request");
+        assert_eq!(
+            request.operation.capability(),
+            Capability::InstallerPackageV1
+        );
+
+        let legacy = OperationRequest {
+            protocol_version: PROTOCOL_VERSION,
+            ..request.clone()
+        };
+        assert_eq!(
+            legacy.validate(),
+            Err("package installation requires bridge protocol version 4")
+        );
+        let unsafe_path = Operation::InstallApprovedPackage {
+            package_identifier: "com.vendor.product".into(),
+            package_path: "relative.pkg".into(),
+        };
+        assert!(unsafe_path.validate().is_err());
     }
 
     #[test]
